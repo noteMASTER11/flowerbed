@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import subprocess
+import uuid
 import unittest
 
 
@@ -88,6 +89,29 @@ class ScriptTest(unittest.TestCase):
         result = run_bash(
             "-c",
             f"source '{common}'; require_ext4_workspace /mnt/d/path-that-does-not-exist",
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("must not be under /mnt", result.stdout)
+
+    def test_sync_dry_run_is_side_effect_free_and_complete(self):
+        workspace = f"/tmp/flowerbed-sync-{uuid.uuid4().hex}"
+        result = run_script("scripts/ubuntu/sync.sh", "--dry-run", workspace)
+        self.assertEqual(0, result.returncode, result.stdout)
+        self.assertIn(
+            "repo init -u https://github.com/LineageOS/android.git -b lineage-23.2",
+            result.stdout,
+        )
+        self.assertIn("fleur-lineage-23.2.xml", result.stdout)
+        self.assertIn("repo sync", result.stdout)
+        self.assertIn("repo manifest -r", result.stdout)
+        existence = run_bash("-c", f"test ! -e '{workspace}'")
+        self.assertEqual(0, existence.returncode, existence.stdout)
+
+    def test_sync_validation_rejects_windows_mount(self):
+        result = run_script(
+            "scripts/ubuntu/sync.sh",
+            "--validate-workspace",
+            "/mnt/d/android",
         )
         self.assertNotEqual(0, result.returncode)
         self.assertIn("must not be under /mnt", result.stdout)
