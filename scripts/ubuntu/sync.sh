@@ -85,8 +85,4 @@ PY
   log "Pinned snapshot: $snapshot"
 }
 
-set +e
 run_sync 2>&1 | tee "$log_file"
-status=${PIPESTATUS[0]}
-set -e
-exit "$status"

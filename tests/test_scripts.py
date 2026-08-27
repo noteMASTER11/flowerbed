@@ -154,6 +154,59 @@ class ScriptTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("must not be under /mnt", result.stdout)
 
+    def test_sync_stops_immediately_when_repo_sync_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            trace = root / "commands.trace"
+            fake_repo = fake_bin / "repo"
+            fake_repo.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf 'repo %s\\n' \"$*\" >>\"$SYNC_TRACE_FILE\"\n"
+                "if [[ \"$1\" == sync ]]; then exit 42; fi\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf 'git %s\\n' \"$*\" >>\"$SYNC_TRACE_FILE\"\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            fake_git_lfs = fake_bin / "git-lfs"
+            fake_git_lfs.write_text("#!/usr/bin/env bash\n", encoding="utf-8", newline="\n")
+            chmod = run_bash(
+                "-c",
+                "chmod 755 "
+                f"'{shell_path(fake_repo)}' '{shell_path(fake_git)}' "
+                f"'{shell_path(fake_git_lfs)}'",
+            )
+            self.assertEqual(0, chmod.returncode, chmod.stdout)
+
+            home = run_bash("-lc", "printf '%s' \"$HOME\"").stdout
+            workspace = f"{home}/.cache/flowerbed-tests/sync-failure-{uuid.uuid4().hex}"
+            try:
+                result = run_script_with_env(
+                    "scripts/ubuntu/sync.sh",
+                    {
+                        "PATH": f"{shell_path(fake_bin)}:/usr/bin:/bin",
+                        "SYNC_TRACE_FILE": shell_path(trace),
+                    },
+                    workspace,
+                )
+                self.assertEqual(42, result.returncode, result.stdout)
+                calls = trace.read_text(encoding="utf-8").splitlines()
+                self.assertTrue(any(call.startswith("repo init ") for call in calls))
+                self.assertTrue(any(call.startswith("repo sync ") for call in calls))
+                self.assertFalse(any(call.startswith("repo manifest ") for call in calls))
+                self.assertFalse(any(call.startswith("git ") for call in calls))
+            finally:
+                self.assertTrue(workspace.startswith(f"{home}/.cache/flowerbed-tests/"))
+                cleanup = run_bash("-c", f"rm -rf -- '{workspace}'")
+                self.assertEqual(0, cleanup.returncode, cleanup.stdout)
+
     def test_build_dry_run_is_side_effect_free_and_selects_fleur(self):
         workspace = f"/tmp/flowerbed-build-{uuid.uuid4().hex}"
         result = run_script("scripts/ubuntu/build.sh", "--dry-run", workspace)

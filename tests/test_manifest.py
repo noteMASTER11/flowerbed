@@ -42,12 +42,19 @@ class ManifestTest(unittest.TestCase):
         for _, revision in projects.values():
             self.assertRegex(revision, re.compile(r"^[0-9a-f]{40}$"))
 
-    def test_github_remote_is_https(self):
+    def test_dedicated_github_remote_is_https_and_collision_free(self):
         self.assertTrue(MANIFEST.is_file(), "candidate manifest is missing")
         root = ET.parse(MANIFEST).getroot()
-        remote = root.find("remote[@name='github']")
+        remote = root.find("remote[@name='flowerbed-github']")
         self.assertIsNotNone(remote)
         self.assertEqual("https://github.com/", remote.attrib["fetch"])
+        self.assertIsNone(root.find("remote[@name='github']"))
+        self.assertTrue(
+            all(
+                project.attrib["remote"] == "flowerbed-github"
+                for project in root.findall("project")
+            )
+        )
 
 
 if __name__ == "__main__":
