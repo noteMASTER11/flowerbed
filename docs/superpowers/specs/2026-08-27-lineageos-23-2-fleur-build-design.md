@@ -15,7 +15,7 @@ The work is complete only when all of the following are true:
 1. The Android source tree resides inside the Ubuntu WSL2 distro's ext4 filesystem with sufficient free space.
 2. A clean, pinned LineageOS 23.2 source checkout can be reproduced from the repository instructions.
 3. `lineage_fleur-userdebug` builds successfully and produces an installable OTA ZIP.
-4. The ZIP, related boot image, manifest snapshot, checksums, and build logs pass static verification.
+4. The ZIP, related boot image, manifest snapshot, checksums, and build logs pass static verification, including all expected firmware partitions in the OTA payload.
 5. The ZIP boots on a physical `fleur` device and completes the agreed smoke test.
 6. Known limitations, source provenance, exact revisions, and recovery instructions are documented.
 7. The repository contains no proprietary build artifacts, credentials, device backups, or large Android source trees.
@@ -89,6 +89,36 @@ The observed revisions are candidates, not an assertion of build success. The fi
 
 The current device tree does not provide a complete dependency manifest, so `flowerbed` supplies an explicit local manifest rather than relying on roomservice discovery.
 
+## Firmware Integration
+
+The initial build retains the firmware already supplied by the pinned `z3rh0/proprietary_vendor_xiaomi_fleur` source. No second firmware repository, recovery-script wrapper, or post-build ZIP modification is added.
+
+`vendor/xiaomi/fleur/BoardConfigVendor.mk` adds these firmware partitions to `AB_OTA_PARTITIONS`:
+
+```text
+audio_dsp
+gz
+lk
+logo
+md1img
+pi_img
+preloader_raw
+scp
+spmfw
+sspm
+tee
+```
+
+The resulting standard LineageOS Virtual A/B ZIP carries the partition images inside `payload.bin`. Installation is performed by `update_engine` as part of the same OTA transaction as the Android partitions. The standalone Xiaomi Firmware Updater ZIP is evidence and a provenance input, not an additional installation step.
+
+The source metadata contains a discrepancy that must remain visible in the provenance report:
+
+- `device/xiaomi/fleur/proprietary-firmware.txt` names Global `V816.0.9.0.TKEMIXM` as its historical fastboot extraction base.
+- Ten current pinned vendor `radio` images match the corresponding prefixes from the archived India `OS1.0.10.0.TKEINXM` firmware package after the generator's trailing-padding normalization.
+- `logo.img` is present and hash-checked in the pinned vendor source but is not included in the standalone Xiaomi Firmware Updater flashable firmware ZIP used for the ten-image comparison.
+
+For this reason, the binary content of the pinned vendor commit is authoritative for the build. The report identifies the ten matched images as India `OS1.0.10.0.TKEINXM`, records `logo.img` separately, and treats the Global comment as stale metadata rather than silently rewriting upstream history.
+
 ## Source Provenance Model
 
 The provenance report maps each known ROM build to its source set:
@@ -161,6 +191,9 @@ Before flashing, the following checks must pass:
 - ZIP structural integrity passes.
 - OTA metadata identifies `fleur` and the intended LineageOS version.
 - Expected boot and dynamic-partition payload content is present.
+- The payload partition manifest contains `audio_dsp`, `gz`, `lk`, `logo`, `md1img`, `pi_img`, `preloader_raw`, `scp`, `spmfw`, `sspm`, and `tee` in addition to the Android partitions.
+- Extracted full firmware images, or reconstructed full images when the payload uses deltas, match the pinned vendor inputs by recorded cryptographic hashes.
+- Firmware provenance records the pinned vendor commit, the archived Xiaomi Firmware Updater package URL and checksum, and the Global-versus-India metadata discrepancy.
 - SHA-256 checksums are generated for the ZIP and separately distributed images.
 - The manifest snapshot and working-tree patch state are recorded.
 - No unexpected proprietary files are added to `flowerbed`.
@@ -267,6 +300,7 @@ The final verification record includes:
 - A successful compile does not prove that the ROM boots or that radio, camera, NFC, encryption, and recovery work.
 - Community builds may combine undocumented patches. Their source provenance is used as evidence, not copied wholesale.
 - Firmware and regional model differences can affect hardware behavior even when the common codename is `fleur`.
+- The pinned 23.2 vendor source contains India-derived firmware even though an older device-tree comment names a Global base; replacing it by region would create a new source combination and is outside the approved initial baseline.
 
 ## Approved Decisions
 
@@ -274,5 +308,7 @@ The final verification record includes:
 - Use the clean `mt6781-devs` kernel for the initial build.
 - Keep host-specific WSL storage administration private and outside the repository.
 - Keep the build process visible in an open terminal and preserve complete logs.
+- Retain the current pinned vendor firmware set and include its eleven declared partitions in the standard LineageOS OTA payload.
+- Use the India `OS1.0.10.0.TKEINXM` match as provenance for the ten confirmed images, while recording `logo.img` and the stale Global source comment separately.
 - Validate the final ZIP on a physical device supplied through ADB.
 - Require separate confirmation immediately before destructive flashing or wiping.
