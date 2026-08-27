@@ -33,7 +33,8 @@ if [[ "$mode" == "dry-run" ]]; then
   printf 'DRY-RUN cd %q\n' "$workspace"
   printf 'DRY-RUN repo init -u https://github.com/LineageOS/android.git -b lineage-23.2 --git-lfs --no-clone-bundle\n'
   printf 'DRY-RUN install -m 0644 %q %q\n' "$manifest_source" "$local_manifest"
-  printf 'DRY-RUN repo sync --progress -c --force-sync --optimized-fetch --prune --no-tags -j8\n'
+  printf "DRY-RUN script --quiet --return --flush --command '%s' /dev/null\n" \
+    'repo sync -c --force-sync --optimized-fetch --prune --no-tags -j8'
   printf 'DRY-RUN verify pinned project revisions from %q\n' "$manifest_source"
   printf 'DRY-RUN repo manifest -r > %q\n' "$snapshot"
   exit 0
@@ -48,6 +49,7 @@ require_command repo
 require_command git
 require_command git-lfs
 require_command python3
+require_command script
 require_command tee
 [[ -f "$manifest_source" ]] || die "Missing local manifest: $manifest_source"
 
@@ -63,7 +65,11 @@ run_sync() {
     -b lineage-23.2 \
     --git-lfs \
     --no-clone-bundle
-  repo sync --progress -c --force-sync --optimized-fetch --prune --no-tags -j8
+  sync_arguments=(
+    repo sync -c --force-sync --optimized-fetch --prune --no-tags -j8
+  )
+  printf -v sync_command '%q ' "${sync_arguments[@]}"
+  script --quiet --return --flush --command "$sync_command" /dev/null
 
   while IFS=$'\t' read -r project_path revision; do
     actual="$(git -C "$workspace/$project_path" rev-parse HEAD)"

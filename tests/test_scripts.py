@@ -140,8 +140,8 @@ class ScriptTest(unittest.TestCase):
             result.stdout,
         )
         self.assertIn("fleur-lineage-23.2.xml", result.stdout)
+        self.assertIn("script --quiet --return --flush --command", result.stdout)
         self.assertIn("repo sync", result.stdout)
-        self.assertIn("repo sync --progress", result.stdout)
         self.assertIn("repo manifest -r", result.stdout)
         existence = run_bash("-c", f"test ! -e '{workspace}'")
         self.assertEqual(0, existence.returncode, existence.stdout)
@@ -169,7 +169,10 @@ class ScriptTest(unittest.TestCase):
                 "  grep -q 'flowerbed-github' "
                 ".repo/local_manifests/fleur-lineage-23.2.xml || exit 43\n"
                 "fi\n"
-                "if [[ \"$1\" == sync ]]; then exit 42; fi\n",
+                "if [[ \"$1\" == sync ]]; then\n"
+                "  [[ -t 1 && -t 2 ]] || exit 44\n"
+                "  exit 42\n"
+                "fi\n",
                 encoding="utf-8",
                 newline="\n",
             )
