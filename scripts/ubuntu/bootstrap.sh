@@ -22,11 +22,10 @@ packages=(
   lib32readline-dev
   lib32z1-dev
   libelf-dev
-  liblz4-tool
   libncurses-dev
   libssl-dev
-  libxml2
   libxml2-utils
+  lz4
   lzop
   pngcrush
   python-is-python3

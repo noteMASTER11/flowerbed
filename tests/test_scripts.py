@@ -24,11 +24,10 @@ PACKAGES = {
     "lib32readline-dev",
     "lib32z1-dev",
     "libelf-dev",
-    "liblz4-tool",
     "libncurses-dev",
     "libssl-dev",
-    "libxml2",
     "libxml2-utils",
+    "lz4",
     "lzop",
     "pngcrush",
     "python-is-python3",
@@ -101,6 +100,14 @@ def run_script_with_env(
 
 
 class ScriptTest(unittest.TestCase):
+    def test_bootstrap_uses_current_ubuntu_package_names(self):
+        result = run_script("scripts/ubuntu/bootstrap.sh", "--print-packages")
+        self.assertEqual(0, result.returncode, result.stdout)
+        packages = set(result.stdout.splitlines())
+        self.assertIn("lz4", packages)
+        self.assertNotIn("liblz4-tool", packages)
+        self.assertNotIn("libxml2", packages)
+
     def test_bootstrap_prints_exact_package_set_without_installing(self):
         result = run_script("scripts/ubuntu/bootstrap.sh", "--print-packages")
         self.assertEqual(0, result.returncode, result.stdout)
