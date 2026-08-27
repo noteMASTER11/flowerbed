@@ -32,6 +32,8 @@ PACKAGES = {
     "pngcrush",
     "python-is-python3",
     "python3",
+    "python3-protobuf",
+    "python3-six",
     "repo",
     "rsync",
     "schedtool",
