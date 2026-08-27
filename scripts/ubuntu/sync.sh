@@ -57,12 +57,12 @@ mkdir -p "$workspace/.repo/local_manifests" "$repo_root/manifests/snapshots" "$r
 
 run_sync() {
   cd "$workspace"
+  install -m 0644 "$manifest_source" "$local_manifest"
   repo init \
     -u https://github.com/LineageOS/android.git \
     -b lineage-23.2 \
     --git-lfs \
     --no-clone-bundle
-  install -m 0644 "$manifest_source" "$local_manifest"
   repo sync -c --force-sync --optimized-fetch --prune --no-tags -j8
 
   while IFS=$'\t' read -r project_path revision; do

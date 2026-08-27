@@ -164,6 +164,10 @@ class ScriptTest(unittest.TestCase):
             fake_repo.write_text(
                 "#!/usr/bin/env bash\n"
                 "printf 'repo %s\\n' \"$*\" >>\"$SYNC_TRACE_FILE\"\n"
+                "if [[ \"$1\" == init ]]; then\n"
+                "  grep -q 'flowerbed-github' "
+                ".repo/local_manifests/fleur-lineage-23.2.xml || exit 43\n"
+                "fi\n"
                 "if [[ \"$1\" == sync ]]; then exit 42; fi\n",
                 encoding="utf-8",
                 newline="\n",
