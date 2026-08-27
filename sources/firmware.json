@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "device": "fleur",
+  "vendorRepository": "z3rh0/proprietary_vendor_xiaomi_fleur",
+  "vendorRevision": "9430b0e8c9e7915fcac5257c21d1c539acaf94c6",
+  "archivePackage": {
+    "version": "OS1.0.10.0.TKEINXM",
+    "region": "India",
+    "filename": "fw_fleur_miui_FLEURINGlobal_OS1.0.10.0.TKEINXM_8680e64fbe_13.0.zip",
+    "url": "https://github.com/XiaomiFirmwareUpdaterReleases/firmware_xiaomi_fleur/releases/download/stable-28.12.2024/fw_fleur_miui_FLEURINGlobal_OS1.0.10.0.TKEINXM_8680e64fbe_13.0.zip",
+    "sha256": "ece414deac942f8fc55bcb8f1ece0b386feca4a0088cc1bf125fe59c87844fc6"
+  },
+  "partitions": [
+    {"name": "audio_dsp", "file": "radio/audio_dsp.img", "size": 822000, "sha256": "ada0e592f8aebe7fd5ef62298397b2fcbd2d5dfc9557e80b7d6c2df074833238", "xfuPrefixMatch": true},
+    {"name": "gz", "file": "radio/gz.img", "size": 2877248, "sha256": "10115cb17768ed54f8f4c8f654b15d6bc6a622f4a42a8a6c84c1f381b934e489", "xfuPrefixMatch": true},
+    {"name": "lk", "file": "radio/lk.img", "size": 1688704, "sha256": "5ae6e6ba6267532b8d766a3ee12f92b902eec2e5b0f94839fbac2ba699b5c44c", "xfuPrefixMatch": true},
+    {"name": "logo", "file": "radio/logo.img", "size": 4140736, "sha256": "f34e0bcd2a07c5c39b7e27299e7e9ce4a39a044f83f9c98b9a687bb471a1e88b", "xfuPrefixMatch": null},
+    {"name": "md1img", "file": "radio/md1img.img", "size": 53395200, "sha256": "e3383a8e7a1eb471f3b85469ceec75051d4a3cdb9991fbe02764a9ffdf005c9e", "xfuPrefixMatch": true},
+    {"name": "pi_img", "file": "radio/pi_img.img", "size": 5328, "sha256": "3d5ac0658abbf10da2b1578d21a73defae3cc4c169cc5b552add368acadec0e7", "xfuPrefixMatch": true},
+    {"name": "preloader_raw", "file": "radio/preloader_raw.img", "size": 360920, "sha256": "8e3755f74ebcb05849715e217d425fa559a4904f246945d89e5078836aa055df", "xfuPrefixMatch": true},
+    {"name": "scp", "file": "radio/scp.img", "size": 871456, "sha256": "a3d16cb458b2975e62e5fe689f36445f06ca24c06bcf500cc4d3e8ea85aec740", "xfuPrefixMatch": true},
+    {"name": "spmfw", "file": "radio/spmfw.img", "size": 16672, "sha256": "dc3c8ef2b18a160a1210aea0485082c0806fd4b1f7a1bfd2bd267179214e846b", "xfuPrefixMatch": true},
+    {"name": "sspm", "file": "radio/sspm.img", "size": 676720, "sha256": "b2859cd77c1392766f0b46c91aec573f341ddb51d21db8455f2de14b345bce36", "xfuPrefixMatch": true},
+    {"name": "tee", "file": "radio/tee.img", "size": 2614496, "sha256": "92366b832392468411018ce4e46a41bcdba430b6de06d57d2d34b39d911defaf", "xfuPrefixMatch": true}
+  ],
+  "metadataDiscrepancy": "The device-tree comment names Global V816.0.9.0.TKEMIXM, while ten current vendor images match the archived India OS1.0.10.0.TKEINXM package after trailing-padding normalization; logo.img is present only in the pinned vendor comparison set."
+}
+
