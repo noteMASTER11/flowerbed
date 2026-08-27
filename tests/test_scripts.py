@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import subprocess
+import tempfile
 import uuid
 import unittest
 
@@ -69,6 +70,34 @@ def run_bash(*args: str) -> subprocess.CompletedProcess:
 
 def run_script(relative: str, *args: str) -> subprocess.CompletedProcess:
     return run_bash(shell_path(ROOT / relative), *args)
+
+
+def run_script_with_env(
+    relative: str, environment: dict[str, str], *args: str
+) -> subprocess.CompletedProcess:
+    assignments = [f"{key}={value}" for key, value in environment.items()]
+    script = shell_path(ROOT / relative)
+    if os.name == "nt":
+        command = [
+            "wsl.exe",
+            "-d",
+            "Ubuntu",
+            "--",
+            "env",
+            *assignments,
+            "bash",
+            script,
+            *args,
+        ]
+    else:
+        command = ["env", *assignments, "bash", script, *args]
+    return subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
 
 
 class ScriptTest(unittest.TestCase):
@@ -141,6 +170,63 @@ class ScriptTest(unittest.TestCase):
                 )
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn("jobs must be a positive integer", result.stdout.lower())
+
+    def test_device_collection_dry_run_has_no_side_effects(self):
+        output = f"/tmp/flowerbed-device-{uuid.uuid4().hex}"
+        result = run_script(
+            "scripts/ubuntu/collect_device_logs.sh",
+            "--dry-run",
+            output,
+        )
+        self.assertEqual(0, result.returncode, result.stdout)
+        self.assertIn("adb shell getprop ro.product.device", result.stdout)
+        self.assertIn("adb shell getprop ro.miui.build.region", result.stdout)
+        self.assertIn("adb shell ls -l /dev/block/bootdevice/by-name", result.stdout)
+        self.assertIn("adb logcat -b all -d -v threadtime", result.stdout)
+        existence = run_bash("-c", f"test ! -e '{output}'")
+        self.assertEqual(0, existence.returncode, existence.stdout)
+
+    def test_device_collection_executes_only_read_only_adb_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            trace = root / "adb.trace"
+            output = root / "device-output"
+            fake_adb = fake_bin / "adb"
+            fake_adb.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$*\" >>\"$ADB_TRACE_FILE\"\n"
+                "if [[ \"$*\" == get-state ]]; then printf 'device\\n'; exit 0; fi\n"
+                "if [[ \"$*\" == 'shell dmesg' ]]; then printf 'permission denied\\n'; exit 1; fi\n"
+                "printf 'fixture: %s\\n' \"$*\"\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            fake_bin_wsl = shell_path(fake_bin)
+            trace_wsl = shell_path(trace)
+            output_wsl = shell_path(output)
+            chmod = run_bash("-c", f"chmod 755 '{shell_path(fake_adb)}'")
+            self.assertEqual(0, chmod.returncode, chmod.stdout)
+            result = run_script_with_env(
+                "scripts/ubuntu/collect_device_logs.sh",
+                {
+                    "PATH": f"{fake_bin_wsl}:/usr/bin:/bin",
+                    "ADB_TRACE_FILE": trace_wsl,
+                },
+                output_wsl,
+            )
+            self.assertEqual(0, result.returncode, result.stdout)
+            calls = trace.read_text(encoding="utf-8").splitlines()
+            self.assertIn("get-state", calls)
+            self.assertIn("shell getprop ro.product.device", calls)
+            self.assertIn("shell ls -l /dev/block/bootdevice/by-name", calls)
+            self.assertIn("shell dmesg", calls)
+            forbidden = ("reboot", "sideload", "flash", "erase", "wipe", "get-serialno")
+            self.assertFalse(any(token in call for call in calls for token in forbidden))
+            self.assertTrue((output / "properties.txt").is_file())
+            self.assertTrue((output / "partitions.txt").is_file())
+            self.assertIn("permission denied", (output / "dmesg.txt").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
