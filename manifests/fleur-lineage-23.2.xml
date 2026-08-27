@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="github" fetch="https://github.com/" />
+  <project path="device/xiaomi/fleur" name="mt6781-devs/android_device_xiaomi_fleur" remote="github" revision="45289f6f6e94fc90870d27477d42a89c735fcff5" />
+  <project path="vendor/xiaomi/fleur" name="z3rh0/proprietary_vendor_xiaomi_fleur" remote="github" revision="9430b0e8c9e7915fcac5257c21d1c539acaf94c6" />
+  <project path="kernel/xiaomi/mt6781" name="mt6781-devs/android_kernel_xiaomi_mt6781" remote="github" revision="9996b68a1808b38f2f9e7798b26479e721bc2a84" />
+  <project path="hardware/mediatek" name="mt6781-devs/android_hardware_mediatek" remote="github" revision="8d18fc6d5b3a63fe2abf9e935947f71c484db291" />
+  <project path="device/mediatek/sepolicy_vndr" name="mt6781-devs/android_device_mediatek_sepolicy_vndr" remote="github" revision="dc6d099b7a1b85a38151b80e675684888ef22683" />
+</manifest>
