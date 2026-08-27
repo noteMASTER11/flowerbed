@@ -116,6 +116,30 @@ class ScriptTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("must not be under /mnt", result.stdout)
 
+    def test_build_dry_run_is_side_effect_free_and_selects_fleur(self):
+        workspace = f"/tmp/flowerbed-build-{uuid.uuid4().hex}"
+        result = run_script("scripts/ubuntu/build.sh", "--dry-run", workspace)
+        self.assertEqual(0, result.returncode, result.stdout)
+        self.assertIn("source build/envsetup.sh", result.stdout)
+        self.assertIn("breakfast fleur", result.stdout)
+        self.assertIn("m bacon -j8", result.stdout)
+        self.assertIn("USE_CCACHE=1", result.stdout)
+        existence = run_bash("-c", f"test ! -e '{workspace}'")
+        self.assertEqual(0, existence.returncode, existence.stdout)
+
+    def test_build_rejects_non_positive_jobs(self):
+        for value in ("0", "-1", "not-a-number"):
+            with self.subTest(jobs=value):
+                result = run_script(
+                    "scripts/ubuntu/build.sh",
+                    "--dry-run",
+                    "--jobs",
+                    value,
+                    "/tmp/unused-build-workspace",
+                )
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("jobs must be a positive integer", result.stdout.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
