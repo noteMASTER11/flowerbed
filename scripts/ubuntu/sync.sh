@@ -33,7 +33,7 @@ if [[ "$mode" == "dry-run" ]]; then
   printf 'DRY-RUN cd %q\n' "$workspace"
   printf 'DRY-RUN repo init -u https://github.com/LineageOS/android.git -b lineage-23.2 --git-lfs --no-clone-bundle\n'
   printf 'DRY-RUN install -m 0644 %q %q\n' "$manifest_source" "$local_manifest"
-  printf 'DRY-RUN repo sync -c --force-sync --optimized-fetch --prune --no-tags -j8\n'
+  printf 'DRY-RUN repo sync --progress -c --force-sync --optimized-fetch --prune --no-tags -j8\n'
   printf 'DRY-RUN verify pinned project revisions from %q\n' "$manifest_source"
   printf 'DRY-RUN repo manifest -r > %q\n' "$snapshot"
   exit 0
@@ -63,7 +63,7 @@ run_sync() {
     -b lineage-23.2 \
     --git-lfs \
     --no-clone-bundle
-  repo sync -c --force-sync --optimized-fetch --prune --no-tags -j8
+  repo sync --progress -c --force-sync --optimized-fetch --prune --no-tags -j8
 
   while IFS=$'\t' read -r project_path revision; do
     actual="$(git -C "$workspace/$project_path" rev-parse HEAD)"

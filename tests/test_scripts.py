@@ -141,6 +141,7 @@ class ScriptTest(unittest.TestCase):
         )
         self.assertIn("fleur-lineage-23.2.xml", result.stdout)
         self.assertIn("repo sync", result.stdout)
+        self.assertIn("repo sync --progress", result.stdout)
         self.assertIn("repo manifest -r", result.stdout)
         existence = run_bash("-c", f"test ! -e '{workspace}'")
         self.assertEqual(0, existence.returncode, existence.stdout)
