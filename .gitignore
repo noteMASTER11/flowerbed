@@ -1,0 +1,16 @@
+artifacts/
+logs/
+reports/private/
+.cache/
+out/
+__pycache__/
+*.pyc
+*.log
+*.img
+*.zip
+*.tar
+*.tar.gz
+*.tar.xz
+*.vhd
+*.vhdx
+
