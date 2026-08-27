@@ -18,3 +18,24 @@ Building is non-destructive. Flashing, sideloading, formatting data, and changin
 
 Host-specific WSL storage administration is intentionally outside this repository.
 
+## Quick start
+
+Run the repository tooling from Ubuntu under WSL2. Keep both this checkout and the
+Android source tree inside the distribution's Linux filesystem, not under `/mnt/c`
+or `/mnt/d`.
+
+```bash
+git clone https://github.com/noteMASTER11/flowerbed.git ~/src/flowerbed
+cd ~/src/flowerbed
+scripts/ubuntu/bootstrap.sh
+scripts/ubuntu/sync.sh ~/android/lineage-23.2
+scripts/ubuntu/build.sh --jobs 8 ~/android/lineage-23.2
+```
+
+The build produces a standard LineageOS Virtual A/B OTA ZIP. The pinned firmware
+images are included in its `payload.bin`; no separate firmware flash is required.
+
+Continue with [build and install](docs/build-and-install.md), then run the
+[device validation](docs/device-validation.md). Source and firmware selection is
+recorded in [source provenance](docs/source-provenance.md). See
+[troubleshooting](docs/troubleshooting.md) for known WSL2 and build failures.
