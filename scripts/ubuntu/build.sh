@@ -36,6 +36,8 @@ workspace="${workspace:-${HOME}/android/lineage-23.2}"
 
 if [[ "$dry_run" == true ]]; then
   printf 'DRY-RUN cd %q\n' "$workspace"
+  # The dry-run must print, not execute, this substitution.
+  # shellcheck disable=SC2016
   printf 'DRY-RUN export USE_CCACHE=1 CCACHE_EXEC=$(command -v ccache) BUILD_USERNAME=flowerbed BUILD_HOSTNAME=wsl2-builder\n'
   printf 'DRY-RUN ccache -M 100G\n'
   printf 'DRY-RUN ccache -z\n'

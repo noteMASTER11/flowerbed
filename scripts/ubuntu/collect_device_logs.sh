@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=lib/common.sh
+source "$script_dir/lib/common.sh"
 
 
 usage() {

@@ -23,7 +23,7 @@ jobs:
       - name: Validate shell scripts
         run: |
           bash -n scripts/ubuntu/*.sh scripts/ubuntu/lib/*.sh
-          shellcheck scripts/ubuntu/*.sh scripts/ubuntu/lib/*.sh
+          shellcheck -x -P scripts/ubuntu scripts/ubuntu/*.sh scripts/ubuntu/lib/*.sh
       - name: Verify generated provenance is current
         run: |
           temporary="$(mktemp)"
