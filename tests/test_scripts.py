@@ -226,6 +226,62 @@ class ScriptTest(unittest.TestCase):
         existence = run_bash("-c", f"test ! -e '{workspace}'")
         self.assertEqual(0, existence.returncode, existence.stdout)
 
+    def test_build_sources_android_envsetup_without_nounset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            fake_ccache = fake_bin / "ccache"
+            fake_ccache.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf 'ccache:%s\\n' \"$*\"\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            envsetup = fixture / "envsetup.sh"
+            envsetup.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ -z \"$TOP\" ]]; then TOP=$PWD; fi\n"
+                "breakfast() { printf 'breakfast:%s\\n' \"$*\"; }\n"
+                "m() { printf 'm:%s\\n' \"$*\"; }\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+
+            home = run_bash("-lc", "printf '%s' \"$HOME\"").stdout
+            sandbox = f"{home}/.cache/flowerbed-tests/build-envsetup-{uuid.uuid4().hex}"
+            repo = f"{sandbox}/repo"
+            workspace = f"{sandbox}/android"
+            try:
+                setup = run_bash(
+                    "-c",
+                    f"mkdir -p '{repo}/scripts/ubuntu/lib' "
+                    f"'{workspace}/build' '{workspace}/device/xiaomi/fleur' "
+                    f"'{workspace}/vendor/xiaomi/fleur' '{workspace}/kernel/xiaomi/mt6781' && "
+                    f"cp '{shell_path(ROOT / 'scripts/ubuntu/build.sh')}' "
+                    f"'{repo}/scripts/ubuntu/build.sh' && "
+                    f"cp '{shell_path(ROOT / 'scripts/ubuntu/lib/common.sh')}' "
+                    f"'{repo}/scripts/ubuntu/lib/common.sh' && "
+                    f"cp '{shell_path(envsetup)}' '{workspace}/build/envsetup.sh' && "
+                    f"chmod 755 '{repo}/scripts/ubuntu/build.sh' "
+                    f"'{repo}/scripts/ubuntu/lib/common.sh' "
+                    f"'{workspace}/build/envsetup.sh' '{shell_path(fake_ccache)}'",
+                )
+                self.assertEqual(0, setup.returncode, setup.stdout)
+
+                result = run_bash(
+                    "-c",
+                    f"PATH='{shell_path(fake_bin)}:/usr/bin:/bin' "
+                    f"bash '{repo}/scripts/ubuntu/build.sh' --jobs 8 '{workspace}'",
+                )
+                self.assertEqual(0, result.returncode, result.stdout)
+                self.assertIn("breakfast:fleur", result.stdout)
+                self.assertIn("m:bacon -j8", result.stdout)
+            finally:
+                self.assertTrue(sandbox.startswith(f"{home}/.cache/flowerbed-tests/"))
+                cleanup = run_bash("-c", f"rm -rf -- '{sandbox}'")
+                self.assertEqual(0, cleanup.returncode, cleanup.stdout)
+
     def test_build_rejects_non_positive_jobs(self):
         for value in ("0", "-1", "not-a-number"):
             with self.subTest(jobs=value):

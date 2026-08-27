@@ -74,6 +74,10 @@ run_build() {
   export BUILD_HOSTNAME=wsl2-builder
   ccache -M 100G
   ccache -z
+  # Android's envsetup intentionally probes variables such as TOP before
+  # defining them. This function runs in the pipeline subshell, so relaxing
+  # nounset here does not weaken the wrapper after the build returns.
+  set +u
   # shellcheck disable=SC1091
   source build/envsetup.sh
   breakfast fleur
