@@ -1,0 +1,13 @@
+diff --git a/device.mk b/device.mk
+index 59f3d0e..fd24c30 100644
+--- a/device.mk
++++ b/device.mk
+@@ -182,7 +182,7 @@
+ # Graphics
+ PRODUCT_PACKAGES += \
+     android.hardware.graphics.composer@2.3-service \
+-    android.hardware.memtrack-service.mediatek-mali
++    android.hardware.memtrack-service.mediatek
+ 
+ # Health
+ PRODUCT_PACKAGES += \

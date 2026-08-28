@@ -1,0 +1,14 @@
+diff --git a/sepolicy/vendor/property_contexts b/sepolicy/vendor/property_contexts
+index 3f511a4..e2a5c17 100644
+--- a/sepolicy/vendor/property_contexts
++++ b/sepolicy/vendor/property_contexts
+@@ -2,9 +2,6 @@
+ persist.vendor.camera. u:object_r:vendor_camera_persist_prop:s0
+ vendor.camera. u:object_r:vendor_camera_prop:s0
+ vendor.debug. u:object_r:vendor_camera_prop:s0
+-
+-# Dynamic sensor
+-vendor.dynamic_sensor. u:object_r:vendor_dynamic_sensor_prop:s0
+ 
+ # Fingerprint
+ persist.vendor.sys.fp. u:object_r:vendor_fp_prop:s0

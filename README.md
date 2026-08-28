@@ -2,7 +2,10 @@
 
 Reproducible build and validation tooling for an unofficial LineageOS 23.2 build for Xiaomi Redmi Note 11S 4G and POCO M4 Pro 4G (`fleur`).
 
-The ROM is experimental until device validation passes. No build from this repository is official LineageOS software.
+The 2026-08-28 build is operator-reported as installed and booting on physical
+hardware. The full device smoke-test matrix is still incomplete, so the ROM
+remains experimental. No build from this repository is official LineageOS
+software.
 
 ## Safety
 
@@ -39,3 +42,10 @@ Continue with [build and install](docs/build-and-install.md), then run the
 [device validation](docs/device-validation.md). Source and firmware selection is
 recorded in [source provenance](docs/source-provenance.md). See
 [troubleshooting](docs/troubleshooting.md) for known WSL2 and build failures.
+The separate [SP Flash Tool V6 reference package](docs/sp-flash-tool.md) uses an
+adapted Download-XML and deliberately leaves authentication unspecified.
+
+The complete Russian build, troubleshooting, and installation guide is in the
+[GitHub Wiki](https://github.com/noteMASTER11/flowerbed/wiki). The sanitized
+[build report](reports/build-report.md) and [device validation report](reports/device-validation.md)
+record the evidence level of the 2026-08-28 artifacts.

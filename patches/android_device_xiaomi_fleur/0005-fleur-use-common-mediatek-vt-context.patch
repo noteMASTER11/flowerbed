@@ -1,0 +1,10 @@
+diff --git a/sepolicy/vendor/property_contexts b/sepolicy/vendor/property_contexts
+index e2a5c17..7f053df 100644
+--- a/sepolicy/vendor/property_contexts
++++ b/sepolicy/vendor/property_contexts
+@@ -12,5 +12,4 @@
+ # RIL
+ ro.vendor.oem. u:object_r:vendor_mtk_radio_prop:s0
+-ro.vendor.vt. u:object_r:vendor_mtk_radio_prop:s0
+ 
+ # Thermal

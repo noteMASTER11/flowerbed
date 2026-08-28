@@ -142,6 +142,7 @@ class ScriptTest(unittest.TestCase):
         self.assertIn("fleur-lineage-23.2.xml", result.stdout)
         self.assertIn("script --quiet --return --flush --command", result.stdout)
         self.assertIn("repo sync", result.stdout)
+        self.assertIn("apply_patches.sh", result.stdout)
         self.assertIn("repo manifest -r", result.stdout)
         existence = run_bash("-c", f"test ! -e '{workspace}'")
         self.assertEqual(0, existence.returncode, existence.stdout)
@@ -215,6 +216,107 @@ class ScriptTest(unittest.TestCase):
                 cleanup = run_bash("-c", f"rm -rf -- '{workspace}'")
                 self.assertEqual(0, cleanup.returncode, cleanup.stdout)
 
+    def test_apply_patches_selects_memtrack_module_defined_by_pinned_hardware(self):
+        home = run_bash("-lc", "printf '%s' \"$HOME\"").stdout
+        sandbox = f"{home}/.cache/flowerbed-tests/apply-patches-{uuid.uuid4().hex}"
+        device_tree = f"{sandbox}/device/xiaomi/fleur"
+        try:
+            setup = run_bash(
+                "-c",
+                f"mkdir -p '{device_tree}/sepolicy/vendor' && "
+                f"printf '%s\\n' '# Graphics' 'PRODUCT_PACKAGES += \\' "
+                f"'    android.hardware.graphics.composer@2.3-service \\' "
+                f"'    android.hardware.memtrack-service.mediatek-mali' '' "
+                f"'# Health' 'PRODUCT_PACKAGES += \\' "
+                f">'{device_tree}/device.mk' && "
+                f"printf '%s\\n' 'vendor_public_prop(vendor_thermal_engine_prop)' "
+                f"'vendor_restricted_prop(vendor_camera_prop)' "
+                f"'vendor_internal_prop(vendor_camera_persist_prop)' "
+                f"'vendor_internal_prop(vendor_dynamic_sensor_prop)' "
+                f">'{device_tree}/sepolicy/vendor/property.te' && "
+                f"printf '%s\\n' '# Graphics' "
+                f"'genfscon sysfs /devices/platform/14000000.dispsys_config/drm/card0/card0-DSI-1/panel_event u:object_r:vendor_sysfs_panel:s0' "
+                f"'genfscon sysfs /devices/platform/14000000.dispsys_config/drm/card0/card0-DSI-1/panel_info u:object_r:vendor_sysfs_panel:s0' "
+                f"'genfscon sysfs /devices/platform/14000000.dispsys_config/idle_state u:object_r:vendor_sysfs_panel:s0' "
+                f"'genfscon sysfs /devices/platform/13000000.mali/dvfs_period u:object_r:sysfs_gpu:s0' "
+                f"'genfscon sysfs /devices/platform/13000000.mali/js_ctx_scheduling_mode u:object_r:sysfs_gpu:s0' "
+                f"'genfscon sysfs /devices/platform/13000000.mali/js_scheduling_period u:object_r:sysfs_gpu:s0' "
+                f"'' '# Health' "
+                f">'{device_tree}/sepolicy/vendor/genfs_contexts' && "
+                f"printf '%s\\n' '# Camera' "
+                f"'persist.vendor.camera. u:object_r:vendor_camera_persist_prop:s0' "
+                f"'vendor.camera. u:object_r:vendor_camera_prop:s0' "
+                f"'vendor.debug. u:object_r:vendor_camera_prop:s0' "
+                f"'' '# Dynamic sensor' "
+                f"'vendor.dynamic_sensor. u:object_r:vendor_dynamic_sensor_prop:s0' "
+                f"'' '# Fingerprint' "
+                f"'persist.vendor.sys.fp. u:object_r:vendor_fp_prop:s0' "
+                f"'' '# RIL' "
+                f"'ro.vendor.oem. u:object_r:vendor_mtk_radio_prop:s0' "
+                f"'ro.vendor.vt. u:object_r:vendor_mtk_radio_prop:s0' "
+                f"'' '# Thermal' "
+                f">'{device_tree}/sepolicy/vendor/property_contexts' && "
+                f"git -C '{device_tree}' init -q && "
+                f"git -C '{device_tree}' add device.mk sepolicy/vendor/property.te "
+                f"sepolicy/vendor/genfs_contexts sepolicy/vendor/property_contexts && "
+                f"git -C '{device_tree}' -c user.name=Test "
+                f"-c user.email=test@example.invalid commit -qm fixture",
+            )
+            self.assertEqual(0, setup.returncode, setup.stdout)
+
+            result = run_script("scripts/ubuntu/apply_patches.sh", sandbox)
+            self.assertEqual(0, result.returncode, result.stdout)
+            device_mk = run_bash("-c", f"cat '{device_tree}/device.mk'")
+            self.assertEqual(0, device_mk.returncode, device_mk.stdout)
+            self.assertIn(
+                "android.hardware.memtrack-service.mediatek\n",
+                device_mk.stdout,
+            )
+            self.assertNotIn(
+                "android.hardware.memtrack-service.mediatek-mali",
+                device_mk.stdout,
+            )
+            property_te = run_bash(
+                "-c", f"cat '{device_tree}/sepolicy/vendor/property.te'"
+            )
+            self.assertEqual(0, property_te.returncode, property_te.stdout)
+            self.assertNotIn(
+                "vendor_internal_prop(vendor_dynamic_sensor_prop)",
+                property_te.stdout,
+            )
+            self.assertIn(
+                "vendor_public_prop(vendor_thermal_engine_prop)",
+                property_te.stdout,
+            )
+            genfs_contexts = run_bash(
+                "-c", f"cat '{device_tree}/sepolicy/vendor/genfs_contexts'"
+            )
+            self.assertEqual(0, genfs_contexts.returncode, genfs_contexts.stdout)
+            self.assertNotIn(
+                "/devices/platform/13000000.mali/",
+                genfs_contexts.stdout,
+            )
+            self.assertIn(
+                "/devices/platform/14000000.dispsys_config/idle_state",
+                genfs_contexts.stdout,
+            )
+            property_contexts = run_bash(
+                "-c", f"cat '{device_tree}/sepolicy/vendor/property_contexts'"
+            )
+            self.assertEqual(0, property_contexts.returncode, property_contexts.stdout)
+            self.assertNotIn("vendor.dynamic_sensor.", property_contexts.stdout)
+            self.assertIn("persist.vendor.camera.", property_contexts.stdout)
+            self.assertNotIn("ro.vendor.vt.", property_contexts.stdout)
+            self.assertIn("ro.vendor.oem.", property_contexts.stdout)
+
+            second = run_script("scripts/ubuntu/apply_patches.sh", sandbox)
+            self.assertEqual(0, second.returncode, second.stdout)
+            self.assertIn("already applied", second.stdout.lower())
+        finally:
+            self.assertTrue(sandbox.startswith(f"{home}/.cache/flowerbed-tests/"))
+            cleanup = run_bash("-c", f"rm -rf -- '{sandbox}'")
+            self.assertEqual(0, cleanup.returncode, cleanup.stdout)
+
     def test_build_dry_run_is_side_effect_free_and_selects_fleur(self):
         workspace = f"/tmp/flowerbed-build-{uuid.uuid4().hex}"
         result = run_script("scripts/ubuntu/build.sh", "--dry-run", workspace)
@@ -225,6 +327,18 @@ class ScriptTest(unittest.TestCase):
         self.assertIn("USE_CCACHE=1", result.stdout)
         existence = run_bash("-c", f"test ! -e '{workspace}'")
         self.assertEqual(0, existence.returncode, existence.stdout)
+
+    def test_build_verbose_passes_verbose_flag_to_ninja(self):
+        result = run_script(
+            "scripts/ubuntu/build.sh",
+            "--dry-run",
+            "--verbose",
+            "/tmp/unused-build-workspace",
+        )
+        self.assertEqual(0, result.returncode, result.stdout)
+        self.assertIn("export SOONG_UI_NINJA_ARGS=-v", result.stdout)
+        self.assertIn("m bacon -j8", result.stdout)
+        self.assertNotIn("showcommands", result.stdout)
 
     def test_build_sources_android_envsetup_without_nounset(self):
         with tempfile.TemporaryDirectory() as directory:

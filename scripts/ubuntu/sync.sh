@@ -36,6 +36,7 @@ if [[ "$mode" == "dry-run" ]]; then
   printf "DRY-RUN script --quiet --return --flush --command '%s' /dev/null\n" \
     'repo sync -c --force-sync --optimized-fetch --prune --no-tags -j8'
   printf 'DRY-RUN verify pinned project revisions from %q\n' "$manifest_source"
+  printf 'DRY-RUN %q %q\n' "$script_dir/apply_patches.sh" "$workspace"
   printf 'DRY-RUN repo manifest -r > %q\n' "$snapshot"
   exit 0
 fi
@@ -84,6 +85,8 @@ for project in ET.parse(sys.argv[1]).getroot().findall("project"):
     print(f"{project.attrib['path']}\t{project.attrib['revision']}")
 PY
   )
+
+  "$script_dir/apply_patches.sh" "$workspace"
 
   temporary_snapshot="${snapshot}.tmp"
   repo manifest -r >"$temporary_snapshot"

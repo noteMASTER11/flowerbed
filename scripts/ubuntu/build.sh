@@ -6,6 +6,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$script_dir/lib/common.sh"
 
 dry_run=false
+verbose=false
 jobs=8
 workspace=""
 
@@ -19,6 +20,10 @@ while (($#)); do
       [[ $# -ge 2 ]] || die "--jobs requires a value"
       jobs="$2"
       shift 2
+      ;;
+    --verbose)
+      verbose=true
+      shift
       ;;
     -*)
       die "Unknown option: $1"
@@ -43,6 +48,9 @@ if [[ "$dry_run" == true ]]; then
   printf 'DRY-RUN ccache -z\n'
   printf 'DRY-RUN source build/envsetup.sh\n'
   printf 'DRY-RUN breakfast fleur\n'
+  if [[ "$verbose" == true ]]; then
+    printf 'DRY-RUN export SOONG_UI_NINJA_ARGS=-v\n'
+  fi
   printf 'DRY-RUN m bacon -j%s\n' "$jobs"
   exit 0
 fi
@@ -81,7 +89,11 @@ run_build() {
   # shellcheck disable=SC1091
   source build/envsetup.sh
   breakfast fleur
-  m bacon "-j$jobs"
+  build_goals=(bacon "-j$jobs")
+  if [[ "$verbose" == true ]]; then
+    export SOONG_UI_NINJA_ARGS=-v
+  fi
+  m "${build_goals[@]}"
 }
 
 set +e

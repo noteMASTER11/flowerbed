@@ -6,4 +6,5 @@
   <project path="kernel/xiaomi/mt6781" name="mt6781-devs/android_kernel_xiaomi_mt6781" remote="flowerbed-github" revision="9996b68a1808b38f2f9e7798b26479e721bc2a84" />
   <project path="hardware/mediatek" name="mt6781-devs/android_hardware_mediatek" remote="flowerbed-github" revision="8d18fc6d5b3a63fe2abf9e935947f71c484db291" />
   <project path="device/mediatek/sepolicy_vndr" name="mt6781-devs/android_device_mediatek_sepolicy_vndr" remote="flowerbed-github" revision="dc6d099b7a1b85a38151b80e675684888ef22683" />
+  <project path="hardware/xiaomi" name="LineageOS/android_hardware_xiaomi" remote="flowerbed-github" revision="1ad18efb60bc5c3cf794213fb29822837e38c1f8" />
 </manifest>
