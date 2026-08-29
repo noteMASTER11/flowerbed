@@ -19,6 +19,7 @@ patch_specs=(
   "device/xiaomi/fleur|patches/android_device_xiaomi_fleur/0004-fleur-drop-duplicate-dynamic-sensor-context.patch"
   "device/xiaomi/fleur|patches/android_device_xiaomi_fleur/0005-fleur-use-common-mediatek-vt-context.patch"
   "device/xiaomi/fleur|patches/android_device_xiaomi_fleur/0006-fleur-expose-sku-market-names.patch"
+  "kernel/xiaomi/mt6781|patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch"
 )
 
 for patch_spec in "${patch_specs[@]}"; do

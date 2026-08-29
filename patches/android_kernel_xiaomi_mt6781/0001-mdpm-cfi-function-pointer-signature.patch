@@ -1,0 +1,16 @@
+diff --git a/drivers/misc/mediatek/base/power/include/mdpm_v2/mt6781/mtk_mdpm_platform.h b/drivers/misc/mediatek/base/power/include/mdpm_v2/mt6781/mtk_mdpm_platform.h
+index af0f3c243224..41ef63a1618a 100644
+--- a/drivers/misc/mediatek/base/power/include/mdpm_v2/mt6781/mtk_mdpm_platform.h
++++ b/drivers/misc/mediatek/base/power/include/mdpm_v2/mt6781/mtk_mdpm_platform.h
+@@ -201,8 +201,9 @@ struct mdpm_scenario {
+ 	char scenario_name[MAX_MDPM_NAME_LEN];
+ 	struct scenario_power_type_t *scenario_power;
+ 	enum tx_rat_type tx_power_rat[MAX_DBM_FUNC_NUM];
+-	int (*tx_power_func)(u32 *dbm_mem, u32 *old_dbm_mem, unsigned int rat,
+-		unsigned int power_type, struct md_power_status *md_power_s);
++	int (*tx_power_func)(u32 *dbm_mem, u32 *old_dbm_mem,
++		enum tx_rat_type rat, enum mdpm_power_type power_type,
++		struct md_power_status *md_power_s);
+ };
+ 
+ #ifdef MD_POWER_UT

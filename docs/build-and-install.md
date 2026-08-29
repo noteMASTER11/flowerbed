@@ -38,12 +38,17 @@ It configures a 100 GB maximum ccache size.
 ```bash
 cd ~/src/flowerbed
 scripts/ubuntu/sync.sh ~/android/lineage-23.2
+scripts/ubuntu/apply_patches.sh ~/android/lineage-23.2
 ```
 
 The sync script initializes the LineageOS 23.2 platform, installs the local
 manifest, verifies every pinned project HEAD, and writes a timestamped resolved
 manifest to `manifests/snapshots/`. Its terminal output is also saved under
 `logs/`.
+
+The patch step is mandatory. In particular, it applies the MT6781 MDPM CFI
+function-pointer type correction required for a bootable `fleur` kernel. It
+keeps CFI enabled and must be rerun after syncing a fresh source tree.
 
 ## Build the OTA
 

@@ -1,0 +1,11 @@
+{
+  "project": "kernel/xiaomi/mt6781",
+  "file": "drivers/misc/mediatek/base/power/include/mdpm_v2/mt6781/mtk_mdpm_platform.h",
+  "base_commit": "9996b68a1808b38f2f9e7798b26479e721bc2a84",
+  "patch_sha256": "ab47ff9bfa68dad9b5dbb1c1e8b5c87c647e1e74c30862915696499cc86dec5a",
+  "verified_package_patch_sha256": "f7b629c87f44ea2e7a05cc56e44fa7d890793b8c696875c365fbcd74bf9d5274",
+  "rejected_pre_fix_boot_sha256": "9356e7d53016e8a6cf22267abe75b06d50dfeb8d9df90ba99e8e449c3e4544db",
+  "hardware_tested_fixed_boot_sha256": "afcc938905b241053d3d34d5c9f95a8e2d8e706a67d13a493b52ee502676c0a9",
+  "root_cause": "CFI rejects the tx_power_func function-pointer call because its declaration uses unsigned int where the implementation uses enum tx_rat_type and enum mdpm_power_type.",
+  "cfi_remains_enabled": true
+}

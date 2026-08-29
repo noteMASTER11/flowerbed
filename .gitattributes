@@ -4,3 +4,4 @@
 *.json text eol=lf
 *.yml text eol=lf
 *.md text eol=lf
+patches/android_kernel_xiaomi_mt6781/*.patch whitespace=-trailing-space,-space-before-tab
