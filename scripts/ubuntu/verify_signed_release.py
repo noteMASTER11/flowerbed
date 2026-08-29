@@ -839,6 +839,16 @@ def _verify_boot_component_transform(
     signed_entries = signed_boot.get("ramdisk_entries")
     if not isinstance(unsigned_entries, Mapping) or not isinstance(signed_entries, Mapping):
         raise VerificationError("boot ramdisk evidence is missing")
+    unsigned_order = unsigned_boot.get("ramdisk_record_order")
+    signed_order = signed_boot.get("ramdisk_record_order")
+    if (
+        not isinstance(unsigned_order, tuple)
+        or not isinstance(signed_order, tuple)
+        or unsigned_order != tuple(unsigned_entries)
+        or signed_order != tuple(signed_entries)
+        or unsigned_order != signed_order
+    ):
+        raise VerificationError("signed boot ramdisk record order differs")
     if set(unsigned_entries) != set(signed_entries):
         raise VerificationError("signed boot ramdisk member inventory differs")
     changed: list[str] = []
@@ -1519,6 +1529,7 @@ def _parse_boot_header_info(text: str) -> dict[str, str]:
 
 def _parse_newc_ramdisk(data: bytes) -> dict[str, object]:
     entries: dict[str, dict[str, object]] = {}
+    record_order: list[str] = []
     offset = 0
     trailer_metadata: tuple[int, ...] | None = None
     trailer_end: int | None = None
@@ -1526,11 +1537,17 @@ def _parse_newc_ramdisk(data: bytes) -> dict[str, object]:
         header = data[offset : offset + 110]
         if header[:6] != b"070701":
             raise VerificationError("boot ramdisk is not a canonical newc archive")
+        encoded_values = tuple(
+            header[6 + index * 8 : 14 + index * 8]
+            for index in range(13)
+        )
+        if any(
+            re.fullmatch(rb"[0-9a-f]{8}", value) is None
+            for value in encoded_values
+        ):
+            raise VerificationError("boot ramdisk has noncanonical numeric field")
         try:
-            values = tuple(
-                int(header[6 + index * 8 : 14 + index * 8], 16)
-                for index in range(13)
-            )
+            values = tuple(int(value, 16) for value in encoded_values)
         except ValueError as error:
             raise VerificationError("boot ramdisk has malformed newc metadata") from error
         offset += 110
@@ -1545,11 +1562,19 @@ def _parse_newc_ramdisk(data: bytes) -> dict[str, object]:
             name = encoded_name[:-1].decode("utf-8")
         except UnicodeDecodeError as error:
             raise VerificationError("boot ramdisk member name is not UTF-8") from error
-        offset = (offset + name_size + 3) & ~3
+        name_end = offset + name_size
+        aligned_name_end = (name_end + 3) & ~3
+        if aligned_name_end > len(data) or any(data[name_end:aligned_name_end]):
+            raise VerificationError("boot ramdisk has nonzero name padding")
+        offset = aligned_name_end
         if offset + size > len(data):
             raise VerificationError("boot ramdisk member is truncated")
         payload = data[offset : offset + size]
-        offset = (offset + size + 3) & ~3
+        data_end = offset + size
+        aligned_data_end = (data_end + 3) & ~3
+        if aligned_data_end > len(data) or any(data[data_end:aligned_data_end]):
+            raise VerificationError("boot ramdisk has nonzero data padding")
+        offset = aligned_data_end
         if name == "TRAILER!!!":
             expected_trailer = (
                 300000 + len(entries),
@@ -1597,6 +1622,7 @@ def _parse_newc_ramdisk(data: bytes) -> dict[str, object]:
             values[12],
         )
         entries[name] = {"metadata": metadata, "data": payload}
+        record_order.append(name)
     if trailer_metadata is None or trailer_end is None:
         raise VerificationError("boot ramdisk newc archive has missing trailer")
     padding = data[trailer_end:]
@@ -1607,6 +1633,7 @@ def _parse_newc_ramdisk(data: bytes) -> dict[str, object]:
         raise VerificationError("boot ramdisk is empty")
     return {
         "entries": entries,
+        "record_order": tuple(record_order),
         "trailer_metadata": trailer_metadata,
         "trailer_end": trailer_end,
         "padding_size": len(padding),
@@ -1697,6 +1724,7 @@ def extract_boot_evidence(
         "dtb_sha256": dtb_hash,
         "boot_header": header,
         "ramdisk_entries": ramdisk["entries"],
+        "ramdisk_record_order": ramdisk["record_order"],
         "ramdisk_trailer_metadata": ramdisk["trailer_metadata"],
         "ramdisk_padding_size": ramdisk["padding_size"],
     }

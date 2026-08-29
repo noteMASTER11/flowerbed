@@ -93,6 +93,23 @@ def build_newc(
     return bytes(output)
 
 
+def newc_record_bounds(data: bytes, offset: int = 0) -> dict[str, int]:
+    header = data[offset : offset + 110]
+    size = int(header[54:62], 16)
+    name_size = int(header[94:102], 16)
+    name_start = offset + 110
+    name_end = name_start + name_size
+    data_start = (name_end + 3) & ~3
+    data_end = data_start + size
+    return {
+        "header": offset,
+        "name_end": name_end,
+        "data_start": data_start,
+        "data_end": data_end,
+        "record_end": (data_end + 3) & ~3,
+    }
+
+
 class SignedReleasePolicyTest(unittest.TestCase):
     def _payload(self, manifest: bytes = b"manifest", signatures: bytes = b"sig"):
         header = struct.pack(">4sQQI", b"CrAU", 2, len(manifest), len(signatures))
@@ -414,6 +431,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 ),
             },
         }
+        unsigned["ramdisk_record_order"] = tuple(unsigned["ramdisk_entries"])
         signed = copy.deepcopy(unsigned)
         signed["raw_sha256"] = "d" * 64
         signed["content_sha256"] = "f" * 64
@@ -528,6 +546,16 @@ class SignedReleasePolicyTest(unittest.TestCase):
             0,
         )
         with self.assertRaisesRegex(module.VerificationError, "trailer"):
+            module.verify_kernel_boot_provenance(
+                unsigned, changed, record, release_certificate
+            )
+        changed = copy.deepcopy(signed)
+        reordered_names = tuple(reversed(changed["ramdisk_record_order"]))
+        changed["ramdisk_entries"] = {
+            name: changed["ramdisk_entries"][name] for name in reordered_names
+        }
+        changed["ramdisk_record_order"] = reordered_names
+        with self.assertRaisesRegex(module.VerificationError, "order"):
             module.verify_kernel_boot_provenance(
                 unsigned, changed, record, release_certificate
             )
@@ -1128,6 +1156,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
         ramdisk = build_newc(entries)
         parsed = module._parse_newc_ramdisk(ramdisk)
         self.assertEqual(b"init", parsed["entries"]["init"]["data"])
+        self.assertEqual(("init",), parsed["record_order"])
         self.assertEqual(0o755, parsed["trailer_metadata"][1])
         self.assertEqual(0, parsed["trailer_metadata"][6])
         self.assertEqual((-parsed["trailer_end"]) % 256, parsed["padding_size"])
@@ -1138,10 +1167,29 @@ class SignedReleasePolicyTest(unittest.TestCase):
         noncanonical_trailer[trailer_offset + 6 : trailer_offset + 14] = b"00000001"
         crc_trailer = bytearray(ramdisk)
         crc_trailer[trailer_offset : trailer_offset + 6] = b"070702"
+        name_padding = bytearray(ramdisk)
+        bounds = newc_record_bounds(name_padding)
+        name_padding[bounds["name_end"]] = 1
+        data_padding = bytearray(
+            build_newc([("x", (stat.S_IFREG | 0o755, b"x"))])
+        )
+        data_bounds = newc_record_bounds(data_padding)
+        data_padding[data_bounds["data_end"]] = 1
+        uppercase_numeric = bytearray(ramdisk)
+        uppercase_numeric[12] = ord("E")
+        short_numeric = bytearray(ramdisk)
+        short_numeric[6:14] = b"00493e0 "
+        signed_numeric = bytearray(ramdisk)
+        signed_numeric[6:14] = b"+00493e0"
         invalid_archives = {
             "nonzero trailer payload": build_newc(entries, trailer_data=b"x"),
             "noncanonical trailer metadata": bytes(noncanonical_trailer),
             "noncanonical trailer magic": bytes(crc_trailer),
+            "nonzero name padding": bytes(name_padding),
+            "nonzero data padding": bytes(data_padding),
+            "uppercase numeric field": bytes(uppercase_numeric),
+            "short numeric field": bytes(short_numeric),
+            "signed numeric field": bytes(signed_numeric),
             "multiple trailer": ramdisk + build_newc([]),
             "missing trailer": build_newc(entries, include_trailer=False),
             "nonzero padding": ramdisk[:-1] + b"x",
@@ -1153,6 +1201,19 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 module.VerificationError, "canonical|trailer|padding|duplicate"
             ):
                 module._parse_newc_ramdisk(archive)
+
+        aligned_archive = None
+        for size in range(256):
+            candidate = build_newc(
+                [("edge", (stat.S_IFREG | 0o644, b"x" * size))]
+            )
+            trailer = candidate.rfind(b"070701")
+            if newc_record_bounds(candidate, trailer)["record_end"] == len(candidate):
+                aligned_archive = candidate
+                break
+        self.assertIsNotNone(aligned_archive)
+        aligned = module._parse_newc_ramdisk(aligned_archive)
+        self.assertEqual(0, aligned["padding_size"])
 
     def test_verifies_representative_apk_and_every_non_presigned_apex(self):
         module = load_verifier()
