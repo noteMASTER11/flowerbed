@@ -243,6 +243,18 @@ class SigningMetadataTest(unittest.TestCase):
         )
         self.assertNotIn("PRESIGNED", inventory.source_key_stems)
 
+    def test_rejects_presigned_lookalike_with_empty_private_key_from_target_files(self):
+        lookalike = (
+            'name="Lookalike.apk" certificate="PRESIGNED.x509.pem" '
+            'private_key="" partition="data"\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "lineage_fleur-target_files.zip"
+            write_target_files(target_files, apkcerts=APK_CERTS + lookalike)
+
+            with self.assertRaisesRegex(SigningMetadataError, "private_key"):
+                load_signing_inventory(target_files)
+
     def test_rejects_missing_required_metadata_member(self):
         with tempfile.TemporaryDirectory() as directory:
             target_files = Path(directory) / "target-files.zip"

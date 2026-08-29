@@ -111,13 +111,13 @@ def _parse_apkcerts(text: str) -> tuple[ApkCertificate, ...]:
             "apkcerts.txt",
             line_number,
         )
+        if not values["private_key"] and values["certificate"] != _PRESIGNED:
+            raise SigningMetadataError(
+                f"apkcerts.txt line {line_number} has an empty private_key "
+                f"for non-PRESIGNED APK {values['name']}"
+            )
         certificate = _normalize_key_stem(values["certificate"])
         if not values["private_key"]:
-            if certificate != _PRESIGNED:
-                raise SigningMetadataError(
-                    f"apkcerts.txt line {line_number} has an empty private_key "
-                    f"for non-PRESIGNED APK {values['name']}"
-                )
             private_key = _PRESIGNED
         else:
             private_key = _normalize_key_stem(values["private_key"])
