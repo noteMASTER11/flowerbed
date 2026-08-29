@@ -1088,6 +1088,35 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     )
             commands = []
 
+            chain_locations = {
+                "boot": 1,
+                "vbmeta_system": 2,
+                "vbmeta_vendor": 3,
+            }
+
+            def vbmeta_info(chains=chain_locations):
+                lines = [
+                    "Public key (sha1): "
+                    + hashlib.sha1(
+                        (public / "avb_vbmeta.avbpubkey").read_bytes()
+                    ).hexdigest(),
+                    "Descriptors:",
+                ]
+                for partition, location in chains.items():
+                    lines.extend(
+                        (
+                            "    Chain Partition descriptor:",
+                            f"      Partition Name:          {partition}",
+                            f"      Rollback Index Location: {location}",
+                            "      Public key (sha1):       "
+                            + hashlib.sha1(
+                                (public / f"avb_{partition}.avbpubkey").read_bytes()
+                            ).hexdigest(),
+                            "      Flags:                   0",
+                        )
+                    )
+                return "\n".join(lines) + "\n"
+
             def runner(command, **_kwargs):
                 commands.append(tuple(str(item) for item in command))
                 if "verify_image" in command:
@@ -1102,6 +1131,8 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 if "info_image" in command:
                     image = Path(command[command.index("--image") + 1])
                     partition = image.stem
+                    if partition == "vbmeta":
+                        return vbmeta_info()
                     return "Public key (sha1): " + hashlib.sha1(
                         (public / f"avb_{partition}.avbpubkey").read_bytes()
                     ).hexdigest() + "\n"
@@ -1124,6 +1155,114 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     if "verify_image" in command
                 )
             )
+            root_verify = next(
+                command
+                for command in commands
+                if "verify_image" in command
+                and Path(command[command.index("--image") + 1]).stem == "vbmeta"
+            )
+            self.assertIn("--follow_chain_partitions", root_verify)
+            expected_chains = {
+                f"{partition}:{location}:{public / f'avb_{partition}.avbpubkey'}"
+                for partition, location in chain_locations.items()
+            }
+            actual_chains = {
+                root_verify[index + 1]
+                for index, value in enumerate(root_verify)
+                if value == "--expected_chain_partition"
+            }
+            self.assertEqual(
+                len(chain_locations), root_verify.count("--expected_chain_partition")
+            )
+            self.assertEqual(expected_chains, actual_chains)
+
+    def test_root_vbmeta_chain_manifest_must_match_release_keys_exactly(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "signed-target.zip"
+            public = root / "public-keys"
+            public.mkdir()
+            with zipfile.ZipFile(target, "w") as archive:
+                for partition in module.REQUIRED_AVB_PARTITIONS:
+                    archive.writestr(f"IMAGES/{partition}.img", partition.encode())
+                    (public / f"avb_{partition}.avbpubkey").write_bytes(
+                        f"public-{partition}".encode()
+                    )
+                    (public / f"avb_{partition}.public.pem").write_text(
+                        f"pem-{partition}", encoding="utf-8"
+                    )
+
+            expected = {
+                "boot": (
+                    1,
+                    hashlib.sha1(
+                        (public / "avb_boot.avbpubkey").read_bytes()
+                    ).hexdigest(),
+                ),
+                "vbmeta_system": (
+                    2,
+                    hashlib.sha1(
+                        (public / "avb_vbmeta_system.avbpubkey").read_bytes()
+                    ).hexdigest(),
+                ),
+                "vbmeta_vendor": (
+                    3,
+                    hashlib.sha1(
+                        (public / "avb_vbmeta_vendor.avbpubkey").read_bytes()
+                    ).hexdigest(),
+                ),
+            }
+
+            def info(chains):
+                lines = [
+                    "Public key (sha1): "
+                    + hashlib.sha1(
+                        (public / "avb_vbmeta.avbpubkey").read_bytes()
+                    ).hexdigest(),
+                    "Descriptors:",
+                ]
+                for partition, (location, digest) in chains.items():
+                    lines.extend(
+                        (
+                            "    Chain Partition descriptor:",
+                            f"      Partition Name:          {partition}",
+                            f"      Rollback Index Location: {location}",
+                            f"      Public key (sha1):       {digest}",
+                            "      Flags:                   0",
+                        )
+                    )
+                return "\n".join(lines) + "\n"
+
+            cases = {
+                "missing": {
+                    name: value
+                    for name, value in expected.items()
+                    if name != "vbmeta_vendor"
+                },
+                "extra": {**expected, "recovery": (4, "a" * 40)},
+                "wrong rollback location": {
+                    **expected,
+                    "boot": (9, expected["boot"][1]),
+                },
+                "wrong public key": {**expected, "boot": (1, "b" * 40)},
+            }
+            for label, chains in cases.items():
+                with self.subTest(label=label):
+                    def runner(command, **_kwargs):
+                        if "info_image" not in command:
+                            return "Footer version: 1.0\n"
+                        image = Path(command[command.index("--image") + 1])
+                        if image.stem == "vbmeta":
+                            return info(chains)
+                        return "Public key (sha1): " + hashlib.sha1(
+                            (public / f"avb_{image.stem}.avbpubkey").read_bytes()
+                        ).hexdigest() + "\n"
+
+                    with self.assertRaisesRegex(module.VerificationError, "chain"):
+                        module.verify_avb_images(
+                            target, public, root / "avbtool", runner=runner
+                        )
 
     def test_payload_partition_policy_requires_android_and_manifest_firmware(self):
         module = load_verifier()
@@ -1435,7 +1574,22 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         public_blob = b"apex-key"
                     else:
                         public_blob = image.stem.encode()
-                    return "Public key (sha1): " + hashlib.sha1(public_blob).hexdigest() + "\n"
+                    output = "Public key (sha1): " + hashlib.sha1(public_blob).hexdigest() + "\n"
+                    if image.stem == "vbmeta":
+                        for partition, location in (
+                            ("boot", 1),
+                            ("vbmeta_system", 2),
+                            ("vbmeta_vendor", 3),
+                        ):
+                            output += (
+                                "    Chain Partition descriptor:\n"
+                                f"      Partition Name:          {partition}\n"
+                                f"      Rollback Index Location: {location}\n"
+                                "      Public key (sha1):       "
+                                + hashlib.sha1(partition.encode()).hexdigest()
+                                + "\n      Flags:                   0\n"
+                            )
+                    return output
                 return "verified\n"
 
             args = SimpleNamespace(

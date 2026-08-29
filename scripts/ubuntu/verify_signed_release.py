@@ -65,6 +65,11 @@ EXPECTED_SKU_PATHS = {
     name: f"ODM/etc/{name}" for name in EXPECTED_SKUS
 }
 REQUIRED_AVB_PARTITIONS = ("boot", "vbmeta", "vbmeta_system", "vbmeta_vendor")
+EXPECTED_AVB_CHAIN_PARTITIONS = (
+    ("boot", 1),
+    ("vbmeta_system", 2),
+    ("vbmeta_vendor", 3),
+)
 REQUIRED_FASTBOOT_IMAGES = ("boot", "dtbo", "vbmeta", "vbmeta_system", "vbmeta_vendor", "super")
 REQUIRED_ANDROID_PAYLOAD_PARTITIONS = (
     "boot",
@@ -1418,6 +1423,85 @@ def _verify_avb_public_key(
     return sha256_file(public_blob)
 
 
+AVB_CHAIN_DESCRIPTOR = re.compile(
+    r"(?m)^[ \t]+Chain Partition descriptor:[ \t]*\r?$\n"
+    r"^[ \t]+Partition Name:[ \t]*([^ \t\r\n]+)[ \t]*\r?$\n"
+    r"^[ \t]+Rollback Index Location:[ \t]*([0-9]+)[ \t]*\r?$\n"
+    r"^[ \t]+Public key \(sha1\):[ \t]*([0-9A-Fa-f]{40})[ \t]*\r?$"
+)
+
+
+def _parse_avb_chain_descriptors(info: str) -> dict[str, tuple[int, str]]:
+    descriptor_count = len(
+        re.findall(r"(?m)^[ \t]+Chain Partition descriptor:[ \t]*\r?$", info)
+    )
+    matches = AVB_CHAIN_DESCRIPTOR.findall(info)
+    if len(matches) != descriptor_count:
+        raise VerificationError("root vbmeta has malformed AVB chain descriptor")
+    descriptors: dict[str, tuple[int, str]] = {}
+    for partition, location, fingerprint in matches:
+        if partition in descriptors:
+            raise VerificationError(
+                f"root vbmeta has duplicate AVB chain partition {partition}"
+            )
+        descriptors[partition] = (int(location), fingerprint.lower())
+    return descriptors
+
+
+def _verify_root_vbmeta(
+    image: Path,
+    public_keys: Path,
+    avbtool: Path,
+    *,
+    runner=_default_runner,
+) -> str:
+    public_keys = Path(public_keys)
+    root_blob = public_keys / "avb_vbmeta.avbpubkey"
+    root_pem = public_keys / "avb_vbmeta.public.pem"
+    if not root_blob.is_file() or root_blob.is_symlink():
+        raise VerificationError("missing AVB public key blob for avb_vbmeta")
+    if not root_pem.is_file() or root_pem.is_symlink():
+        raise VerificationError("missing AVB public PEM for avb_vbmeta")
+
+    expected: dict[str, tuple[int, str]] = {}
+    command = [
+        avbtool,
+        "verify_image",
+        "--key",
+        root_pem,
+        "--image",
+        image,
+        "--follow_chain_partitions",
+    ]
+    for partition, location in EXPECTED_AVB_CHAIN_PARTITIONS:
+        public_blob = public_keys / f"avb_{partition}.avbpubkey"
+        if not public_blob.is_file() or public_blob.is_symlink():
+            raise VerificationError(f"missing AVB public key blob for avb_{partition}")
+        command.extend(
+            (
+                "--expected_chain_partition",
+                f"{partition}:{location}:{public_blob}",
+            )
+        )
+        expected[partition] = (
+            location,
+            hashlib.sha1(public_blob.read_bytes()).hexdigest(),
+        )
+
+    runner(command)
+    info = runner([avbtool, "info_image", "--image", image])
+    root_match = re.search(r"Public key \(sha1\):\s*([0-9A-Fa-f]{40})", info)
+    if not root_match:
+        raise VerificationError("avbtool did not report embedded public key for avb_vbmeta")
+    if root_match.group(1).lower() != hashlib.sha1(root_blob.read_bytes()).hexdigest():
+        raise VerificationError("AVB embedded public key mismatch for avb_vbmeta")
+
+    actual = _parse_avb_chain_descriptors(info)
+    if actual != expected:
+        raise VerificationError("root vbmeta AVB chain manifest does not match release keys")
+    return sha256_file(root_blob)
+
+
 def verify_package_signatures(
     signed_target_files: Path,
     apkcerts: str,
@@ -1633,6 +1717,16 @@ def verify_avb_images(
             image = root / f"{partition}.img"
             if not image.is_file():
                 raise VerificationError(f"signed target-files is missing AVB image {partition}")
+        fingerprints["vbmeta"] = _verify_root_vbmeta(
+            root / "vbmeta.img",
+            Path(public_keys),
+            avbtool,
+            runner=runner,
+        )
+        for partition in REQUIRED_AVB_PARTITIONS:
+            if partition == "vbmeta":
+                continue
+            image = root / f"{partition}.img"
             fingerprints[partition] = _verify_avb_public_key(
                 image,
                 f"avb_{partition}",
