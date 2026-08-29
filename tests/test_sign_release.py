@@ -54,11 +54,13 @@ def write_target_files(
     *,
     system_build_prop: str = SYSTEM_BUILD_PROP,
     misc_info: str = MISC_INFO,
+    otakeys: str = "\n",
 ) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("META/apkcerts.txt", APK_CERTS)
         archive.writestr("META/apexkeys.txt", APEX_KEYS)
         archive.writestr("META/misc_info.txt", misc_info)
+        archive.writestr("META/otakeys.txt", otakeys)
         archive.writestr("SYSTEM/build.prop", system_build_prop)
         archive.writestr("IMAGES/boot.img", b"fixed-kernel-boot")
 
@@ -285,6 +287,7 @@ class FakeReleaseRunner:
         with zipfile.ZipFile(output, "w") as archive:
             if tool == "sign_target_files_apks":
                 archive.writestr("META/misc_info.txt", MISC_INFO)
+                archive.writestr("META/otakeys.txt", "\n")
             elif tool == "ota_from_target_files":
                 archive.writestr(
                     "META-INF/com/android/metadata",
@@ -381,6 +384,7 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                     "META/apkcerts.txt",
                     "META/apexkeys.txt",
                     "META/misc_info.txt",
+                    "META/otakeys.txt",
                     "SYSTEM/build.prop",
                 },
                 set(report["input_metadata_sha256"]),
@@ -983,6 +987,35 @@ class SigningCommandTest(unittest.TestCase):
             "vendor/lineage/build/target/product/security/lineage="
             + str(paths.keys_dir / "releasekey")
         )
+        self.assertTrue(
+            any(sign[index : index + 2] == ["-k", expected] for index in range(len(sign) - 1))
+        )
+
+    def test_maps_nonblank_otakeys_source_to_releasekey(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target_files = root / "lineage_fleur-target_files.zip"
+            write_target_files(
+                target_files,
+                otakeys="vendor/custom/security/ota.x509.pem\n",
+            )
+            paths = self.SigningPaths(
+                target_files=target_files,
+                android_root=root / "android",
+                keys_dir=root / "keys",
+                output_dir=root / "20260829T123456Z",
+            )
+            inventory = self.load_signing_inventory(target_files)
+
+            commands = self.build_signing_commands(
+                inventory,
+                paths,
+                signing_helper=SIGNING_HELPER,
+                public_key_dir=paths.output_dir / ".signing-runtime/public-pem",
+            )
+
+        sign = list(commands.sign_target_files)
+        expected = "vendor/custom/security/ota=" + str(paths.keys_dir / "releasekey")
         self.assertTrue(
             any(sign[index : index + 2] == ["-k", expected] for index in range(len(sign) - 1))
         )

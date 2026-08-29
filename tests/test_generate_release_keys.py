@@ -59,6 +59,7 @@ def write_target_files(
         archive.writestr("META/apkcerts.txt", apkcerts)
         archive.writestr("META/apexkeys.txt", APEX_KEYS)
         archive.writestr("META/misc_info.txt", misc_info)
+        archive.writestr("META/otakeys.txt", "\n")
         archive.writestr("SYSTEM/build.prop", SYSTEM_BUILD_PROP)
 
 

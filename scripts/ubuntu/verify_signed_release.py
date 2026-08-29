@@ -726,6 +726,7 @@ def target_metadata_hashes(target_files: Path) -> dict[str, str]:
         "META/apkcerts.txt",
         "META/apexkeys.txt",
         "META/misc_info.txt",
+        "META/otakeys.txt",
         "SYSTEM/build.prop",
     )
     with zipfile.ZipFile(target_files) as archive:

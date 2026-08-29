@@ -72,6 +72,7 @@ def write_target_files(
     apkcerts: str = APK_CERTS,
     apexkeys: str = APEX_KEYS,
     misc_info: str = MISC_INFO,
+    otakeys: str | bytes = "\n",
     system_build_prop: str = REAL_SYSTEM_BUILD_PROP,
     omit: str | None = None,
 ) -> None:
@@ -79,6 +80,7 @@ def write_target_files(
         "META/apkcerts.txt": apkcerts,
         "META/apexkeys.txt": apexkeys,
         "META/misc_info.txt": misc_info,
+        "META/otakeys.txt": otakeys,
         "SYSTEM/build.prop": system_build_prop,
     }
     with zipfile.ZipFile(path, "w") as archive:
@@ -105,8 +107,8 @@ class SigningMetadataTest(unittest.TestCase):
 
     def test_parses_extra_ota_key_lists_deterministically(self):
         extra = REAL_MISC_INFO + (
-            "extra_ota_keys=vendor/keys/secondary.x509.pem "
-            "vendor/lineage/build/target/product/security/lineage.pk8 "
+            "extra_ota_keys=vendor/keys/secondary "
+            "vendor/lineage/build/target/product/security/lineage "
             "vendor/keys/secondary\n"
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -130,6 +132,11 @@ class SigningMetadataTest(unittest.TestCase):
             "vendor//lineage",
             r"vendor\lineage",
             "PRESIGNED",
+            "PRESIGNED.x509.pem",
+            "vendor/lineage.x509.pem",
+            "vendor/lineage.pk8",
+            "vendor/lineage.pem",
+            "vendor/lineage.avbpubkey",
         ):
             with self.subTest(unsafe=unsafe), tempfile.TemporaryDirectory() as directory:
                 target_files = Path(directory) / "lineage_fleur-target_files.zip"
@@ -140,6 +147,80 @@ class SigningMetadataTest(unittest.TestCase):
 
                 with self.assertRaisesRegex(SigningMetadataError, "extra_ota_keys"):
                     load_signing_inventory(target_files)
+
+    def test_allows_blank_fleur_otakeys_default_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "lineage_fleur-target_files.zip"
+            write_target_files(target_files, misc_info=REAL_MISC_INFO, otakeys=" \n\t")
+
+            inventory = load_signing_inventory(target_files)
+
+        self.assertEqual(
+            inventory.extra_ota_key_stems,
+            ("vendor/lineage/build/target/product/security/lineage",),
+        )
+
+    def test_parses_nonblank_otakeys_deterministically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "lineage_fleur-target_files.zip"
+            write_target_files(
+                target_files,
+                otakeys=(
+                    "vendor/keys/secondary.x509.pem "
+                    "vendor/keys/primary.x509.pem "
+                    "vendor/keys/secondary.x509.pem\n"
+                ),
+            )
+
+            inventory = load_signing_inventory(target_files)
+
+        self.assertEqual(
+            inventory.extra_ota_key_stems,
+            ("vendor/keys/primary", "vendor/keys/secondary"),
+        )
+
+    def test_rejects_malformed_otakeys_tokens(self):
+        for unsafe in (
+            "PRESIGNED",
+            "PRESIGNED.x509.pem",
+            "vendor/key",
+            "vendor/key.pk8",
+            "vendor/key.pem",
+            "vendor/key.avbpubkey",
+            "/absolute/key.x509.pem",
+            "vendor/../key.x509.pem",
+            "vendor//key.x509.pem",
+            r"vendor\key.x509.pem",
+            "vendor/key\x00.x509.pem",
+        ):
+            with self.subTest(unsafe=unsafe), tempfile.TemporaryDirectory() as directory:
+                target_files = Path(directory) / "lineage_fleur-target_files.zip"
+                write_target_files(target_files, otakeys=unsafe + "\n")
+
+                with self.assertRaisesRegex(SigningMetadataError, "otakeys.txt"):
+                    load_signing_inventory(target_files)
+
+    def test_requires_one_utf8_otakeys_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing = root / "missing.zip"
+            write_target_files(missing, omit="META/otakeys.txt")
+            with self.assertRaisesRegex(SigningMetadataError, "META/otakeys.txt"):
+                load_signing_inventory(missing)
+
+            duplicate = root / "duplicate.zip"
+            write_target_files(duplicate)
+            with zipfile.ZipFile(duplicate, "a") as archive:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    archive.writestr("META/otakeys.txt", "vendor/key.x509.pem\n")
+            with self.assertRaisesRegex(SigningMetadataError, "META/otakeys.txt"):
+                load_signing_inventory(duplicate)
+
+            invalid_utf8 = root / "invalid-utf8.zip"
+            write_target_files(invalid_utf8, otakeys=b"\xff")
+            with self.assertRaisesRegex(SigningMetadataError, "META/otakeys.txt.*UTF-8"):
+                load_signing_inventory(invalid_utf8)
 
     def test_allows_empty_optional_properties_in_canonical_system_build_prop(self):
         properties = (

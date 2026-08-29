@@ -56,11 +56,13 @@ class SigningInventory:
 
 _PRESIGNED = "PRESIGNED"
 _SUPPORTED_AVB_ALGORITHM = "SHA256_RSA4096"
+_KEY_SUFFIXES = (".x509.pem", ".pk8", ".avbpubkey", ".pem")
 _SAFE_KEY_PATH_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _REQUIRED_MEMBERS = (
     "META/apkcerts.txt",
     "META/apexkeys.txt",
     "META/misc_info.txt",
+    "META/otakeys.txt",
     "SYSTEM/build.prop",
 )
 
@@ -68,16 +70,17 @@ _REQUIRED_MEMBERS = (
 def load_signing_inventory(target_files: Path) -> SigningInventory:
     """Load a deterministic signing inventory from a target-files ZIP archive."""
     with ZipFile(target_files) as archive:
-        apk_text = _read_required_member(archive, _REQUIRED_MEMBERS[0])
-        apex_text = _read_required_member(archive, _REQUIRED_MEMBERS[1])
-        misc_text = _read_required_member(archive, _REQUIRED_MEMBERS[2])
-        system_build_prop_text = _read_required_member(archive, _REQUIRED_MEMBERS[3])
+        required = {
+            member: _read_required_member(archive, member)
+            for member in _REQUIRED_MEMBERS
+        }
 
-    apk_certificates = _parse_apkcerts(apk_text)
-    apexes = _parse_apexkeys(apex_text)
-    misc_info = _parse_misc_info(misc_text)
+    apk_certificates = _parse_apkcerts(required["META/apkcerts.txt"])
+    apexes = _parse_apexkeys(required["META/apexkeys.txt"])
+    misc_info = _parse_misc_info(required["META/misc_info.txt"])
+    otakey_stems = _parse_otakeys(required["META/otakeys.txt"])
     avb_keys = _parse_avb_keys(misc_info)
-    device, build_tags = _parse_build_identity(system_build_prop_text)
+    device, build_tags = _parse_build_identity(required["SYSTEM/build.prop"])
     return _assemble_inventory(
         apk_certificates,
         apexes,
@@ -85,6 +88,7 @@ def load_signing_inventory(target_files: Path) -> SigningInventory:
         misc_info,
         device=device,
         build_tags=build_tags,
+        otakey_stems=otakey_stems,
     )
 
 
@@ -313,22 +317,46 @@ def _parse_extra_ota_key_stems(misc_info: Mapping[str, str]) -> tuple[str, ...]:
     stems: set[str] = set()
     for property_name in ("extra_recovery_keys", "extra_ota_keys"):
         for value in misc_info.get(property_name, "").split():
-            if (
-                value == _PRESIGNED
-                or value.startswith("/")
-                or "\\" in value
-                or "\x00" in value
-                or any(
-                    component in {"", ".", ".."}
-                    or not _SAFE_KEY_PATH_COMPONENT.fullmatch(component)
-                    for component in value.split("/")
-                )
-            ):
+            if any(suffix in value for suffix in _KEY_SUFFIXES):
                 raise SigningMetadataError(
                     f"misc_info.txt {property_name} contains an unsafe key stem"
                 )
-            stems.add(_normalize_key_stem(value))
+            stems.add(
+                _validate_extra_key_stem(value, f"misc_info.txt {property_name}")
+            )
     return tuple(sorted(stems))
+
+
+def _parse_otakeys(text: str) -> tuple[str, ...]:
+    stems: set[str] = set()
+    for token in text.split():
+        if not token.endswith(".x509.pem"):
+            raise SigningMetadataError(
+                "otakeys.txt entries must be safe .x509.pem key paths"
+            )
+        stem = token[: -len(".x509.pem")]
+        if any(suffix in stem for suffix in _KEY_SUFFIXES):
+            raise SigningMetadataError(
+                "otakeys.txt entries must contain one exact .x509.pem suffix"
+            )
+        stems.add(_validate_extra_key_stem(stem, "otakeys.txt"))
+    return tuple(sorted(stems))
+
+
+def _validate_extra_key_stem(value: str, label: str) -> str:
+    if (
+        value == _PRESIGNED
+        or value.startswith("/")
+        or "\\" in value
+        or "\x00" in value
+        or any(
+            component in {"", ".", ".."}
+            or not _SAFE_KEY_PATH_COMPONENT.fullmatch(component)
+            for component in value.split("/")
+        )
+    ):
+        raise SigningMetadataError(f"{label} contains an unsafe key stem")
+    return value
 
 
 def _assemble_inventory(
@@ -339,8 +367,11 @@ def _assemble_inventory(
     *,
     device: str,
     build_tags: frozenset[str],
+    otakey_stems: tuple[str, ...] = (),
 ) -> SigningInventory:
-    extra_ota_key_stems = _parse_extra_ota_key_stems(misc_info)
+    extra_ota_key_stems = tuple(
+        sorted(set(_parse_extra_ota_key_stems(misc_info)) | set(otakey_stems))
+    )
     source_key_stems = {
         value
         for certificate in apk_certificates
@@ -439,7 +470,7 @@ def _insert_record(
 def _normalize_key_stem(value: str) -> str:
     if value == _PRESIGNED:
         return value
-    for suffix in (".x509.pem", ".pk8", ".avbpubkey", ".pem"):
+    for suffix in _KEY_SUFFIXES:
         if value.endswith(suffix):
             return value[: -len(suffix)]
     return value

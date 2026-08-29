@@ -490,6 +490,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
             common = {
                 "META/apexkeys.txt": "",
                 "META/misc_info.txt": "ab_update=true\nvirtual_ab=true\n",
+                "META/otakeys.txt": "\n",
                 "SYSTEM/build.prop": (
                     "ro.product.system.device=fleur\n"
                     "ro.build.tags=test-keys\nro.system.build.tags=test-keys\n"
@@ -859,6 +860,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         for partition in module.REQUIRED_AVB_PARTITIONS
                     )
                 ),
+                "META/otakeys.txt": "\n",
                 "META/ab_partitions.txt": "\n".join(
                     sorted(set(module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | {"md1img"})
                 ) + "\n",
