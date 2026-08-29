@@ -1180,9 +1180,11 @@ class SignedReleasePolicyTest(unittest.TestCase):
             android_root = root / "android"
             host_tools = android_root / "out/host/linux-x86/bin"
             host_framework = android_root / "out/host/linux-x86/framework"
+            host_lib64 = android_root / "out/host/linux-x86/lib64"
             jdk_bin = android_root / "prebuilts/jdk/jdk21/linux-x86/bin"
             host_tools.mkdir(parents=True)
             host_framework.mkdir(parents=True)
+            host_lib64.mkdir(parents=True)
             jdk_bin.mkdir(parents=True)
             for tool in (
                 "apksigner",
@@ -1195,6 +1197,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 (host_tools / tool).write_text("fixture\n", encoding="utf-8")
                 (host_tools / tool).chmod(0o755)
             (host_framework / "apksigner.jar").write_bytes(b"jar-fixture")
+            (host_lib64 / "libc++.so").write_bytes(b"libcxx-fixture")
             (jdk_bin / "java").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             (jdk_bin / "java").chmod(0o755)
             payload_info = android_root / "system/update_engine/scripts/payload_info.py"
@@ -1518,10 +1521,12 @@ class SignedReleasePolicyTest(unittest.TestCase):
             android = root / "android"
             tools = android / "out/host/linux-x86/bin"
             framework = android / "out/host/linux-x86/framework"
+            libraries = android / "out/host/linux-x86/lib64"
             jdk_bin = android / "prebuilts/jdk/jdk21/linux-x86/bin"
             scripts = android / "system/update_engine/scripts"
             tools.mkdir(parents=True)
             framework.mkdir(parents=True)
+            libraries.mkdir(parents=True)
             jdk_bin.mkdir(parents=True)
             scripts.mkdir(parents=True)
             for name in module.ANDROID_TOOL_NAMES:
@@ -1529,6 +1534,8 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 path.write_bytes((name + "-original").encode())
                 path.chmod(0o755)
             (framework / "apksigner.jar").write_bytes(b"apksigner-jar-original")
+            (libraries / "libc++.so").write_bytes(b"libcxx-original")
+            (libraries / "libprotobuf-cpp-lite.so").write_bytes(b"protobuf-original")
             (jdk_bin / "java").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             (jdk_bin / "java").chmod(0o755)
             (scripts / "payload_info.py").write_text("print('fixture')\n", encoding="utf-8")
@@ -1555,6 +1562,18 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     )
                     (framework / "apksigner.jar").write_bytes(b"mutated")
             (framework / "apksigner.jar").write_bytes(b"apksigner-jar-original")
+            with self.assertRaisesRegex(module.VerificationError, "changed"):
+                with module.snapshot_android_toolchain(android) as snapshot:
+                    self.assertEqual(
+                        b"libcxx-original",
+                        (snapshot.root / "lib64/libc++.so").read_bytes(),
+                    )
+                    (libraries / "libc++.so").write_bytes(b"mutated")
+            (libraries / "libc++.so").write_bytes(b"libcxx-original")
+            with self.assertRaisesRegex(module.VerificationError, "inventory changed"):
+                with module.snapshot_android_toolchain(android):
+                    (libraries / "late-library.so").write_bytes(b"late")
+            (libraries / "late-library.so").unlink()
             with self.assertRaisesRegex(module.VerificationError, "changed"):
                 with module.snapshot_android_toolchain(android):
                     (jdk_bin / "java").write_bytes(b"mutated-java")
@@ -1590,10 +1609,17 @@ class SignedReleasePolicyTest(unittest.TestCase):
     def test_apksigner_snapshot_requires_safe_jar_and_preserves_launcher_layout(self):
         module = load_verifier()
 
-        def make_fixture(root: Path, *, jar_kind: str, java_kind: str = "regular"):
+        def make_fixture(
+            root: Path,
+            *,
+            jar_kind: str,
+            java_kind: str = "regular",
+            lib_kind: str = "regular",
+        ):
             android = root / "android"
             tools = android / "out/host/linux-x86/bin"
             framework = android / "out/host/linux-x86/framework"
+            libraries = android / "out/host/linux-x86/lib64"
             jdk_bin = android / "prebuilts/jdk/jdk21/linux-x86/bin"
             scripts = android / "system/update_engine/scripts"
             tools.mkdir(parents=True)
@@ -1604,6 +1630,13 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 os.symlink(outside_framework, framework)
             else:
                 framework.mkdir(parents=True)
+            if lib_kind == "symlink":
+                outside_libraries = root / "outside-lib64"
+                outside_libraries.mkdir()
+                (outside_libraries / "libc++.so").write_bytes(b"outside")
+                os.symlink(outside_libraries, libraries)
+            elif lib_kind != "missing":
+                libraries.mkdir(parents=True)
             jdk_bin.mkdir(parents=True)
             scripts.mkdir(parents=True)
             for name in module.ANDROID_TOOL_NAMES:
@@ -1615,6 +1648,13 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 'jar="$(dirname "$0")/../framework/apksigner.jar"\n'
                 'test -r "$jar" || { echo "missing jar"; exit 9; }\n'
                 'exec java -jar "$jar" "$@"\n',
+                encoding="utf-8",
+            )
+            (tools / "debugfs_static").write_text(
+                "#!/bin/sh\n"
+                'library="$(dirname "$0")/../lib64/libc++.so"\n'
+                'test -r "$library" || { echo "missing libc++"; exit 127; }\n'
+                'sha256sum "$library" | cut -d" " -f1\n',
                 encoding="utf-8",
             )
             java = jdk_bin / "java"
@@ -1644,6 +1684,20 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 target = root / "outside.jar"
                 target.write_bytes(b"outside")
                 os.symlink(target, jar)
+            if lib_kind == "regular":
+                (libraries / "libc++.so").write_bytes(b"libcxx-fixture")
+                (libraries / "libprotobuf-cpp-lite.so").write_bytes(
+                    b"protobuf-fixture"
+                )
+            elif lib_kind == "file-symlink":
+                target = root / "outside-libc++.so"
+                target.write_bytes(b"outside")
+                os.symlink(target, libraries / "libc++.so")
+            elif lib_kind == "subdir":
+                (libraries / "nested").mkdir()
+                (libraries / "libc++.so").write_bytes(b"libcxx-fixture")
+            elif lib_kind == "special":
+                os.mkfifo(libraries / "libc++.so")
             return android
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1663,6 +1717,20 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     Path(lines[0]),
                 )
                 self.assertIn("framework/apksigner.jar verify", lines[1])
+                debugfs = subprocess.run(
+                    [snapshot.host_tools / "debugfs_static"],
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                )
+                self.assertEqual(
+                    hashlib.sha256(b"libcxx-fixture").hexdigest(),
+                    debugfs.stdout.strip(),
+                )
+                self.assertEqual(
+                    b"protobuf-fixture",
+                    (snapshot.root / "lib64/libprotobuf-cpp-lite.so").read_bytes(),
+                )
 
         for jar_kind, message in (
             ("missing", "unavailable"),
@@ -1687,6 +1755,22 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 with self.assertRaisesRegex(module.VerificationError, message):
                     with module.snapshot_android_toolchain(android):
                         self.fail("unsafe or missing Android JDK21 java must not run")
+
+        for lib_kind, message in (
+            ("missing", "lib64.*unavailable"),
+            ("missing-libcxx", r"libc\+\+.*unavailable"),
+            ("symlink", "lib64.*symlink"),
+            ("file-symlink", "lib64.*symlink"),
+            ("subdir", "lib64.*subdirector"),
+            ("special", "lib64.*special"),
+        ):
+            with self.subTest(lib_kind=lib_kind), tempfile.TemporaryDirectory() as directory:
+                android = make_fixture(
+                    Path(directory), jar_kind="regular", lib_kind=lib_kind
+                )
+                with self.assertRaisesRegex(module.VerificationError, message):
+                    with module.snapshot_android_toolchain(android):
+                        self.fail("unsafe Android host lib64 must not run")
 
     def test_android_toolchain_execution_labels_reject_traversal_and_collisions(self):
         module = load_verifier()

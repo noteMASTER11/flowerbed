@@ -333,6 +333,7 @@ def _android_execution_destination(
         "tool": Path(root) / "bin",
         "framework": Path(root) / "framework",
         "jdk": Path(root) / "jdk21",
+        "lib64": Path(root) / "lib64",
         "script": Path(root) / "payload-scripts",
     }
     parts = name.split("/")
@@ -355,6 +356,7 @@ def _android_toolchain_inputs(android_root: Path) -> dict[str, Path]:
     android_root = Path(android_root)
     source_tools = android_root / "out/host/linux-x86/bin"
     source_framework = android_root / "out/host/linux-x86/framework"
+    source_lib64 = android_root / "out/host/linux-x86/lib64"
     source_java_home = android_root / "prebuilts/jdk/jdk21/linux-x86"
     source_scripts = android_root / "system/update_engine/scripts"
     inputs: dict[str, Path] = {}
@@ -375,6 +377,32 @@ def _android_toolchain_inputs(android_root: Path) -> dict[str, Path]:
     if not apksigner_jar.is_file():
         raise VerificationError("Android apksigner.jar is unavailable")
     inputs["framework:apksigner.jar"] = apksigner_jar
+    if source_lib64.is_symlink():
+        raise VerificationError("Android host lib64 directory is a symlink")
+    if not source_lib64.is_dir():
+        raise VerificationError("Android host lib64 directory is unavailable")
+    with os.scandir(source_lib64) as directory_entries:
+        library_entries = sorted(directory_entries, key=lambda item: item.name)
+    for entry in library_entries:
+        path = Path(entry.path)
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise VerificationError(
+                f"Android host lib64 file is a symlink: {entry.name}"
+            )
+        if stat.S_ISDIR(metadata.st_mode):
+            raise VerificationError(
+                f"Android host lib64 contains a subdirectory: {entry.name}"
+            )
+        if not stat.S_ISREG(metadata.st_mode):
+            raise VerificationError(
+                f"Android host lib64 contains a special file: {entry.name}"
+            )
+        if not entry.name or "\\" in entry.name or entry.name in {".", ".."}:
+            raise VerificationError("Android host lib64 filename is unsafe")
+        inputs[f"lib64:{entry.name}"] = path
+    if "lib64:libc++.so" not in inputs:
+        raise VerificationError("Android host lib64 libc++.so is unavailable")
     java_bin = source_java_home / "bin"
     java = java_bin / "java"
     if source_java_home.is_symlink() or java_bin.is_symlink():
