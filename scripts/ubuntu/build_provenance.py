@@ -136,25 +136,49 @@ def normalized_boot_sha256(boot: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def create_pre_build_provenance(kernel_root: Path, policy: Mapping[str, object], patch: Path, application_script: Path, output: Path, *, timestamp: str, nonce: str) -> dict[str, object]:
+def _live_kernel_evidence(
+    kernel_root: Path,
+    fields: Mapping[str, str],
+    patch: Path,
+    application_script: Path,
+) -> dict[str, object]:
     kernel_root = Path(kernel_root)
-    fields = _policy_fields(policy)
     patch = _regular(patch, "kernel patch")
     application_script = _regular(application_script, "patch application script")
     source = _regular(kernel_root / fields["file"], "post-fix kernel source")
-    if not TIMESTAMP.fullmatch(timestamp) or not HEX64.fullmatch(nonce):
-        raise BuildProvenanceError("pre-build timestamp or session nonce is invalid")
     if sha256_file(patch) != fields["patch_sha256"]:
         raise BuildProvenanceError("kernel patch differs from policy")
     if sha256_file(application_script) != fields["application_script_sha256"]:
         raise BuildProvenanceError("patch application script differs from policy")
     if _run(("git", "rev-parse", "HEAD"), kernel_root).stdout.strip() != fields["base_commit"]:
         raise BuildProvenanceError("kernel checkout base commit differs from policy")
-    forward = _run(("git", "apply", "--check", patch), kernel_root, check=False).returncode == 0
-    reverse = _run(("git", "apply", "--reverse", "--check", patch), kernel_root, check=False).returncode == 0
+    forward = _run(
+        ("git", "apply", "--check", patch), kernel_root, check=False
+    ).returncode == 0
+    reverse = _run(
+        ("git", "apply", "--reverse", "--check", patch),
+        kernel_root,
+        check=False,
+    ).returncode == 0
     if forward or not reverse:
-        raise BuildProvenanceError("kernel patch is registered but unapplied or ambiguously applied")
-    evidence = {**fields, "post_fix_source_sha256": sha256_file(source), "forward_applicable": False, "reverse_applicable": True}
+        raise BuildProvenanceError(
+            "post-build kernel patch is unapplied or ambiguously applied"
+        )
+    return {
+        **fields,
+        "post_fix_source_sha256": sha256_file(source),
+        "forward_applicable": False,
+        "reverse_applicable": True,
+    }
+
+
+def create_pre_build_provenance(kernel_root: Path, policy: Mapping[str, object], patch: Path, application_script: Path, output: Path, *, timestamp: str, nonce: str) -> dict[str, object]:
+    fields = _policy_fields(policy)
+    if not TIMESTAMP.fullmatch(timestamp) or not HEX64.fullmatch(nonce):
+        raise BuildProvenanceError("pre-build timestamp or session nonce is invalid")
+    evidence = _live_kernel_evidence(
+        kernel_root, fields, patch, application_script
+    )
     record: dict[str, object] = {
         "schema_version": 1, "state": "pre-build", "device": "fleur", "session_nonce": nonce,
         "pre_build": {**evidence, "timestamp": timestamp, "application_evidence_sha256": _canonical_hash(evidence)},
@@ -174,10 +198,49 @@ def _load(path: Path) -> dict[str, object]:
     return value
 
 
-def finalize_build_provenance(pre_build_path: Path, unsigned_target_files: Path, output: Path) -> dict[str, object]:
+def finalize_build_provenance(
+    pre_build_path: Path,
+    unsigned_target_files: Path,
+    output: Path,
+    *,
+    kernel_root: Path,
+    policy: Mapping[str, object],
+    patch: Path,
+    application_script: Path,
+) -> dict[str, object]:
     record = _load(pre_build_path)
-    if record.get("state") != "pre-build":
-        raise BuildProvenanceError("only a pre-build provenance record can be finalized")
+    if set(record) != {"schema_version", "state", "device", "session_nonce", "pre_build"}:
+        raise BuildProvenanceError("pre-build provenance fields are not exact")
+    if (
+        record.get("schema_version") != 1
+        or record.get("state") != "pre-build"
+        or record.get("device") != "fleur"
+    ):
+        raise BuildProvenanceError("pre-build provenance schema/state/device is invalid")
+    nonce = record.get("session_nonce")
+    if not isinstance(nonce, str) or not HEX64.fullmatch(nonce):
+        raise BuildProvenanceError("pre-build session nonce is invalid")
+    fields = _policy_fields(policy)
+    pre = record.get("pre_build")
+    if not isinstance(pre, dict):
+        raise BuildProvenanceError("pre-build proof is missing")
+    exact_pre = set(fields) | {
+        "post_fix_source_sha256", "forward_applicable", "reverse_applicable",
+        "timestamp", "application_evidence_sha256",
+    }
+    if set(pre) != exact_pre:
+        raise BuildProvenanceError("pre-build proof fields are not exact")
+    if not isinstance(pre.get("timestamp"), str) or not TIMESTAMP.fullmatch(pre["timestamp"]):
+        raise BuildProvenanceError("pre-build timestamp is invalid")
+    live = _live_kernel_evidence(
+        kernel_root, fields, patch, application_script
+    )
+    if any(pre.get(name) != value for name, value in live.items()):
+        raise BuildProvenanceError(
+            "post-build live kernel state differs from the pre-build proof"
+        )
+    if pre.get("application_evidence_sha256") != _canonical_hash(live):
+        raise BuildProvenanceError("pre-build application evidence hash is invalid")
     boot = _boot_bytes(unsigned_target_files)
     target = _regular(unsigned_target_files, "unsigned target-files")
     finalized = dict(record)
@@ -256,6 +319,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     final = commands.add_parser("finalize")
     final.add_argument("--pre-build", required=True, type=Path)
     final.add_argument("--unsigned-target-files", required=True, type=Path)
+    final.add_argument("--kernel-root", required=True, type=Path)
+    final.add_argument("--kernel-policy", required=True, type=Path)
+    final.add_argument("--patch", required=True, type=Path)
+    final.add_argument("--application-script", required=True, type=Path)
     final.add_argument("--output", required=True, type=Path)
     verify = commands.add_parser("validate")
     verify.add_argument("--provenance", required=True, type=Path)
@@ -273,7 +340,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "finalize":
             result = finalize_build_provenance(
-                args.pre_build, args.unsigned_target_files, args.output
+                args.pre_build, args.unsigned_target_files, args.output,
+                kernel_root=args.kernel_root,
+                policy=_load_policy(args.kernel_policy),
+                patch=args.patch,
+                application_script=args.application_script,
             )
         else:
             result = validate_final_build_provenance(

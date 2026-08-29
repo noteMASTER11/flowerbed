@@ -515,6 +515,21 @@ class SignedReleasePolicyTest(unittest.TestCase):
             plan = module.build_key_plan(inventory)
             with self.assertRaisesRegex(module.VerificationError, "Alpha.apk"):
                 module.verify_signed_key_plan(signed, inventory, plan)
+            for mappings in (
+                (
+                    SimpleNamespace(source_stem="source/platform", destination_role="platform"),
+                    SimpleNamespace(source_stem="source/./platform", destination_role="media"),
+                ),
+                (
+                    SimpleNamespace(source_stem="source/platform", destination_role="roles/platform"),
+                    SimpleNamespace(source_stem="source/media", destination_role="roles//platform"),
+                ),
+            ):
+                collision_plan = SimpleNamespace(
+                    android_mappings=mappings, apex_names=(), avb_roles=(),
+                )
+                with self.assertRaisesRegex(module.VerificationError, "canonical.*collision"):
+                    module.verify_signed_key_plan(signed, inventory, collision_plan)
 
     def test_fastboot_images_and_android_info_must_match_signed_target_files(self):
         module = load_verifier()
@@ -1134,6 +1149,20 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     )
             (scripts / "shadow.py").unlink()
 
+            with self.assertRaisesRegex(module.VerificationError, "execution copy changed"):
+                with module.snapshot_android_toolchain(android) as snapshot:
+                    executed = snapshot.host_tools / "avbtool"
+                    executed.chmod(0o755)
+                    executed.write_bytes(b"mutated-execution-copy")
+
+            with self.assertRaisesRegex(module.VerificationError, "execution copy changed"):
+                with module.snapshot_android_toolchain(android) as snapshot:
+                    executed_import = snapshot.payload_scripts / "helper.py"
+                    executed_import.chmod(0o644)
+                    executed_import.write_text(
+                        "VALUE = 'mutated execution import'\n", encoding="utf-8"
+                    )
+
             (tools / "avbtool").unlink()
             os.symlink(tools / "apksigner", tools / "avbtool")
             with self.assertRaisesRegex(module.VerificationError, "symlink"):
@@ -1158,6 +1187,43 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 script, clean, [], cwd=shadow
             )
             self.assertEqual("clean", output.strip())
+
+    def test_update_verifier_detects_mutated_clean_export_execution_copy(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "verifier"
+            repository.mkdir()
+            (repository / "update_verifier.py").write_text(
+                "print('verified successfully')\n", encoding="utf-8"
+            )
+            ota = root / "ota.zip"
+            key = root / "key.pem"
+            ota.write_bytes(b"ota")
+            key.write_bytes(b"key")
+
+            def runner(command, **_kwargs):
+                command = [str(item) for item in command]
+                if command[:3] == ["git", "rev-parse", "HEAD"] or command[:3] == ["git", "rev-parse", "refs/heads/main"]:
+                    return module.PINNED_UPDATE_VERIFIER_COMMIT + "\n"
+                if command[:2] == ["git", "status"]:
+                    return ""
+                if command[:2] == ["git", "archive"]:
+                    output = Path(next(item.split("=", 1)[1] for item in command if item.startswith("--output=")))
+                    with tarfile.open(output, "w") as archive:
+                        archive.add(repository / "update_verifier.py", arcname="update_verifier.py")
+                    return ""
+                if "-I" in command:
+                    script = next(Path(item) for item in command if Path(item).name == "update_verifier.py")
+                    script.chmod(0o644)
+                    script.write_text("print('tampered')\n", encoding="utf-8")
+                    return "verified successfully\n"
+                self.fail(command)
+
+            with self.assertRaisesRegex(module.VerificationError, "execution copy changed"):
+                module.verify_ota_whole_file_signature(
+                    repository, ota, key, runner=runner
+                )
 
     def test_report_temporary_is_removed_on_fsync_failure(self):
         module = load_verifier()

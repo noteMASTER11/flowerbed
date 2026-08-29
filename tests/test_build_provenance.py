@@ -52,7 +52,11 @@ class BuildProvenanceTest(unittest.TestCase):
             with zipfile.ZipFile(target, "w") as archive:
                 archive.writestr("IMAGES/boot.img", b"fixed-boot")
             final = root / "final.json"
-            finalized = build_provenance.finalize_build_provenance(prebuild, target, final)
+            finalized = build_provenance.finalize_build_provenance(
+                prebuild, target, final,
+                kernel_root=kernel, policy=policy, patch=patch,
+                application_script=script,
+            )
             self.assertEqual("finalized", finalized["state"])
             self.assertEqual(hashlib.sha256(b"fixed-boot").hexdigest(), finalized["unsigned_target_files"]["boot_raw_sha256"])
             build_provenance.validate_final_build_provenance(final, target, policy, patch, script)
@@ -70,7 +74,11 @@ class BuildProvenanceTest(unittest.TestCase):
                     ]),
                 )
             with self.assertRaisesRegex(build_provenance.BuildProvenanceError, "exists"):
-                build_provenance.finalize_build_provenance(prebuild, target, final)
+                build_provenance.finalize_build_provenance(
+                    prebuild, target, final,
+                    kernel_root=kernel, policy=policy, patch=patch,
+                    application_script=script,
+                )
 
     def test_final_validation_rejects_wrong_application_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -83,10 +91,88 @@ class BuildProvenanceTest(unittest.TestCase):
             with zipfile.ZipFile(target, "w") as archive:
                 archive.writestr("IMAGES/boot.img", b"fixed")
             final = root / "final.json"
-            build_provenance.finalize_build_provenance(prebuild, target, final)
+            build_provenance.finalize_build_provenance(
+                prebuild, target, final,
+                kernel_root=kernel, policy=policy, patch=patch,
+                application_script=script,
+            )
             value = json.loads(final.read_text(encoding="utf-8"))
             value["pre_build"]["application_evidence_sha256"] = "0" * 64
             final.chmod(0o644)
             final.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(build_provenance.BuildProvenanceError, "application evidence"):
                 build_provenance.validate_final_build_provenance(final, target, policy, patch, script)
+
+    def test_finalize_rechecks_live_kernel_and_rejects_revert_or_mutation(self):
+        cases = {
+            "revert": "unapplied",
+            "extra-change": "post-build",
+            "patch": "kernel patch differs",
+            "script": "application script differs",
+            "head": "base commit differs",
+        }
+        for mutation, expected_error in cases.items():
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                kernel, patch, script, policy = self._fixture(root)
+                subprocess.run(("git", "apply", patch), cwd=kernel, check=True)
+                prebuild = root / "prebuild.json"
+                build_provenance.create_pre_build_provenance(
+                    kernel, policy, patch, script, prebuild,
+                    timestamp="2026-08-29T00:00:00Z", nonce="c" * 64,
+                )
+                source = kernel / policy["file"]
+                if mutation == "revert":
+                    subprocess.run(("git", "apply", "--reverse", patch), cwd=kernel, check=True)
+                elif mutation == "extra-change":
+                    source.write_text(source.read_text(encoding="utf-8") + "extra\n", encoding="utf-8")
+                elif mutation == "patch":
+                    patch.write_bytes(patch.read_bytes() + b"\n")
+                elif mutation == "script":
+                    script.write_text(
+                        script.read_text(encoding="utf-8") + "# changed\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    unrelated = kernel / "unrelated.txt"
+                    unrelated.write_text("new commit\n", encoding="utf-8")
+                    subprocess.run(("git", "add", "unrelated.txt"), cwd=kernel, check=True)
+                    subprocess.run(("git", "commit", "-qm", "unrelated"), cwd=kernel, check=True)
+                target = root / "lineage_fleur-target_files.zip"
+                with zipfile.ZipFile(target, "w") as archive:
+                    archive.writestr("IMAGES/boot.img", b"fixed")
+                with self.assertRaisesRegex(
+                    build_provenance.BuildProvenanceError,
+                    expected_error,
+                ):
+                    build_provenance.finalize_build_provenance(
+                        prebuild, target, root / "final.json",
+                        kernel_root=kernel, policy=policy, patch=patch,
+                        application_script=script,
+                    )
+
+    def test_finalize_rejects_non_exact_prebuild_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel, patch, script, policy = self._fixture(root)
+            subprocess.run(("git", "apply", patch), cwd=kernel, check=True)
+            prebuild = root / "prebuild.json"
+            build_provenance.create_pre_build_provenance(
+                kernel, policy, patch, script, prebuild,
+                timestamp="2026-08-29T00:00:00Z", nonce="d" * 64,
+            )
+            value = json.loads(prebuild.read_text(encoding="utf-8"))
+            value["unexpected"] = True
+            prebuild.chmod(0o644)
+            prebuild.write_text(json.dumps(value), encoding="utf-8")
+            target = root / "lineage_fleur-target_files.zip"
+            with zipfile.ZipFile(target, "w") as archive:
+                archive.writestr("IMAGES/boot.img", b"fixed")
+            with self.assertRaisesRegex(
+                build_provenance.BuildProvenanceError, "pre-build.*exact"
+            ):
+                build_provenance.finalize_build_provenance(
+                    prebuild, target, root / "final.json",
+                    kernel_root=kernel, policy=policy, patch=patch,
+                    application_script=script,
+                )

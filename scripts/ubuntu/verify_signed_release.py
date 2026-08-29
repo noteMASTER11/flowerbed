@@ -138,18 +138,89 @@ class _FileSnapshot:
 
 
 class _AndroidToolchainSnapshot:
-    def __init__(self, root: Path, files: _FileSnapshot, android_root: Path):
+    def __init__(
+        self,
+        root: Path,
+        files: _FileSnapshot,
+        android_root: Path,
+        execution,
+    ):
         self.root = root
         self.host_tools = root / "bin"
         self.payload_scripts = root / "payload-scripts"
         self.files = files
         self.android_root = android_root
         self.source_inventory = dict(files.sources)
+        self.execution = execution
 
     def verify(self) -> None:
+        self.execution.verify()
         self.files.verify()
         if _android_toolchain_inputs(self.android_root) != self.source_inventory:
             raise VerificationError("Android toolchain inventory changed during verification")
+
+
+class _ExecutionTree:
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.directories, self.files = self._inventory()
+
+    def _inventory(self):
+        directories: set[str] = set()
+        files: dict[str, tuple[int, int, int, int, str]] = {}
+        for directory, names, filenames in os.walk(self.root, followlinks=False):
+            base = Path(directory)
+            for name in names:
+                path = base / name
+                metadata = path.lstat()
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                    raise VerificationError("execution copy contains an unsafe directory")
+                directories.add(path.relative_to(self.root).as_posix())
+            for name in filenames:
+                path = base / name
+                metadata = path.lstat()
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    raise VerificationError("execution copy contains an unsafe file")
+                files[path.relative_to(self.root).as_posix()] = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_size,
+                    stat.S_IMODE(metadata.st_mode),
+                    sha256_file(path),
+                )
+        return directories, files
+
+    def verify(self) -> None:
+        try:
+            directories, files = self._inventory()
+        except (OSError, VerificationError) as error:
+            raise VerificationError("execution copy changed during verification") from error
+        if directories != self.directories or files != self.files:
+            raise VerificationError("execution copy changed during verification")
+
+
+def _make_tree_read_only(root: Path) -> None:
+    for directory, _names, filenames in os.walk(root, topdown=False):
+        base = Path(directory)
+        for name in filenames:
+            path = base / name
+            mode = stat.S_IMODE(path.lstat().st_mode)
+            path.chmod(0o555 if mode & 0o111 else 0o444)
+        base.chmod(0o555)
+
+
+def _make_tree_writable(root: Path) -> None:
+    for directory, _names, filenames in os.walk(root):
+        base = Path(directory)
+        base.chmod(0o700)
+        for name in filenames:
+            path = base / name
+            try:
+                metadata = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                path.chmod(0o600)
 
 
 @contextmanager
@@ -218,9 +289,16 @@ def snapshot_android_toolchain(android_root: Path) -> Iterator[_AndroidToolchain
             destination = (host_tools if kind == "tool" else payload_scripts) / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(snapshot_path, destination)
-        snapshot = _AndroidToolchainSnapshot(root, files, android_root)
-        yield snapshot
-        snapshot.verify()
+        _make_tree_read_only(root)
+        execution = _ExecutionTree(root)
+        snapshot = _AndroidToolchainSnapshot(
+            root, files, android_root, execution
+        )
+        try:
+            yield snapshot
+            snapshot.verify()
+        finally:
+            _make_tree_writable(root)
 
 
 def _android_toolchain_inputs(android_root: Path) -> dict[str, Path]:
@@ -750,16 +828,38 @@ def build_provenance_evidence(path: Path, record: Mapping[str, object]) -> dict[
     }
 
 
+def _exact_android_key_mapping(plan) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    source_spellings: dict[str, str] = {}
+    role_spellings: dict[str, str] = {}
+    for item in plan.android_mappings:
+        source = _canonical_key_path(item.source_stem)
+        role = _canonical_key_path(item.destination_role)
+        previous_source = source_spellings.get(source)
+        if previous_source is not None and previous_source != item.source_stem:
+            raise VerificationError(
+                "canonical Android source-stem collision in key plan"
+            )
+        previous_role = role_spellings.get(role)
+        if previous_role is not None and previous_role != item.destination_role:
+            raise VerificationError(
+                "canonical Android destination-role collision in key plan"
+            )
+        if source in mapping:
+            raise VerificationError("duplicate Android source stem in key plan")
+        source_spellings[source] = item.source_stem
+        role_spellings[role] = item.destination_role
+        mapping[source] = role
+    return mapping
+
+
 def verify_signed_key_plan(signed_target_files: Path, unsigned_inventory, plan) -> None:
     inventory = load_signing_inventory(signed_target_files)
     expected_apk = {item.name: item for item in unsigned_inventory.apk_certificates}
     actual_apk = {item.name: item for item in inventory.apk_certificates}
     if set(actual_apk) != set(expected_apk):
         raise VerificationError("signed APK inventory differs from unsigned target-files")
-    mapping = {
-        _canonical_key_path(item.source_stem): item.destination_role
-        for item in plan.android_mappings
-    }
+    mapping = _exact_android_key_mapping(plan)
     apex_roles = set(plan.apex_names)
     avb_roles = {f"avb_{name}" for name in plan.avb_roles}
     for name, item in actual_apk.items():
@@ -924,25 +1024,31 @@ def verify_ota_whole_file_signature(
         script = export / "update_verifier.py"
         if not script.is_file():
             raise VerificationError("isolated update_verifier export is incomplete")
+        _make_tree_read_only(export)
+        execution = _ExecutionTree(export)
         isolated_loader = (
             "import runpy,sys; sys.argv.pop(0); root=sys.argv.pop(0); "
             "sys.path.insert(0,root); runpy.run_path(sys.argv[0],run_name='__main__')"
         )
-        output = runner(
-            [
-                os.sys.executable,
-                "-I",
-                "-c",
-                isolated_loader,
-                export,
-                script,
-                public_key,
-                ota,
-            ],
-            cwd=export,
-        )
-        if "verified successfully" not in output:
-            raise VerificationError("OTA whole-file signature was not verified successfully")
+        try:
+            output = runner(
+                [
+                    os.sys.executable,
+                    "-I",
+                    "-c",
+                    isolated_loader,
+                    export,
+                    script,
+                    public_key,
+                    ota,
+                ],
+                cwd=export,
+            )
+            execution.verify()
+            if "verified successfully" not in output:
+                raise VerificationError("OTA whole-file signature was not verified successfully")
+        finally:
+            _make_tree_writable(export)
     if runner(["git", "rev-parse", "HEAD"], cwd=repository).strip() != revision:
         raise VerificationError("update_verifier checkout changed during verification")
     if runner(
