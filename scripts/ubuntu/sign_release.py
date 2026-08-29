@@ -116,6 +116,10 @@ class SigningPaths:
         return self.android_root / "out/host/linux-x86/bin"
 
     @property
+    def jdk21_bin(self) -> Path:
+        return self.android_root / "prebuilts/jdk/jdk21/linux-x86/bin"
+
+    @property
     def signed_target_files(self) -> Path:
         return self.output_dir / "lineage_fleur-SIGNED-target_files.zip"
 
@@ -332,7 +336,11 @@ def build_child_environment(
     """Build a narrow child environment containing only nonsecret path state."""
     environment: dict[str, str] = {
         "PATH": os.pathsep.join(
-            (str(paths.host_tools), os.environ.get("PATH", "/usr/bin:/bin"))
+            (
+                str(paths.host_tools),
+                str(paths.jdk21_bin),
+                os.environ.get("PATH", "/usr/bin:/bin"),
+            )
         ),
         "ANDROID_PW_FILE": str(
             paths.keys_dir / "passwords" if password_file is None else password_file
@@ -350,7 +358,11 @@ def build_public_environment(paths: SigningPaths) -> dict[str, str]:
     """Build a child environment for tools that never consume private keys."""
     environment = {
         "PATH": os.pathsep.join(
-            (str(paths.host_tools), os.environ.get("PATH", "/usr/bin:/bin"))
+            (
+                str(paths.host_tools),
+                str(paths.jdk21_bin),
+                os.environ.get("PATH", "/usr/bin:/bin"),
+            )
         ),
         "LC_ALL": "C.UTF-8",
         "LANG": "C.UTF-8",
@@ -911,6 +923,9 @@ def _validate_inputs(paths: SigningPaths, *, archive: Path | None = None) -> Sig
         path = paths.host_tools / tool
         if not path.is_file() or not os.access(path, os.X_OK):
             raise ReleaseSigningError(f"required host tool {tool} is unavailable")
+    java = paths.jdk21_bin / "java"
+    if not java.is_file() or not os.access(java, os.X_OK):
+        raise ReleaseSigningError("required Android JDK21 java is unavailable")
     return inventory
 
 

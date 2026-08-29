@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import uuid
 import zipfile
 
@@ -194,6 +195,14 @@ def write_fake_host_tools(android_root: Path) -> None:
         path.chmod(0o755)
 
 
+def write_fake_android_jdk(android_root: Path) -> Path:
+    java = android_root / "prebuilts/jdk/jdk21/linux-x86/bin/java"
+    java.parent.mkdir(parents=True)
+    java.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    java.chmod(0o755)
+    return java
+
+
 class FakeCryptoRunner:
     def __init__(self, secret: str):
         self.secret_digest = digest(secret)
@@ -304,6 +313,7 @@ class ReleaseOrchestrationTest(unittest.TestCase):
         build_provenance = root / "build-provenance.json"
         write_build_provenance(build_provenance, target_files)
         write_fake_host_tools(android_root)
+        write_fake_android_jdk(android_root)
         write_fake_keyset(keys_dir, secret)
         paths = self.SigningPaths(
             target_files, android_root, keys_dir, output_dir,
@@ -724,6 +734,52 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                 self.assertEqual(main(arguments), 1)
             self.assertIn("key", stderr.getvalue())
 
+    def test_dry_run_rejects_missing_android_jdk_java_despite_caller_path(self):
+        from scripts.ubuntu.sign_release import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, _secret = self.make_fixture(root)
+            java = paths.android_root / "prebuilts/jdk/jdk21/linux-x86/bin/java"
+            java.unlink()
+            caller_bin = root / "caller-bin"
+            caller_bin.mkdir()
+            fallback_java = caller_bin / "java"
+            fallback_java.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            fallback_java.chmod(0o755)
+            arguments = [
+                "--target-files", str(paths.target_files),
+                "--android-root", str(paths.android_root),
+                "--keys-dir", str(paths.keys_dir),
+                "--output-dir", str(paths.output_dir),
+                "--build-provenance", str(paths.build_provenance),
+                "--dry-run",
+            ]
+
+            stderr = io.StringIO()
+            with patch.dict(os.environ, {"PATH": str(caller_bin)}), redirect_stderr(stderr):
+                self.assertEqual(main(arguments), 1)
+
+            self.assertIn("JDK21 java", stderr.getvalue())
+            self.assertFalse(paths.output_dir.exists())
+
+    def test_signing_rejects_missing_android_jdk_java_before_subprocess(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, _secret = self.make_fixture(root)
+            java = paths.android_root / "prebuilts/jdk/jdk21/linux-x86/bin/java"
+            java.unlink()
+
+            with self.assertRaisesRegex(self.ReleaseSigningError, "JDK21 java"):
+                self.sign_release(
+                    paths,
+                    runner=lambda *_args, **_kwargs: self.fail("release tool must not run"),
+                    openssl_runner=lambda *_args, **_kwargs: self.fail("crypto must not run"),
+                )
+
+            self.assertFalse(paths.output_dir.exists())
+            self.assertEqual(list(root.glob(".20260829T123456Z.staging-*")), [])
+
     def test_command_failure_removes_staging_and_publishes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -763,6 +819,7 @@ class SigningCommandTest(unittest.TestCase):
             ReleaseSigningError,
             SigningPaths,
             build_child_environment,
+            build_public_environment,
             build_signing_commands,
         )
         from scripts.ubuntu.signing_metadata import load_signing_inventory
@@ -770,6 +827,7 @@ class SigningCommandTest(unittest.TestCase):
         self.ReleaseSigningError = ReleaseSigningError
         self.SigningPaths = SigningPaths
         self.build_child_environment = build_child_environment
+        self.build_public_environment = build_public_environment
         self.build_signing_commands = build_signing_commands
         self.load_signing_inventory = load_signing_inventory
 
@@ -865,6 +923,28 @@ class SigningCommandTest(unittest.TestCase):
             shlex.split(signing_args),
             [f"--signing_helper={SIGNING_HELPER}"],
         )
+
+    def test_child_environments_prepend_android_jdk21_independently_of_caller_path(self):
+        paths = self.SigningPaths(
+            target_files=Path("/tmp/input.zip"),
+            android_root=Path("/opt/android"),
+            keys_dir=Path("/tmp/keys"),
+            output_dir=Path("/tmp/20260829T123456Z"),
+        )
+        expected = (
+            str(paths.host_tools),
+            "/opt/android/prebuilts/jdk/jdk21/linux-x86/bin",
+            "/caller-only",
+        )
+
+        with patch.dict(os.environ, {"PATH": "/caller-only"}):
+            private_environment = self.build_child_environment(
+                paths, Path("/tmp/helper.json")
+            )
+            public_environment = self.build_public_environment(paths)
+
+        self.assertEqual(tuple(private_environment["PATH"].split(os.pathsep)), expected)
+        self.assertEqual(tuple(public_environment["PATH"].split(os.pathsep)), expected)
 
     def test_disambiguates_android_role_collisions_with_apex_roles(self):
         from scripts.ubuntu.signing_metadata import (
