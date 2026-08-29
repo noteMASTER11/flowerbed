@@ -24,6 +24,23 @@ scripts/ubuntu/build.sh --jobs 4 ~/android/lineage-23.2
 Do not treat an out-of-memory failure as a source-tree defect until the kernel log
 and memory limits have been checked.
 
+## Incremental target-files runner rejects the output as stale
+
+`build_target_files.sh` deliberately fails when `m target-files-package` leaves
+the expected target-files ZIP unchanged. Do not point the signer at an older ZIP
+or copy a prior provenance JSON. First confirm the SKU and MDPM CFI patches are
+applied, then rerun the incremental target-files command. It retains compiler
+outputs and ccache; it never performs a source or output cleanup.
+
+## Release signing or verification rejects the keyset
+
+Do not bypass a key or provenance error. Confirm that the target-files archive,
+final build-provenance JSON, Android tree, and keyset are the exact paths from
+the same incremental run. Keep private keys on WSL ext4 outside source trees and
+check that no `.pk8`, private `.pem`, password file, or private keyset metadata
+has been copied to an export directory. A lost private keyset means the update
+lineage is lost: create a new keyset and perform a verified clean installation.
+
 ## Missing `ota_extractor`
 
 Build the AOSP host tool from the synchronized tree:

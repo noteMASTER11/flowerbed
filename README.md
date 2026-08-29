@@ -39,3 +39,16 @@ Continue with [build and install](docs/build-and-install.md), then run the
 [device validation](docs/device-validation.md). Source and firmware selection is
 recorded in [source provenance](docs/source-provenance.md). See
 [troubleshooting](docs/troubleshooting.md) for known WSL2 and build failures.
+
+## Signed release workflow
+
+`fleur` remains the Android device and partition codename. The device patch only
+selects the market-facing SKU name: Redmi Note 11S 4G or POCO M4 Pro 4G. Build a
+fresh unsigned target-files archive incrementally, generate the private release
+keyset once on WSL ext4 storage, post-build sign that exact archive, and run the
+release verifier before exporting public artifacts. The full operator procedure,
+including key custody and migration constraints, is in
+[build and install](docs/build-and-install.md).
+
+Never commit, publish, or copy private `.pk8`/`.pem` files, password records, or
+the private keyset metadata to the repository, Wiki, or `C:\\output`.

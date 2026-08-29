@@ -66,6 +66,82 @@ written below `~/android/lineage-23.2/out/target/product/fleur/`.
 If memory pressure causes compiler or linker processes to be killed, reduce the
 job count to four before changing source code.
 
+## Build and sign a release
+
+The Android codename, OTA metadata, and partition identity remain `fleur`. The
+SKU patch changes only the market-facing model properties: it maps the approved
+Redmi configuration to **Redmi Note 11S 4G** and the POCO configuration to
+**POCO M4 Pro 4G**. Do not rename partitions, the product target, or the build
+command.
+
+Apply the repository patches, then rebuild only the target-files package. This
+keeps the existing `out` tree and ccache intact and rejects an unchanged stale
+target-files archive. It also creates two-phase MDPM CFI kernel provenance so a
+pre-fix boot image cannot be signed by mistake.
+
+```bash
+cd ~/src/flowerbed
+scripts/ubuntu/apply_patches.sh ~/android/lineage-23.2
+scripts/ubuntu/build_target_files.sh --verbose --jobs 8 ~/android/lineage-23.2
+```
+
+The runner writes a timestamped log, JSON metadata, resolved manifest, and final
+build-provenance JSON under the repository's ignored `logs/` and
+`manifests/snapshots/` paths. Its output identifies the refreshed unsigned
+target-files archive and provenance file; use those exact two paths below.
+
+Generate the keyset once. It is private WSL-ext4 material outside both the Android
+tree and this repository. The passphrase is entered directly in Ubuntu and must
+never appear in a shell history, log, source file, or exported archive.
+
+```bash
+TARGET_FILES=~/android/lineage-23.2/out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip
+KEYS=~/.android-certs/fleur-release
+python3 scripts/ubuntu/generate_release_keys.py \
+  --target-files "$TARGET_FILES" \
+  --android-root ~/android/lineage-23.2 \
+  --keys-dir "$KEYS" \
+  --subject '/C=GE/ST=Tbilisi/L=Tbilisi/O=flowerbed/OU=Android/CN=fleur release/emailAddress=android@localhost'
+```
+
+Keep an encrypted offline backup of the whole keyset and its documented recovery
+materials. Existing valid keys are reused; replacing keys changes the Android
+trust lineage. A migration from an already installed self-signed build requires
+the normal verified clean-install path unless the old signing lineage is retained.
+If the private keyset or passphrase is lost, it cannot sign a compatible update:
+generate a new keyset, label it as a new lineage, and require a clean install.
+
+Sign and verify only the exact refreshed target-files/provenance pair:
+
+```bash
+BUILD_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+SIGNED_OUTPUT=~/android/lineage-23.2/out/signed-fleur/$BUILD_ID
+PROVENANCE=~/src/flowerbed/logs/target-files-<run-id>.build-provenance.json
+
+python3 scripts/ubuntu/sign_release.py \
+  --target-files "$TARGET_FILES" \
+  --android-root ~/android/lineage-23.2 \
+  --keys-dir "$KEYS" \
+  --output-dir "$SIGNED_OUTPUT" \
+  --build-provenance "$PROVENANCE"
+
+python3 scripts/ubuntu/verify_signed_release.py \
+  --unsigned-target-files "$TARGET_FILES" \
+  --signed-target-files "$SIGNED_OUTPUT/lineage_fleur-SIGNED-target_files.zip" \
+  --ota "$SIGNED_OUTPUT/lineage-23.2-$BUILD_ID-SIGNED-fleur.zip" \
+  --fastboot "$SIGNED_OUTPUT/lineage_fleur-SIGNED-img.zip" \
+  --public-keys "$SIGNED_OUTPUT/public-keys" \
+  --android-root ~/android/lineage-23.2 \
+  --firmware-manifest sources/firmware.json \
+  --signing-report "$SIGNED_OUTPUT/signing-report.json" \
+  --build-provenance "$PROVENANCE" \
+  --report "$SIGNED_OUTPUT/verification-report.json"
+```
+
+Export only a verifier-passed OTA ZIP, fastboot ZIP, public certificates/AVB
+keys, checksums, the sanitized reports, and the resolved manifest. Do not export
+private keys, password files, or private keyset metadata.
+
 ## Verify the complete OTA and embedded firmware
 
 Build the official AOSP payload extractor, locate the newest OTA, and run the

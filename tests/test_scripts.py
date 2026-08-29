@@ -295,6 +295,36 @@ class ScriptTest(unittest.TestCase):
                 self.assertNotEqual(0, result.returncode)
                 self.assertIn("jobs must be a positive integer", result.stdout.lower())
 
+    def test_target_files_dry_run_is_side_effect_free_and_selects_fleur(self):
+        workspace = f"/tmp/flowerbed-target-files-{uuid.uuid4().hex}"
+        result = run_script(
+            "scripts/ubuntu/build_target_files.sh", "--dry-run", workspace
+        )
+        self.assertEqual(0, result.returncode, result.stdout)
+        self.assertIn("source build/envsetup.sh", result.stdout)
+        self.assertIn("breakfast fleur", result.stdout)
+        self.assertIn("m target-files-package otatools -j8", result.stdout)
+        self.assertIn("build_provenance.py pre-build", result.stdout)
+        self.assertIn("build_provenance.py finalize", result.stdout)
+        existence = run_bash("-c", f"test ! -e '{workspace}'")
+        self.assertEqual(0, existence.returncode, existence.stdout)
+
+    def test_target_files_runner_never_cleans_and_requires_fresh_output(self):
+        runner = (ROOT / "scripts/ubuntu/build_target_files.sh").read_text(
+            encoding="utf-8"
+        )
+        for forbidden in ("m clean", "installclean", "rm -rf out", "ccache -C"):
+            self.assertNotIn(forbidden, runner)
+        self.assertIn("pre-build provenance output already exists", runner)
+        self.assertIn("final build provenance output already exists", runner)
+        self.assertIn("target-files output was not refreshed", runner)
+        self.assertIn("--kernel-root", runner)
+        self.assertIn("--kernel-policy", runner)
+        self.assertIn("--application-script", runner)
+        self.assertIn("repo manifest -r", runner)
+        self.assertNotIn("repo -C", runner)
+        self.assertIn('"metadata": str(path)', runner)
+
     def test_device_collection_dry_run_has_no_side_effects(self):
         output = f"/tmp/flowerbed-device-{uuid.uuid4().hex}"
         result = run_script(
