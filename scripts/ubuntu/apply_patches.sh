@@ -18,6 +18,7 @@ patch_specs=(
   "device/xiaomi/fleur|patches/android_device_xiaomi_fleur/0003-fleur-drop-duplicate-mali-genfs-labels.patch"
   "device/xiaomi/fleur|patches/android_device_xiaomi_fleur/0004-fleur-drop-duplicate-dynamic-sensor-context.patch"
   "device/xiaomi/fleur|patches/android_device_xiaomi_fleur/0005-fleur-use-common-mediatek-vt-context.patch"
+  "device/xiaomi/fleur|patches/android_device_xiaomi_fleur/0006-fleur-expose-sku-market-names.patch"
 )
 
 for patch_spec in "${patch_specs[@]}"; do

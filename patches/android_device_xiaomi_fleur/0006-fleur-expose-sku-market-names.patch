@@ -1,0 +1,36 @@
+diff --git a/sku/build_fleur.prop b/sku/build_fleur.prop
+--- a/sku/build_fleur.prop
++++ b/sku/build_fleur.prop
+@@
+ vendor.usb.product_string=Redmi Note 11S
++ro.product.marketname=Redmi Note 11S
+ ro.product.odm.brand=Redmi
+-ro.product.odm.model=fleur
++ro.product.odm.model=Redmi Note 11S
+diff --git a/sku/build_miel.prop b/sku/build_miel.prop
+--- a/sku/build_miel.prop
++++ b/sku/build_miel.prop
+@@
+ vendor.usb.product_string=Redmi Note 11S
++ro.product.marketname=Redmi Note 11S
+ ro.product.odm.brand=Redmi
+-ro.product.odm.model=miel
++ro.product.odm.model=Redmi Note 11S
+diff --git a/sku/build_fleurp.prop b/sku/build_fleurp.prop
+--- a/sku/build_fleurp.prop
++++ b/sku/build_fleurp.prop
+@@
+ vendor.usb.product_string=POCO M4 Pro
++ro.product.marketname=POCO M4 Pro
+ ro.product.odm.brand=POCO
+-ro.product.odm.model=fleur
++ro.product.odm.model=POCO M4 Pro
+diff --git a/sku/build_mielp.prop b/sku/build_mielp.prop
+--- a/sku/build_mielp.prop
++++ b/sku/build_mielp.prop
+@@
+ vendor.usb.product_string=POCO M4 Pro
++ro.product.marketname=POCO M4 Pro
+ ro.product.odm.brand=POCO
+-ro.product.odm.model=miel
++ro.product.odm.model=POCO M4 Pro
