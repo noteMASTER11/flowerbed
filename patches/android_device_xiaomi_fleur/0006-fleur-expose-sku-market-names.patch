@@ -1,36 +1,48 @@
 diff --git a/sku/build_fleur.prop b/sku/build_fleur.prop
 --- a/sku/build_fleur.prop
 +++ b/sku/build_fleur.prop
-@@ -1,3 +1,4 @@
+@@ -1,6 +1,7 @@
+ bluetooth.device.default_name=Redmi Note 11S
  vendor.usb.product_string=Redmi Note 11S
 +ro.product.marketname=Redmi Note 11S
  ro.product.odm.brand=Redmi
+ ro.product.odm.device=fleur
 -ro.product.odm.model=fleur
 +ro.product.odm.model=Redmi Note 11S
+ ro.product.odm.name=fleur_global
 diff --git a/sku/build_miel.prop b/sku/build_miel.prop
 --- a/sku/build_miel.prop
 +++ b/sku/build_miel.prop
-@@ -1,3 +1,4 @@
+@@ -1,6 +1,7 @@
+ bluetooth.device.default_name=Redmi Note 11S
  vendor.usb.product_string=Redmi Note 11S
 +ro.product.marketname=Redmi Note 11S
  ro.product.odm.brand=Redmi
+ ro.product.odm.device=miel
 -ro.product.odm.model=miel
 +ro.product.odm.model=Redmi Note 11S
+ ro.product.odm.name=miel_global
 diff --git a/sku/build_fleurp.prop b/sku/build_fleurp.prop
 --- a/sku/build_fleurp.prop
 +++ b/sku/build_fleurp.prop
-@@ -1,3 +1,4 @@
+@@ -1,6 +1,7 @@
+ bluetooth.device.default_name=POCO M4 Pro
  vendor.usb.product_string=POCO M4 Pro
 +ro.product.marketname=POCO M4 Pro
  ro.product.odm.brand=POCO
+ ro.product.odm.device=fleur
 -ro.product.odm.model=fleur
 +ro.product.odm.model=POCO M4 Pro
+ ro.product.odm.name=fleur_p_global
 diff --git a/sku/build_mielp.prop b/sku/build_mielp.prop
 --- a/sku/build_mielp.prop
 +++ b/sku/build_mielp.prop
-@@ -1,3 +1,4 @@
+@@ -1,6 +1,7 @@
+ bluetooth.device.default_name=POCO M4 Pro
  vendor.usb.product_string=POCO M4 Pro
 +ro.product.marketname=POCO M4 Pro
  ro.product.odm.brand=POCO
+ ro.product.odm.device=miel
 -ro.product.odm.model=miel
 +ro.product.odm.model=POCO M4 Pro
+ ro.product.odm.name=miel_p_global

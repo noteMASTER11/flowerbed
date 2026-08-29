@@ -26,19 +26,22 @@ class ProductIdentityTest(unittest.TestCase):
 
     def test_patch_is_valid_and_applies_to_sku_fixture(self):
         fixture_files = {
-            "fleur": ("Redmi Note 11S", "Redmi", "fleur"),
-            "miel": ("Redmi Note 11S", "Redmi", "miel"),
-            "fleurp": ("POCO M4 Pro", "POCO", "fleur"),
-            "mielp": ("POCO M4 Pro", "POCO", "miel"),
+            "fleur": ("Redmi Note 11S", "Redmi", "fleur", "fleur_global"),
+            "miel": ("Redmi Note 11S", "Redmi", "miel", "miel_global"),
+            "fleurp": ("POCO M4 Pro", "POCO", "fleur", "fleur_p_global"),
+            "mielp": ("POCO M4 Pro", "POCO", "miel", "miel_p_global"),
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "sku").mkdir()
-            for sku, (market_name, brand, model) in fixture_files.items():
+            for sku, (market_name, brand, model, product_name) in fixture_files.items():
                 (root / f"sku/build_{sku}.prop").write_text(
+                    f"bluetooth.device.default_name={market_name}\n"
                     f"vendor.usb.product_string={market_name}\n"
                     f"ro.product.odm.brand={brand}\n"
-                    f"ro.product.odm.model={model}\n",
+                    f"ro.product.odm.device={model}\n"
+                    f"ro.product.odm.model={model}\n"
+                    f"ro.product.odm.name={product_name}\n",
                     encoding="utf-8",
                 )
             subprocess.run(["git", "init", "-q"], cwd=root, check=True)
