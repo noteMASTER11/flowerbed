@@ -155,6 +155,15 @@ def validate_private_destination(
     return resolved
 
 
+def _validated_host_avbtool(android_root: Path) -> Path:
+    avbtool = android_root / "out/host/linux-x86/bin/avbtool"
+    if not avbtool.is_file() or not os.access(avbtool, os.X_OK):
+        raise KeyGenerationError(
+            "required Android host tool avbtool is unavailable or not executable"
+        )
+    return avbtool
+
+
 def run_command(
     command: Sequence[str],
     *,
@@ -193,6 +202,7 @@ def generate_keyset(
         raise KeyGenerationError("certificate subject is invalid")
     plan = build_key_plan(target_files)
     _reject_existing_destination(destination, plan)
+    avbtool = _validated_host_avbtool(android_root)
     if dry_run:
         return destination
 
@@ -205,7 +215,7 @@ def generate_keyset(
     old_umask = os.umask(0o077)
     try:
         with _workspace_context(destination, plan) as workspace:
-            _generate_all(plan, workspace, subject, password, runner)
+            _generate_all(plan, workspace, subject, password, avbtool, runner)
             _remove_raw_directory(workspace)
             _write_password_file_at(
                 workspace.staging_fd,
@@ -257,6 +267,7 @@ def _generate_all(
     workspace: _Workspace,
     subject: str,
     password: str,
+    avbtool: Path,
     runner: CommandRunner,
 ) -> None:
     protected_input = password + "\n"
@@ -268,7 +279,7 @@ def _generate_all(
     for name in plan.apex_names:
         raw_name = f"{name}.raw.pem"
         _generate_raw(workspace, raw_name, "4096", runner)
-        _extract_public(name, raw_name, workspace, runner)
+        _extract_public(name, raw_name, workspace, avbtool, runner)
         _derive_container_key(name, raw_name, workspace, subject, protected_input, runner)
         _encrypt_pem(name, raw_name, workspace, protected_input, runner)
 
@@ -276,7 +287,7 @@ def _generate_all(
         name = f"avb_{role}"
         raw_name = f"{name}.raw.pem"
         _generate_raw(workspace, raw_name, "4096", runner)
-        _extract_public(name, raw_name, workspace, runner)
+        _extract_public(name, raw_name, workspace, avbtool, runner)
         _encrypt_pem(name, raw_name, workspace, protected_input, runner)
 
 
@@ -304,7 +315,11 @@ def _generate_raw(
 
 
 def _extract_public(
-    name: str, raw_name: str, workspace: _Workspace, runner: CommandRunner
+    name: str,
+    raw_name: str,
+    workspace: _Workspace,
+    avbtool: Path,
+    runner: CommandRunner,
 ) -> None:
     public_name = f"{name}.avbpubkey"
     input_fd = _open_input_file(workspace.raw_fd, raw_name)
@@ -314,7 +329,7 @@ def _extract_public(
             workspace,
             runner,
             [
-                "avbtool",
+                str(avbtool),
                 "extract_public_key",
                 "--key",
                 _descriptor_path(input_fd),
@@ -1154,6 +1169,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.android_root,
             )
             _reject_existing_destination(destination, plan)
+            _validated_host_avbtool(arguments.android_root)
             print(
                 json.dumps(
                     {

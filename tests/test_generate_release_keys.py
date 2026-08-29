@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -57,6 +58,14 @@ def write_target_files(path: Path, *, apkcerts: str = APK_CERTS) -> None:
         archive.writestr("META/apexkeys.txt", APEX_KEYS)
         archive.writestr("META/misc_info.txt", MISC_INFO)
         archive.writestr("SYSTEM/build.prop", SYSTEM_BUILD_PROP)
+
+
+def write_fake_avbtool(android_root: Path) -> Path:
+    avbtool = android_root / "out/host/linux-x86/bin/avbtool"
+    avbtool.parent.mkdir(parents=True)
+    avbtool.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    avbtool.chmod(0o755)
+    return avbtool
 
 
 def digest_text(value: str) -> str:
@@ -197,12 +206,14 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             KeyGenerationError,
             build_key_plan,
             generate_keyset,
+            main,
             validate_private_destination,
         )
 
         self.KeyGenerationError = KeyGenerationError
         self.build_key_plan = build_key_plan
         self.generate_keyset = generate_keyset
+        self.main = main
         self.validate_private_destination = validate_private_destination
 
     def private_temp(self):
@@ -313,7 +324,65 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             (("build/make/target/product/security/platform", "platform"),),
         )
 
-    def test_blank_or_mismatched_passphrase_fails_before_commands(self):
+    def test_dry_run_rejects_missing_android_host_avbtool(self):
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            android_root = root / "android"
+            private_parent = root / "private"
+            android_root.mkdir()
+            private_parent.mkdir(mode=0o700)
+
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                result = self.main(
+                    [
+                        "--target-files",
+                        str(target_files),
+                        "--android-root",
+                        str(android_root),
+                        "--keys-dir",
+                        str(private_parent / "keys"),
+                        "--subject",
+                        "/CN=fleur release/",
+                        "--dry-run",
+                    ]
+                )
+
+            self.assertEqual(result, 1)
+            self.assertIn("required Android host tool avbtool", stderr.getvalue())
+            self.assertFalse((private_parent / "keys").exists())
+
+    def test_dry_run_rejects_non_executable_android_host_avbtool(self):
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            android_root = root / "android"
+            private_parent = root / "private"
+            write_fake_avbtool(android_root).chmod(0o644)
+            private_parent.mkdir(mode=0o700)
+
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                result = self.main(
+                    [
+                        "--target-files",
+                        str(target_files),
+                        "--android-root",
+                        str(android_root),
+                        "--keys-dir",
+                        str(private_parent / "keys"),
+                        "--subject",
+                        "/CN=fleur release/",
+                        "--dry-run",
+                    ]
+                )
+
+            self.assertEqual(result, 1)
+            self.assertIn("required Android host tool avbtool", stderr.getvalue())
+            self.assertFalse((private_parent / "keys").exists())
+
+    def test_missing_android_host_avbtool_fails_before_passphrase(self):
         with self.private_temp() as directory:
             root = Path(directory)
             target_files = root / "target-files.zip"
@@ -323,6 +392,36 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             private_parent = root / "private"
             repo.mkdir()
             android_root.mkdir()
+            private_parent.mkdir(mode=0o700)
+            prompts: list[str] = []
+            secret = uuid.uuid4().hex
+            runner = FakeRunner(failure_tool="avbtool")
+
+            with self.assertRaisesRegex(self.KeyGenerationError, "avbtool"):
+                self.generate_keyset(
+                    target_files,
+                    android_root,
+                    private_parent / "keys",
+                    "/CN=fleur release/",
+                    repo_root=repo,
+                    runner=runner,
+                    getpass_fn=lambda prompt: prompts.append(prompt) or secret,
+                )
+
+            self.assertEqual(prompts, [])
+            self.assertEqual(runner.calls, [])
+            self.assertFalse((private_parent / "keys").exists())
+
+    def test_blank_or_mismatched_passphrase_fails_before_commands(self):
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            repo = root / "repo"
+            android_root = root / "android"
+            private_parent = root / "private"
+            repo.mkdir()
+            write_fake_avbtool(android_root)
             private_parent.mkdir()
 
             first = uuid.uuid4().hex
@@ -361,7 +460,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             repo = root / "repo"
             android_root = root / "android"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             secret = uuid.uuid4().hex
 
             unsafe_parent = root / "private space"
@@ -421,7 +520,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             android_root = root / "android"
             keys_dir = root / "private" / "keys"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             keys_dir.mkdir(parents=True)
             (keys_dir / "platform.pk8").write_bytes(b"private")
             runner = FakeRunner()
@@ -449,7 +548,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             private_parent = root / "private"
             keys_dir = private_parent / "keys"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             private_parent.mkdir(mode=0o700)
             abandoned = private_parent / ".keys.staging-abandoned"
             abandoned.mkdir(mode=0o700)
@@ -479,7 +578,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             private_parent = root / "private"
             keys_dir = private_parent / "keys"
             repo.mkdir()
-            android_root.mkdir()
+            avbtool = write_fake_avbtool(android_root)
             private_parent.mkdir(mode=0o700)
             secret = uuid.uuid4().hex + "!"
             runner = FakeRunner(
@@ -540,13 +639,16 @@ class GenerateReleaseKeysTest(unittest.TestCase):
                     for call in protected_calls
                 )
             )
+            avb_calls = [
+                call
+                for call in runner.calls
+                if Path(call.command[0]).name == "avbtool"
+            ]
+            self.assertTrue(avb_calls)
             self.assertTrue(
-                all(
-                    not call.environment
-                    for call in runner.calls
-                    if call.command[0] == "avbtool"
-                )
+                all(call.command[0] == str(avbtool) for call in avb_calls)
             )
+            self.assertTrue(all(not call.environment for call in avb_calls))
             self.assertTrue(
                 all(
                     dict(call.fd_targets)[
@@ -555,8 +657,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
                             .split("/")[4]
                         )
                     ].endswith(".raw.pem")
-                    for call in runner.calls
-                    if call.command[0] == "avbtool"
+                    for call in avb_calls
                 )
             )
             self.assertTrue(
@@ -625,7 +726,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             private_parent = root / "private"
             keys_dir = private_parent / "keys"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             private_parent.mkdir(mode=0o700)
             runner = FakeRunner(failure_tool="openssl")
             secret = uuid.uuid4().hex
@@ -654,7 +755,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             private_parent = root / "private"
             keys_dir = private_parent / "keys"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             private_parent.mkdir(mode=0o700)
             runner = FakeRunner(create_unexpected_entry=True)
             secret = uuid.uuid4().hex
@@ -682,7 +783,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             private_parent = root / "private"
             keys_dir = private_parent / "keys"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             private_parent.mkdir(mode=0o700)
             secret = uuid.uuid4().hex
             runner = FakeRunner(
@@ -715,7 +816,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             keys_dir = private_parent / "keys"
             trap = root / "trap"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             private_parent.mkdir(mode=0o700)
             trap.write_bytes(b"")
             secret = uuid.uuid4().hex
@@ -747,7 +848,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             repo = root / "repo"
             android_root = root / "android"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             secret = uuid.uuid4().hex
 
             for name, error in (
@@ -790,7 +891,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             private_parent = root / "private"
             keys_dir = private_parent / "keys"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             private_parent.mkdir(mode=0o700)
             secret = uuid.uuid4().hex
             original_open = generator.os.open
@@ -829,7 +930,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             private_parent = root / "private"
             keys_dir = private_parent / "keys"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             private_parent.mkdir(mode=0o700)
             secret = uuid.uuid4().hex
             original_rename = generator._rename_no_replace_at
@@ -875,7 +976,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             repo = root / "repo"
             android_root = root / "android"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             secret = uuid.uuid4().hex
             plan = self.build_key_plan(target_files)
             boundaries = (
@@ -993,7 +1094,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             private_parent = root / "private"
             keys_dir = private_parent / "keys"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             private_parent.mkdir(mode=0o700)
             secret = uuid.uuid4().hex
             marker = RuntimeError("redacted manifest failure")
@@ -1030,7 +1131,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             private_parent = root / "private"
             keys_dir = private_parent / "keys"
             repo.mkdir()
-            android_root.mkdir()
+            write_fake_avbtool(android_root)
             private_parent.mkdir(mode=0o700)
             secret = uuid.uuid4().hex
             marker = RuntimeError("redacted runner failure")
