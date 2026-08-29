@@ -83,9 +83,8 @@ TEST_KEY_PREFIXES = (
     "build/make/target/product/security/",
     "external/avb/test/",
 )
-OPTIONAL_EMPTY_MISC_PROPERTIES = frozenset(
-    ("building_oem_image", "mkbootimg_init_args")
-)
+MISC_KEY_LIST_PROPERTIES = ("extra_ota_keys", "extra_recovery_keys")
+AVB_KEY_PATH_PROPERTY = re.compile(r"avb_[A-Za-z0-9_]+_key_path\Z")
 FASTBOOT_ALLOWED_MEMBERS = {
     "android-info.txt",
     *(f"{partition}.img" for partition in REQUIRED_FASTBOOT_IMAGES),
@@ -502,6 +501,27 @@ def _normalized_key_stem(value: str) -> str:
     return normalized
 
 
+def _verify_misc_signing_key_paths(misc: Mapping[str, str]) -> None:
+    default_certificate = misc.get("default_system_dev_certificate")
+    if not default_certificate:
+        raise VerificationError(
+            "misc_info.txt has invalid default_system_dev_certificate"
+        )
+    _reject_test_key_path(default_certificate)
+
+    for name in MISC_KEY_LIST_PROPERTIES:
+        for value in misc.get(name, "").split():
+            _reject_test_key_path(value)
+
+    for name, value in misc.items():
+        if AVB_KEY_PATH_PROPERTY.fullmatch(name):
+            if not value:
+                raise VerificationError(
+                    f"misc_info.txt has invalid AVB key path {name}"
+                )
+            _reject_test_key_path(value)
+
+
 def verify_signing_metadata_paths(apkcerts: str, apexkeys: str, misc_info: str) -> list[str]:
     """Validate preserved package metadata and reject test keys in rewritten misc data."""
     for fields in _metadata_records(
@@ -544,14 +564,7 @@ def verify_signing_metadata_paths(apkcerts: str, apexkeys: str, misc_info: str) 
                 raise VerificationError("apexkeys.txt has mismatched container key stems")
 
     misc = _parse_properties(misc_info, "misc_info.txt")
-    for name, value in misc.items():
-        if not value:
-            if name not in OPTIONAL_EMPTY_MISC_PROPERTIES:
-                raise VerificationError(
-                    f"misc_info.txt has an empty property {name}"
-                )
-            continue
-        _reject_test_key_path(value)
+    _verify_misc_signing_key_paths(misc)
     for partition in REQUIRED_AVB_PARTITIONS:
         key_name = f"avb_{partition}_key_path"
         algorithm_name = f"avb_{partition}_algorithm"

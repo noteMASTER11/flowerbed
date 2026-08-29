@@ -145,14 +145,20 @@ class SignedReleasePolicyTest(unittest.TestCase):
             f"avb_{partition}_algorithm=SHA256_RSA4096\n"
             for partition in module.REQUIRED_AVB_PARTITIONS
         )
-        optional_empty_misc = "building_oem_image=\nmkbootimg_init_args=\n"
+        optional_nonsecurity_misc = (
+            "building_oem_image=\n"
+            "mkbootimg_init_args=\n"
+            "tool_extensions=device/xiaomi/fleur/../common\n"
+            "extra_ota_keys=\n"
+            "extra_recovery_keys=vendor/lineage/build/target/product/security/lineage\n"
+        )
         permitted = module.verify_signing_metadata_paths(
             'name="Settings.apk" certificate="build/make/target/product/security/testkey.x509.pem" private_key="build/make/target/product/security/testkey.pk8"\n'
             'name="AndroidXComposeStartupApp.apk" certificate="PRESIGNED" private_key="" partition="data"\n',
             'name="com.android.art.apex" public_key="build/make/target/product/security/com.android.art.avbpubkey" private_key="build/make/target/product/security/com.android.art.pem" container_certificate="build/make/target/product/security/platform.x509.pem" container_private_key="build/make/target/product/security/platform.pk8" partition="system"\n'
             'name="com.android.tzdata.apex" public_key="PRESIGNED" private_key="PRESIGNED" container_certificate="PRESIGNED" container_private_key="PRESIGNED" partition="system"\n',
             "default_system_dev_certificate=release/releasekey\n"
-            + optional_empty_misc
+            + optional_nonsecurity_misc
             + avb_metadata,
         )
         self.assertEqual(["com.android.tzdata.apex"], permitted)
@@ -185,12 +191,64 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 'name="Settings.apk" certificate="release/platform.x509.pem" private_key="release/platform.pk8"\n',
                 "",
                 "default_system_dev_certificate=release/releasekey\n"
-                + optional_empty_misc
+                + optional_nonsecurity_misc
                 + avb_metadata.replace(
                     "avb_vbmeta_vendor_key_path=release/avb_vbmeta_vendor.pem",
                     "avb_vbmeta_vendor_key_path=",
                 ),
             )
+        security_failures = (
+            (
+                "missing default certificate",
+                avb_metadata,
+                "default_system_dev_certificate",
+            ),
+            (
+                "empty default certificate",
+                "default_system_dev_certificate=\n" + avb_metadata,
+                "default_system_dev_certificate",
+            ),
+            (
+                "default certificate traversal",
+                "default_system_dev_certificate=release/../releasekey\n"
+                + avb_metadata,
+                "traversal",
+            ),
+            (
+                "AVB test key",
+                "default_system_dev_certificate=release/releasekey\n"
+                + avb_metadata.replace(
+                    "avb_boot_key_path=release/avb_boot.pem",
+                    "avb_boot_key_path=build/make/target/product/security/testkey.pem",
+                ),
+                "test certificate",
+            ),
+            (
+                "extra recovery traversal",
+                "default_system_dev_certificate=release/releasekey\n"
+                "extra_recovery_keys=vendor/keys/../test\n"
+                + avb_metadata,
+                "traversal",
+            ),
+            (
+                "extra OTA test key",
+                "default_system_dev_certificate=release/releasekey\n"
+                "extra_ota_keys=build/make/target/product/security/testkey\n"
+                + avb_metadata,
+                "test certificate",
+            ),
+            (
+                "extra key NUL",
+                "default_system_dev_certificate=release/releasekey\n"
+                "extra_recovery_keys=vendor/keys/good vendor/keys/bad\x00key\n"
+                + avb_metadata,
+                "invalid",
+            ),
+        )
+        for label, misc_info, message in security_failures:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(module.VerificationError, message):
+                    module.verify_signing_metadata_paths("", "", misc_info)
         for malformed in ("building_oem_image\n", "=value\n"):
             with self.assertRaises(module.VerificationError):
                 module.verify_signing_metadata_paths(
@@ -1139,6 +1197,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 "META/misc_info.txt": (
                     "ab_update=true\nvirtual_ab=true\n"
                     "building_oem_image=\nmkbootimg_init_args=\n"
+                    "tool_extensions=device/xiaomi/fleur/../common\n"
                     "default_system_dev_certificate=release/releasekey\n"
                     + "".join(
                         f"avb_{partition}_key_path=release/avb_{partition}.pem\n"
