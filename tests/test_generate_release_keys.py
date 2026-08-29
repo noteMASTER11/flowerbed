@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -47,18 +50,65 @@ def write_target_files(path: Path) -> None:
         archive.writestr("META/misc_info.txt", MISC_INFO)
 
 
+def digest_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class RecordedCall:
+    command: tuple[str, ...]
+    stdin_digest: str | None
+    environment: tuple[tuple[str, str], ...]
+    pass_fds: tuple[int, ...]
+    fd_targets: tuple[tuple[int, str], ...]
+
+
 class FakeRunner:
     def __init__(
-        self, *, failure_tool: str | None = None, create_unexpected_entry: bool = False
+        self,
+        *,
+        failure_tool: str | None = None,
+        create_unexpected_entry: bool = False,
+        forbidden_secret: str | None = None,
+        raise_error: BaseException | None = None,
+        mutate_after_first=None,
+        replace_first_output_with_symlink_to: Path | None = None,
+        write_outputs_in_child: bool = False,
     ):
-        self.calls: list[tuple[tuple[str, ...], str | None, dict[str, str] | None]] = []
+        self.calls: list[RecordedCall] = []
         self.failure_tool = failure_tool
         self.create_unexpected_entry = create_unexpected_entry
+        self.forbidden_secret = forbidden_secret
+        self.raise_error = raise_error
+        self.mutate_after_first = mutate_after_first
+        self.replace_first_output_with_symlink_to = replace_first_output_with_symlink_to
+        self.write_outputs_in_child = write_outputs_in_child
 
-    def __call__(self, command, *, stdin=None, env=None):
+    def __call__(self, command, *, stdin=None, env=None, pass_fds=()):
         command = tuple(str(item) for item in command)
-        copied_env = None if env is None else dict(env)
-        self.calls.append((command, stdin, copied_env))
+        environment = tuple(sorted((env or {}).items()))
+        if self.forbidden_secret:
+            exposed = any(self.forbidden_secret in item for item in command)
+            exposed = exposed or any(
+                self.forbidden_secret in key or self.forbidden_secret in value
+                for key, value in environment
+            )
+            if exposed:
+                raise AssertionError("secret exposed outside stdin")
+        self.calls.append(
+            RecordedCall(
+                command=command,
+                stdin_digest=None if stdin is None else digest_text(stdin),
+                environment=environment,
+                pass_fds=tuple(pass_fds),
+                fd_targets=tuple(
+                    (descriptor, os.readlink(f"/proc/self/fd/{descriptor}"))
+                    for descriptor in pass_fds
+                ),
+            )
+        )
+        if self.raise_error is not None:
+            raise self.raise_error
         if self.failure_tool and Path(command[0]).name == self.failure_tool:
             raise subprocess.CalledProcessError(1, command)
 
@@ -69,14 +119,41 @@ class FakeRunner:
         else:
             return
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes((Path(command[0]).name + ":public-fixture").encode("ascii"))
+        if (
+            len(self.calls) == 1
+            and self.replace_first_output_with_symlink_to is not None
+        ):
+            named_output = output.resolve()
+            named_output.unlink()
+            named_output.symlink_to(self.replace_first_output_with_symlink_to)
+        payload = (Path(command[0]).name + ":public-fixture").encode("ascii")
+        if self.write_outputs_in_child:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,sys; "
+                        "fd=os.open(sys.argv[1], os.O_WRONLY|os.O_TRUNC); "
+                        "os.write(fd, b'child-public-fixture'); os.close(fd)"
+                    ),
+                    str(output),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            output.write_bytes(payload)
         if self.create_unexpected_entry:
             staging = next(
                 parent
-                for parent in output.parents
+                for parent in output.resolve().parents
                 if parent.name.startswith(".keys.staging-")
             )
             (staging / "unexpected").mkdir(exist_ok=True)
+        if len(self.calls) == 1 and self.mutate_after_first is not None:
+            self.mutate_after_first()
 
 
 class GenerateReleaseKeysTest(unittest.TestCase):
@@ -94,7 +171,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
         self.validate_private_destination = validate_private_destination
 
     def private_temp(self):
-        return tempfile.TemporaryDirectory(dir="/var/tmp")
+        return tempfile.TemporaryDirectory(dir="/home/administrator")
 
     def test_rejects_repository_android_and_windows_mount_destinations(self):
         with self.private_temp() as directory:
@@ -164,8 +241,13 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             second = uuid.uuid4().hex
             cases = {
                 "blank": ("", ""),
+                "whitespace": ("   ", "   "),
                 "mismatch": (first, second),
                 "newline": (first + "\n", first + "\n"),
+                "unicode-line-separator": (first + "\u2028", first + "\u2028"),
+                "control": (first + "\x1f", first + "\x1f"),
+                "delimiter": (first + "]]]", first + "]]]"),
+                "leading-space": (" " + first, " " + first),
             }
             for name, answers in cases.items():
                 with self.subTest(case=name):
@@ -182,6 +264,65 @@ class GenerateReleaseKeysTest(unittest.TestCase):
                             getpass_fn=lambda _prompt: next(prompts),
                         )
                     self.assertEqual(runner.calls, [])
+
+    def test_password_path_and_untrusted_ancestor_fail_before_commands(self):
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            repo = root / "repo"
+            android_root = root / "android"
+            repo.mkdir()
+            android_root.mkdir()
+            secret = uuid.uuid4().hex
+
+            unsafe_parent = root / "private space"
+            unsafe_parent.mkdir(mode=0o700)
+            runner = FakeRunner(forbidden_secret=secret)
+            with self.assertRaises(self.KeyGenerationError):
+                self.generate_keyset(
+                    target_files,
+                    android_root,
+                    unsafe_parent / "keys",
+                    "/CN=fleur release/",
+                    repo_root=repo,
+                    runner=runner,
+                    getpass_fn=lambda _prompt: secret,
+                )
+            self.assertEqual(runner.calls, [])
+
+            real_parent = root / "real-parent"
+            linked_parent = root / "linked-parent"
+            real_parent.mkdir(mode=0o700)
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            runner = FakeRunner(forbidden_secret=secret)
+            with self.assertRaises(self.KeyGenerationError):
+                self.generate_keyset(
+                    target_files,
+                    android_root,
+                    linked_parent / "keys",
+                    "/CN=fleur release/",
+                    repo_root=repo,
+                    runner=runner,
+                    getpass_fn=lambda _prompt: secret,
+                )
+            self.assertEqual(runner.calls, [])
+
+            writable_parent = root / "writable"
+            writable_parent.mkdir()
+            writable_parent.chmod(0o770)
+            runner = FakeRunner(forbidden_secret=secret)
+            with self.assertRaises(self.KeyGenerationError):
+                self.generate_keyset(
+                    target_files,
+                    android_root,
+                    writable_parent / "keys",
+                    "/CN=fleur release/",
+                    repo_root=repo,
+                    runner=runner,
+                    getpass_fn=lambda _prompt: secret,
+                )
+            self.assertEqual(runner.calls, [])
 
     def test_partial_destination_fails_before_commands(self):
         with self.private_temp() as directory:
@@ -252,8 +393,11 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             repo.mkdir()
             android_root.mkdir()
             private_parent.mkdir(mode=0o700)
-            runner = FakeRunner()
             secret = uuid.uuid4().hex + "!"
+            runner = FakeRunner(
+                forbidden_secret=secret,
+                write_outputs_in_child=True,
+            )
             prompts = iter((secret, secret))
 
             result = self.generate_keyset(
@@ -293,28 +437,93 @@ class GenerateReleaseKeysTest(unittest.TestCase):
                 ["com.android.art"],
             )
             serialized_manifest = json.dumps(manifest, sort_keys=True)
-            self.assertNotIn(secret, serialized_manifest)
+            self.assertFalse(secret in serialized_manifest)
             self.assertNotIn(".pk8", serialized_manifest)
             self.assertNotIn(".pem", serialized_manifest)
 
-            argv_text = "\n".join(" ".join(call[0]) for call in runner.calls)
-            self.assertNotIn(secret, argv_text)
-            protected_calls = [call for call in runner.calls if call[1] is not None]
+            protected_calls = [
+                call for call in runner.calls if call.stdin_digest is not None
+            ]
             self.assertTrue(protected_calls)
-            self.assertTrue(all(call[1] == secret + "\n" for call in protected_calls))
+            expected_stdin_digest = digest_text(secret + "\n")
+            self.assertTrue(
+                all(
+                    call.stdin_digest == expected_stdin_digest
+                    for call in protected_calls
+                )
+            )
+            self.assertTrue(
+                all(
+                    not call.environment
+                    for call in runner.calls
+                    if call.command[0] == "avbtool"
+                )
+            )
+            self.assertTrue(
+                all(
+                    dict(call.fd_targets)[
+                        int(
+                            call.command[call.command.index("--key") + 1]
+                            .split("/")[4]
+                        )
+                    ].endswith(".raw.pem")
+                    for call in runner.calls
+                    if call.command[0] == "avbtool"
+                )
+            )
             self.assertTrue(
                 any(
-                    call[0][:3] == ("openssl", "genrsa", "-traditional")
-                    and call[0][-1] == "2048"
+                    call.command[:3] == ("openssl", "genrsa", "-traditional")
+                    and call.command[-1] == "2048"
                     for call in runner.calls
                 )
             )
             self.assertTrue(
                 any(
-                    call[0][:3] == ("openssl", "genrsa", "-traditional")
-                    and call[0][-1] == "4096"
+                    call.command[:3] == ("openssl", "genrsa", "-traditional")
+                    and call.command[-1] == "4096"
                     for call in runner.calls
                 )
+            )
+            for call in runner.calls:
+                for option in ("-out", "--output"):
+                    if option in call.command:
+                        output = call.command[call.command.index(option) + 1]
+                        self.assertTrue(
+                            output.startswith(f"/proc/{os.getpid()}/fd/")
+                        )
+                        descriptor = int(output.split("/", 5)[4])
+                        self.assertIn(descriptor, call.pass_fds)
+
+            from scripts.ubuntu.avb_password_helper import parse_password_file
+
+            password_entries = parse_password_file(keys_dir / "passwords")
+            self.assertEqual(
+                set(password_entries),
+                {
+                    str(keys_dir / "platform"),
+                    str(keys_dir / "releasekey"),
+                    str(keys_dir / "com.android.art"),
+                    str(keys_dir / "com.android.art.pem"),
+                    str(keys_dir / "avb_boot.pem"),
+                    str(keys_dir / "avb_vbmeta.pem"),
+                    str(keys_dir / "avb_vbmeta_system.pem"),
+                    str(keys_dir / "avb_vbmeta_vendor.pem"),
+                },
+            )
+            self.assertTrue(
+                all(
+                    digest_text(value) == digest_text(secret)
+                    for value in password_entries.values()
+                )
+            )
+            lineage_pattern = re.compile(r"^\[\[\[\s*(.*?)\s*\]\]\]\s*(\S+)$")
+            written_lines = (keys_dir / "passwords").read_text().splitlines()
+            matches = [lineage_pattern.fullmatch(line) for line in written_lines]
+            self.assertTrue(all(match is not None for match in matches))
+            self.assertEqual(
+                {match.group(2) for match in matches if match is not None},
+                set(password_entries),
             )
 
     def test_command_failure_removes_staging_and_does_not_publish_destination(self):
@@ -374,6 +583,227 @@ class GenerateReleaseKeysTest(unittest.TestCase):
 
             self.assertFalse(keys_dir.exists())
 
+    def test_parent_revalidation_blocks_permission_change_during_generation(self):
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            repo = root / "repo"
+            android_root = root / "android"
+            private_parent = root / "private"
+            keys_dir = private_parent / "keys"
+            repo.mkdir()
+            android_root.mkdir()
+            private_parent.mkdir(mode=0o700)
+            secret = uuid.uuid4().hex
+            runner = FakeRunner(
+                forbidden_secret=secret,
+                mutate_after_first=lambda: private_parent.chmod(0o770),
+            )
+
+            with self.assertRaises(self.KeyGenerationError):
+                self.generate_keyset(
+                    target_files,
+                    android_root,
+                    keys_dir,
+                    "/CN=fleur release/",
+                    repo_root=repo,
+                    runner=runner,
+                    getpass_fn=lambda _prompt: secret,
+                )
+
+            self.assertFalse(keys_dir.exists())
+            self.assertEqual(list(private_parent.glob(".keys.staging-*")), [])
+
+    def test_replaced_output_path_cannot_redirect_raw_material(self):
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            repo = root / "repo"
+            android_root = root / "android"
+            private_parent = root / "private"
+            keys_dir = private_parent / "keys"
+            trap = root / "trap"
+            repo.mkdir()
+            android_root.mkdir()
+            private_parent.mkdir(mode=0o700)
+            trap.write_bytes(b"")
+            secret = uuid.uuid4().hex
+            runner = FakeRunner(
+                forbidden_secret=secret,
+                replace_first_output_with_symlink_to=trap,
+            )
+
+            with self.assertRaises(self.KeyGenerationError):
+                self.generate_keyset(
+                    target_files,
+                    android_root,
+                    keys_dir,
+                    "/CN=fleur release/",
+                    repo_root=repo,
+                    runner=runner,
+                    getpass_fn=lambda _prompt: secret,
+                )
+
+            self.assertEqual(trap.read_bytes(), b"")
+            self.assertFalse(keys_dir.exists())
+            self.assertEqual(list(private_parent.glob(".keys.staging-*")), [])
+
+    def test_base_exceptions_preserve_error_and_remove_all_staging_material(self):
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            repo = root / "repo"
+            android_root = root / "android"
+            repo.mkdir()
+            android_root.mkdir()
+            secret = uuid.uuid4().hex
+
+            for name, error in (
+                ("interrupt", KeyboardInterrupt()),
+                ("unexpected", RuntimeError("redacted runner failure")),
+            ):
+                with self.subTest(case=name):
+                    private_parent = root / name
+                    private_parent.mkdir(mode=0o700)
+                    keys_dir = private_parent / "keys"
+                    runner = FakeRunner(
+                        forbidden_secret=secret,
+                        raise_error=error,
+                    )
+                    with self.assertRaises(type(error)) as caught:
+                        self.generate_keyset(
+                            target_files,
+                            android_root,
+                            keys_dir,
+                            "/CN=fleur release/",
+                            repo_root=repo,
+                            runner=runner,
+                            getpass_fn=lambda _prompt: secret,
+                        )
+                    self.assertIs(caught.exception, error)
+                    self.assertFalse(keys_dir.exists())
+                    self.assertEqual(
+                        list(private_parent.glob(".keys.staging-*")), []
+                    )
+
+    def test_workspace_open_interrupt_removes_new_staging_directory(self):
+        import scripts.ubuntu.generate_release_keys as generator
+
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            repo = root / "repo"
+            android_root = root / "android"
+            private_parent = root / "private"
+            keys_dir = private_parent / "keys"
+            repo.mkdir()
+            android_root.mkdir()
+            private_parent.mkdir(mode=0o700)
+            secret = uuid.uuid4().hex
+            original_open = generator.os.open
+
+            def interrupt_staging_open(path, flags, *args, **kwargs):
+                if str(path).startswith(".keys.staging-"):
+                    raise KeyboardInterrupt()
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                generator.os, "open", side_effect=interrupt_staging_open
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.generate_keyset(
+                        target_files,
+                        android_root,
+                        keys_dir,
+                        "/CN=fleur release/",
+                        repo_root=repo,
+                        runner=FakeRunner(forbidden_secret=secret),
+                        getpass_fn=lambda _prompt: secret,
+                    )
+
+            self.assertFalse(keys_dir.exists())
+            self.assertEqual(list(private_parent.glob(".keys.staging-*")), [])
+
+    def test_post_generation_error_removes_passwords_and_staging_material(self):
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            repo = root / "repo"
+            android_root = root / "android"
+            private_parent = root / "private"
+            keys_dir = private_parent / "keys"
+            repo.mkdir()
+            android_root.mkdir()
+            private_parent.mkdir(mode=0o700)
+            secret = uuid.uuid4().hex
+            marker = RuntimeError("redacted manifest failure")
+            runner = FakeRunner(forbidden_secret=secret)
+
+            with mock.patch(
+                "scripts.ubuntu.generate_release_keys._write_keyset_manifest",
+                side_effect=marker,
+            ):
+                with self.assertRaises(RuntimeError) as caught:
+                    self.generate_keyset(
+                        target_files,
+                        android_root,
+                        keys_dir,
+                        "/CN=fleur release/",
+                        repo_root=repo,
+                        runner=runner,
+                        getpass_fn=lambda _prompt: secret,
+                    )
+
+            self.assertIs(caught.exception, marker)
+            self.assertFalse(keys_dir.exists())
+            self.assertEqual(list(private_parent.glob(".keys.staging-*")), [])
+
+    def test_cleanup_error_does_not_mask_original_exception(self):
+        import scripts.ubuntu.generate_release_keys as generator
+
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            repo = root / "repo"
+            android_root = root / "android"
+            private_parent = root / "private"
+            keys_dir = private_parent / "keys"
+            repo.mkdir()
+            android_root.mkdir()
+            private_parent.mkdir(mode=0o700)
+            secret = uuid.uuid4().hex
+            marker = RuntimeError("redacted runner failure")
+            runner = FakeRunner(forbidden_secret=secret, raise_error=marker)
+            original_cleanup = generator._cleanup_workspace
+
+            def cleanup_then_fail(workspace):
+                original_cleanup(workspace)
+                raise OSError("redacted cleanup failure")
+
+            with mock.patch.object(
+                generator, "_cleanup_workspace", side_effect=cleanup_then_fail
+            ):
+                with self.assertRaises(RuntimeError) as caught:
+                    self.generate_keyset(
+                        target_files,
+                        android_root,
+                        keys_dir,
+                        "/CN=fleur release/",
+                        repo_root=repo,
+                        runner=runner,
+                        getpass_fn=lambda _prompt: secret,
+                    )
+
+            self.assertIs(caught.exception, marker)
+            self.assertFalse(keys_dir.exists())
+            self.assertEqual(list(private_parent.glob(".keys.staging-*")), [])
+
 
 class PasswordHelperTest(unittest.TestCase):
     def setUp(self):
@@ -409,23 +839,28 @@ class PasswordHelperTest(unittest.TestCase):
             unrelated = uuid.uuid4().hex
             self.write_passwords(
                 password_file,
-                f"/secure/key.pem={wanted}\n/secure/key.pem.other={unrelated}\n",
+                f"[[[ {wanted} ]]] /secure/key.pem\n"
+                f"[[[ {unrelated} ]]] /secure/key.pem.other\n",
             )
 
             result = self.run_helper(password_file, "/secure/key.pem")
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, wanted + "\n")
-            self.assertNotIn(unrelated, result.stdout + result.stderr)
+            self.assertEqual(len(result.stdout), len(wanted))
+            self.assertEqual(digest_text(result.stdout), digest_text(wanted))
+            self.assertFalse(unrelated in result.stdout + result.stderr)
 
     def test_helper_rejects_missing_duplicate_and_malformed_entries_without_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             secret = uuid.uuid4().hex
             fixtures = {
-                "missing": f"/secure/other.pem={secret}\n",
-                "duplicate": f"/secure/key.pem={secret}\n/secure/key.pem={secret}\n",
-                "malformed": f"/secure/key.pem={secret}\nnot-an-entry\n",
+                "missing": f"[[[ {secret} ]]] /secure/other.pem\n",
+                "duplicate": (
+                    f"[[[ {secret} ]]] /secure/key.pem\n"
+                    f"[[[ {secret} ]]] /secure/key.pem\n"
+                ),
+                "malformed": f"[[[ {secret} ]]] /secure/key.pem\nnot-an-entry\n",
             }
             for name, content in fixtures.items():
                 with self.subTest(name=name):
@@ -434,7 +869,7 @@ class PasswordHelperTest(unittest.TestCase):
                     result = self.run_helper(password_file, "/secure/key.pem")
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(result.stdout, "")
-                    self.assertNotIn(secret, result.stderr)
+                    self.assertFalse(secret in result.stderr)
 
     def test_helper_rejects_symlink_and_overly_permissive_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -442,7 +877,7 @@ class PasswordHelperTest(unittest.TestCase):
             target = root / "target"
             link = root / "link"
             secret = uuid.uuid4().hex
-            self.write_passwords(target, f"/secure/key.pem={secret}\n")
+            self.write_passwords(target, f"[[[ {secret} ]]] /secure/key.pem\n")
             link.symlink_to(target)
 
             with self.assertRaises(self.PasswordLookupError):
