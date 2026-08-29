@@ -585,6 +585,10 @@ def sign_release(
                                 staging_paths.signed_target_files,
                                 target_snapshot.proc_path,
                             )
+                            _validate_signed_selinux_policy(
+                                prepared_target_pin.proc_path,
+                                staging_paths.signed_target_files,
+                            )
                             _run_release_tool(
                                 commands.ota_from_target_files,
                                 private_environment,
@@ -1411,6 +1415,21 @@ def _validate_signed_target_files(path: Path, unsigned_snapshot: Path) -> None:
             f"{path.name} symlink manifest differs from unsigned target-files"
         )
     _fsync_zip(path)
+
+
+def _validate_signed_selinux_policy(prepared: Path, signed: Path) -> None:
+    try:
+        with ZipFile(prepared) as prepared_archive, ZipFile(signed) as signed_archive:
+            expected = mac_permissions_documents_from_archive(prepared_archive)
+            actual = mac_permissions_documents_from_archive(signed_archive)
+    except (OSError, BadZipFile, MacPermissionsError) as error:
+        raise ReleaseSigningError(
+            f"signed SELinux signer policy validation failed: {error}"
+        ) from error
+    if actual != expected:
+        raise ReleaseSigningError(
+            "signed SELinux signer policy differs from prepared target-files"
+        )
 
 
 def _validate_payload_ota(path: Path) -> None:

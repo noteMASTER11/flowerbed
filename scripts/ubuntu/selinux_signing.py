@@ -42,6 +42,25 @@ _MAC_PERMISSIONS_MEMBER = re.compile(
     r"(?:ODM|PRODUCT|SYSTEM|SYSTEM_EXT|VENDOR)/etc/selinux/"
     r"[a-z0-9_]+_mac_permissions\.xml\Z"
 )
+EXPECTED_MAC_PERMISSIONS_MEMBERS = frozenset(
+    {
+        "SYSTEM/etc/selinux/plat_mac_permissions.xml",
+        "SYSTEM_EXT/etc/selinux/system_ext_mac_permissions.xml",
+        "VENDOR/etc/selinux/vendor_mac_permissions.xml",
+        "PRODUCT/etc/selinux/product_mac_permissions.xml",
+        "ODM/etc/selinux/odm_mac_permissions.xml",
+    }
+)
+_SYSTEM_POLICY = "SYSTEM/etc/selinux/plat_mac_permissions.xml"
+_VENDOR_POLICY = "VENDOR/etc/selinux/vendor_mac_permissions.xml"
+EXPECTED_ROLE_TOPOLOGY = {
+    "platform": (_SYSTEM_POLICY, _VENDOR_POLICY),
+    "sdk_sandbox": (_SYSTEM_POLICY,),
+    "bluetooth": (_SYSTEM_POLICY,),
+    "media": (_SYSTEM_POLICY,),
+    "networkstack": (_SYSTEM_POLICY,),
+    "nfc": (_SYSTEM_POLICY,),
+}
 
 
 def certificate_der_from_pem(payload: bytes) -> bytes:
@@ -81,16 +100,36 @@ def mac_permissions_documents_from_archive(
     archive: zipfile.ZipFile,
 ) -> dict[str, bytes]:
     infos = archive.infolist()
-    names = [info.filename for info in infos]
-    if len(names) != len(set(names)):
-        raise MacPermissionsError("target-files has duplicate members")
+    names: set[str] = set()
+    for info in infos:
+        name = info.filename
+        parts = name.split("/")
+        file_type = (info.external_attr >> 16) & 0o170000
+        if (
+            not name
+            or "\x00" in name
+            or "\\" in name
+            or name.startswith("/")
+            or (len(name) > 1 and name[1] == ":" and name[0].isalpha())
+            or ".." in parts
+            or parts[-1] == "."
+            or any(part in {"", "."} for part in parts[:-1])
+        ):
+            raise MacPermissionsError(f"target-files has unsafe member {name!r}")
+        if name in names:
+            raise MacPermissionsError("target-files has duplicate members")
+        names.add(name)
+        if file_type not in (0, stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK):
+            raise MacPermissionsError(
+                f"target-files has special-file member {name}"
+            )
     selected = {
         info.filename: info
         for info in infos
         if _MAC_PERMISSIONS_MEMBER.fullmatch(info.filename)
     }
-    if not selected:
-        raise MacPermissionsError("mac_permissions inventory is empty")
+    if set(selected) != EXPECTED_MAC_PERMISSIONS_MEMBERS:
+        raise MacPermissionsError("fleur mac_permissions member topology is invalid")
     documents: dict[str, bytes] = {}
     for name, info in selected.items():
         file_type = (info.external_attr >> 16) & 0o170000
@@ -102,6 +141,14 @@ def mac_permissions_documents_from_archive(
     return documents
 
 
+def _require_exact_role_topology(occurrences: Mapping[str, Sequence[str]]) -> None:
+    for role, expected_members in EXPECTED_ROLE_TOPOLOGY.items():
+        if tuple(occurrences.get(role, ())) != expected_members:
+            raise MacPermissionsError(
+                f"fleur signer topology is invalid for {role}"
+            )
+
+
 def expected_source_certificates(
     documents: Mapping[str, bytes],
 ) -> dict[str, tuple[bytes, ...]]:
@@ -109,6 +156,11 @@ def expected_source_certificates(
     discovered: dict[str, set[bytes]] = {
         role: set() for role in EXPECTED_SEINFO_ROLES.values()
     }
+    occurrences: dict[str, list[str]] = {
+        role: [] for role in EXPECTED_SEINFO_ROLES.values()
+    }
+    if set(documents) != EXPECTED_MAC_PERMISSIONS_MEMBERS:
+        raise MacPermissionsError("fleur mac_permissions member topology is invalid")
     for name in sorted(documents):
         payload = documents[name]
         try:
@@ -138,6 +190,8 @@ def expected_source_certificates(
             role = EXPECTED_SEINFO_ROLES.get(seinfo[0])
             if role is not None:
                 discovered[role].add(bytes.fromhex(encoded.decode("ascii")))
+                occurrences[role].append(name)
+    _require_exact_role_topology(occurrences)
     for role, certificates in discovered.items():
         if len(certificates) != 1:
             raise MacPermissionsError(f"ambiguous expected signer source for {role}")
@@ -187,8 +241,8 @@ def rewrite_mac_permissions(
     release_certificates: Mapping[str, bytes],
 ) -> tuple[dict[str, bytes], dict[str, object]]:
     """Return byte-preserving policy documents with exact signer substitutions."""
-    if not documents:
-        raise MacPermissionsError("mac_permissions inventory is empty")
+    if set(documents) != EXPECTED_MAC_PERMISSIONS_MEMBERS:
+        raise MacPermissionsError("fleur mac_permissions member topology is invalid")
     required_roles = set(EXPECTED_SEINFO_ROLES.values())
     if set(release_certificates) & required_roles != required_roles:
         raise MacPermissionsError("missing expected signer release certificate")
@@ -209,7 +263,7 @@ def rewrite_mac_permissions(
                 raise MacPermissionsError("source certificate is empty")
             source_roles.setdefault(certificate, set()).add(role)
 
-    occurrences = {role: 0 for role in required_roles}
+    occurrences: dict[str, list[str]] = {role: [] for role in required_roles}
     rewritten: dict[str, bytes] = {}
     member_evidence: dict[str, dict[str, str]] = {}
     for name in sorted(documents):
@@ -250,7 +304,7 @@ def rewrite_mac_permissions(
                     raise MacPermissionsError(
                         f"{problem} expected signer {expected_role} in {name}"
                     )
-                occurrences[expected_role] += 1
+                occurrences[expected_role].append(name)
                 replacements.append(release_certificates[expected_role].hex().encode())
             else:
                 if candidates:
@@ -285,12 +339,10 @@ def rewrite_mac_permissions(
             "signed_sha256": hashlib.sha256(output).hexdigest(),
         }
 
-    missing = sorted(role for role, count in occurrences.items() if count == 0)
-    if missing:
-        raise MacPermissionsError(f"missing expected signer roles: {missing}")
+    _require_exact_role_topology(occurrences)
     role_evidence = {
         role: {
-            "occurrences": occurrences[role],
+            "occurrences": len(occurrences[role]),
             "source_certificate_sha256": hashlib.sha256(
                 source_certificates[role][0]
             ).hexdigest(),

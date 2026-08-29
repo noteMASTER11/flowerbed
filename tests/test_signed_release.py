@@ -1437,6 +1437,14 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     b'<?xml version="1.0" encoding="iso-8859-1"?>'
                     b"<policy></policy>"
                 ),
+                "PRODUCT/etc/selinux/product_mac_permissions.xml": (
+                    b'<?xml version="1.0" encoding="iso-8859-1"?>'
+                    b"<policy></policy>"
+                ),
+                "ODM/etc/selinux/odm_mac_permissions.xml": (
+                    b'<?xml version="1.0" encoding="iso-8859-1"?>'
+                    b"<policy></policy>"
+                ),
             }
             signed_entries = dict(unsigned_entries)
             for name, value in tuple(signed_entries.items()):

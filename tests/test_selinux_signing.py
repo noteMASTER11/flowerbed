@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import warnings
 import zipfile
+import stat
 
 
 EXPECTED = {
@@ -122,7 +123,7 @@ class SelinuxSigningTest(unittest.TestCase):
         missing["SYSTEM/etc/selinux/plat_mac_permissions.xml"] = missing[
             "SYSTEM/etc/selinux/plat_mac_permissions.xml"
         ].replace(signer(sources["nfc"][0], "nfc"), b"")
-        cases["missing expected signer"] = (missing, sources, releases)
+        cases["topology"] = (missing, sources, releases)
 
         ambiguous_sources = dict(sources)
         ambiguous_sources["media"] = sources["platform"]
@@ -151,6 +152,48 @@ class SelinuxSigningTest(unittest.TestCase):
                 MacPermissionsError, message
             ):
                 rewrite_mac_permissions(*arguments)
+
+    def test_rejects_any_drift_from_exact_fleur_signer_topology(self):
+        from scripts.ubuntu.selinux_signing import MacPermissionsError, rewrite_mac_permissions
+
+        sources, releases = self.mappings()
+        documents = self.documents()
+        system_name = "SYSTEM/etc/selinux/plat_mac_permissions.xml"
+        vendor_name = "VENDOR/etc/selinux/vendor_mac_permissions.xml"
+        system_ext_name = "SYSTEM_EXT/etc/selinux/system_ext_mac_permissions.xml"
+        product_name = "PRODUCT/etc/selinux/product_mac_permissions.xml"
+
+        duplicate = dict(documents)
+        duplicate[system_name] = duplicate[system_name].replace(
+            b"</policy>", signer(sources["platform"][0], "platform") + b"</policy>"
+        )
+        moved = dict(documents)
+        moved[system_name] = moved[system_name].replace(
+            signer(sources["nfc"][0], "nfc"), b""
+        )
+        moved[vendor_name] = moved[vendor_name].replace(
+            b"</policy>", signer(sources["nfc"][0], "nfc") + b"</policy>"
+        )
+        extra_partition = dict(documents)
+        extra_partition[system_ext_name] = extra_partition[system_ext_name].replace(
+            b"</policy>", signer(sources["platform"][0], "platform") + b"</policy>"
+        )
+        missing_member = dict(documents)
+        del missing_member[product_name]
+        extra_member = dict(documents)
+        extra_member["SYSTEM/etc/selinux/extra_mac_permissions.xml"] = policy()
+
+        for label, candidate in (
+            ("duplicate occurrence", duplicate),
+            ("location drift", moved),
+            ("unexpected partition", extra_partition),
+            ("missing required member", missing_member),
+            ("unexpected member", extra_member),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(
+                MacPermissionsError, "topology"
+            ):
+                rewrite_mac_permissions(candidate, sources, releases)
 
     def test_rejects_malformed_or_noncanonical_xml_and_wrong_expected_source(self):
         from scripts.ubuntu.selinux_signing import MacPermissionsError, rewrite_mac_permissions
@@ -236,6 +279,32 @@ class SelinuxSigningTest(unittest.TestCase):
                 rewrite_target_files_mac_permissions(
                     duplicate, root / "rejected.zip", sources, releases
                 )
+
+    def test_target_files_rewrite_rejects_unsafe_unselected_members(self):
+        from scripts.ubuntu.selinux_signing import (
+            MacPermissionsError,
+            rewrite_target_files_mac_permissions,
+        )
+
+        sources, releases = self.mappings()
+        for label, member in (
+            ("unsafe", zipfile.ZipInfo("../unselected")),
+            ("special-file", zipfile.ZipInfo("SYSTEM/bin/unselected-fifo")),
+        ):
+            if label == "special-file":
+                member.create_system = 3
+                member.external_attr = (stat.S_IFIFO | 0o600) << 16
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "unsigned.zip"
+                with zipfile.ZipFile(source, "w") as archive:
+                    for name, value in self.documents().items():
+                        archive.writestr(name, value)
+                    archive.writestr(member, b"not selected policy")
+                with self.assertRaisesRegex(MacPermissionsError, label):
+                    rewrite_target_files_mac_permissions(
+                        source, root / "prepared.zip", sources, releases
+                    )
 
 
 if __name__ == "__main__":

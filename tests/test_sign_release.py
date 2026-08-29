@@ -390,6 +390,27 @@ class FakeReleaseRunner:
                 archive.writestr("android-info.txt", "require product=fleur\n")
 
 
+class PolicyMutatingReleaseRunner(FakeReleaseRunner):
+    def __call__(self, command, *, env):
+        super().__call__(command, env=env)
+        command = tuple(str(item) for item in command)
+        if Path(command[0]).name != "sign_target_files_apks":
+            return
+        output = Path(command[-1])
+        with zipfile.ZipFile(output) as archive:
+            entries = [(member, archive.read(member)) for member in archive.infolist()]
+        policy_name = "SYSTEM/etc/selinux/plat_mac_permissions.xml"
+        with zipfile.ZipFile(output, "w") as archive:
+            for member, payload in entries:
+                if member.filename == policy_name:
+                    payload = payload.replace(
+                        fixture_der("platform", release=True).hex().encode(),
+                        fixture_der("platform").hex().encode(),
+                        1,
+                    )
+                archive.writestr(member, payload)
+
+
 class ReleaseOrchestrationTest(unittest.TestCase):
     def setUp(self):
         from scripts.ubuntu.sign_release import (
@@ -593,6 +614,55 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             self.assertEqual(
                 set(MAC_ROLES), set(report["selinux_mac_permissions"]["roles"])
             )
+
+    def test_rejects_signed_target_files_that_drift_from_prepared_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, secret = self.make_fixture(root)
+            runner = PolicyMutatingReleaseRunner(paths.output_dir)
+
+            with self.assertRaisesRegex(
+                self.ReleaseSigningError, "signed SELinux signer policy"
+            ):
+                self.sign_release(
+                    paths,
+                    runner=runner,
+                    openssl_runner=FakeCryptoRunner(secret),
+                )
+
+            self.assertEqual(
+                ["sign_target_files_apks"],
+                [Path(call[0][0]).name for call in runner.calls],
+            )
+            self.assertFalse(paths.output_dir.exists())
+
+    def test_rejects_unsafe_unselected_input_before_crypto_subprocess(self):
+        for label, member in (
+            ("unsafe", zipfile.ZipInfo("../unselected")),
+            ("special-file", zipfile.ZipInfo("SYSTEM/bin/unselected-fifo")),
+        ):
+            if label == "special-file":
+                member.create_system = 3
+                member.external_attr = (stat.S_IFIFO | 0o600) << 16
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                paths, _secret = self.make_fixture(root)
+                with zipfile.ZipFile(paths.target_files, "a") as archive:
+                    archive.writestr(member, b"unselected")
+                write_build_provenance(paths.build_provenance, paths.target_files)
+
+                with self.assertRaisesRegex(self.ReleaseSigningError, label):
+                    self.sign_release(
+                        paths,
+                        runner=lambda *_args, **_kwargs: self.fail(
+                            "release tool must not run"
+                        ),
+                        openssl_runner=lambda *_args, **_kwargs: self.fail(
+                            "crypto must not run"
+                        ),
+                    )
+
+                self.assertFalse(paths.output_dir.exists())
 
     def test_generated_zip_validation_rejects_unsafe_members(self):
         from scripts.ubuntu.sign_release import _validate_zip
