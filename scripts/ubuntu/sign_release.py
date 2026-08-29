@@ -539,7 +539,10 @@ def sign_release(
                             pinned_passwords.verify_named(
                                 "runtime password file", verify_hash=True
                             )
-                            _validate_zip(staging_paths.signed_target_files)
+                            _validate_signed_target_files(
+                                staging_paths.signed_target_files,
+                                target_snapshot.proc_path,
+                            )
                             _run_release_tool(
                                 commands.ota_from_target_files,
                                 private_environment,
@@ -1171,16 +1174,26 @@ def _run_release_tool(
         raise ReleaseSigningError(f"{Path(command[0]).name} failed") from error
 
 
-def _validate_zip(path: Path) -> None:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+def _inspect_zip(
+    path: Path,
+    *,
+    allow_symlinks: bool,
+    allow_descriptor_path: bool = False,
+) -> dict[str, tuple[int, int, bytes]]:
+    if (
+        (path.is_symlink() and not allow_descriptor_path)
+        or not path.is_file()
+        or path.stat().st_size == 0
+    ):
         raise ReleaseSigningError(f"{path.name} was not produced")
     try:
         with ZipFile(path) as archive:
             names: set[str] = set()
+            symlinks: dict[str, tuple[int, int, bytes]] = {}
             for member in archive.infolist():
                 name = member.filename
                 parts = name.split("/")
-                mode = (member.external_attr >> 16) & 0o170000
+                file_type = (member.external_attr >> 16) & 0o170000
                 if (
                     not name
                     or "\x00" in name
@@ -1191,20 +1204,55 @@ def _validate_zip(path: Path) -> None:
                     or any(part in {"", "."} for part in parts[:-1])
                 ):
                     raise ReleaseSigningError(f"{path.name} has unsafe member {name!r}")
-                if mode == stat.S_IFLNK:
-                    raise ReleaseSigningError(f"{path.name} has symlink member {name}")
                 if name in names:
                     raise ReleaseSigningError(f"{path.name} has duplicate member {name}")
                 names.add(name)
+                if file_type == stat.S_IFLNK:
+                    if not allow_symlinks:
+                        raise ReleaseSigningError(
+                            f"{path.name} has symlink member {name}"
+                        )
+                    symlinks[name] = (
+                        member.create_system,
+                        member.external_attr,
+                        archive.read(member),
+                    )
+                elif file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+                    raise ReleaseSigningError(
+                        f"{path.name} has special-file member {name}"
+                    )
             if archive.testzip() is not None:
                 raise ReleaseSigningError(f"{path.name} is corrupt")
     except BadZipFile as error:
         raise ReleaseSigningError(f"{path.name} is not a ZIP archive") from error
+    return symlinks
+
+
+def _fsync_zip(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _validate_zip(path: Path) -> None:
+    _inspect_zip(path, allow_symlinks=False)
+    _fsync_zip(path)
+
+
+def _validate_signed_target_files(path: Path, unsigned_snapshot: Path) -> None:
+    expected = _inspect_zip(
+        unsigned_snapshot,
+        allow_symlinks=True,
+        allow_descriptor_path=True,
+    )
+    actual = _inspect_zip(path, allow_symlinks=True)
+    if actual != expected:
+        raise ReleaseSigningError(
+            f"{path.name} symlink manifest differs from unsigned target-files"
+        )
+    _fsync_zip(path)
 
 
 def _validate_payload_ota(path: Path) -> None:

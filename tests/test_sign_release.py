@@ -66,6 +66,19 @@ def write_target_files(
         archive.writestr("IMAGES/boot.img", b"fixed-kernel-boot")
 
 
+def write_zip_symlink(
+    archive: zipfile.ZipFile,
+    name: str,
+    target: bytes,
+    *,
+    mode: int = 0o777,
+) -> None:
+    member = zipfile.ZipInfo(name)
+    member.create_system = 3
+    member.external_attr = (stat.S_IFLNK | mode) << 16
+    archive.writestr(member, target)
+
+
 def write_build_provenance(path: Path, target_files: Path) -> None:
     policy = json.loads((ROOT / "sources/kernel-fix.json").read_text(encoding="utf-8"))
     fields = {
@@ -473,6 +486,131 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                 archive.writestr("../escape", b"bad")
             with self.assertRaisesRegex(self.ReleaseSigningError, "unsafe"):
                 _validate_zip(archive_path)
+
+    def test_signed_target_files_symlink_manifest_must_match_unsigned(self):
+        from scripts.ubuntu.sign_release import _validate_signed_target_files
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsigned = root / "unsigned.zip"
+            expected = {
+                "BOOT/RAMDISK/adb_keys": b"/product/etc/security/adb_keys",
+                "SYSTEM/bin/tool": b"../lib64/tool",
+            }
+            with zipfile.ZipFile(unsigned, "w") as archive:
+                archive.writestr("META/misc_info.txt", "fixture\n")
+                for name, target in expected.items():
+                    write_zip_symlink(archive, name, target)
+
+            matching = root / "matching.zip"
+            with zipfile.ZipFile(matching, "w") as archive:
+                archive.writestr("META/misc_info.txt", "signed\n")
+                for name, target in expected.items():
+                    write_zip_symlink(archive, name, target)
+            _validate_signed_target_files(matching, unsigned)
+
+            variants = {
+                "added": {
+                    **expected,
+                    "SYSTEM/bin/added": b"/system/lib64/added",
+                },
+                "removed": {
+                    "BOOT/RAMDISK/adb_keys": expected["BOOT/RAMDISK/adb_keys"],
+                },
+                "retargeted": {
+                    **expected,
+                    "SYSTEM/bin/tool": b"../lib64/other",
+                },
+            }
+            for label, links in variants.items():
+                with self.subTest(change=label):
+                    candidate = root / f"{label}.zip"
+                    with zipfile.ZipFile(candidate, "w") as archive:
+                        archive.writestr("META/misc_info.txt", "signed\n")
+                        for name, target in links.items():
+                            write_zip_symlink(archive, name, target)
+                    with self.assertRaisesRegex(
+                        self.ReleaseSigningError, "symlink manifest"
+                    ):
+                        _validate_signed_target_files(candidate, unsigned)
+
+            mode_changed = root / "mode-changed.zip"
+            with zipfile.ZipFile(mode_changed, "w") as archive:
+                archive.writestr("META/misc_info.txt", "signed\n")
+                for name, target in expected.items():
+                    write_zip_symlink(
+                        archive,
+                        name,
+                        target,
+                        mode=0o755 if name == "SYSTEM/bin/tool" else 0o777,
+                    )
+            with self.assertRaisesRegex(self.ReleaseSigningError, "symlink manifest"):
+                _validate_signed_target_files(mode_changed, unsigned)
+
+    def test_signed_target_files_rejects_other_special_files(self):
+        from scripts.ubuntu.sign_release import _validate_signed_target_files
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsigned = root / "unsigned.zip"
+            signed = root / "signed.zip"
+            for path in (unsigned, signed):
+                with zipfile.ZipFile(path, "w") as archive:
+                    special = zipfile.ZipInfo("SYSTEM/bin/fifo")
+                    special.create_system = 3
+                    special.external_attr = (stat.S_IFIFO | 0o600) << 16
+                    archive.writestr(special, b"")
+
+            with self.assertRaisesRegex(self.ReleaseSigningError, "special"):
+                _validate_signed_target_files(signed, unsigned)
+
+    def test_generic_ota_and_fastboot_validation_still_rejects_symlinks(self):
+        from scripts.ubuntu.sign_release import _validate_zip
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for filename in ("ota.zip", "fastboot.zip"):
+                with self.subTest(filename=filename):
+                    archive_path = root / filename
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        write_zip_symlink(
+                            archive,
+                            "META/link",
+                            b"/system/etc/target",
+                        )
+                    with self.assertRaisesRegex(self.ReleaseSigningError, "symlink"):
+                        _validate_zip(archive_path)
+
+    def test_signing_accepts_unchanged_target_files_symlink_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, secret = self.make_fixture(root)
+            with zipfile.ZipFile(paths.target_files, "a") as archive:
+                write_zip_symlink(
+                    archive,
+                    "BOOT/RAMDISK/adb_keys",
+                    b"/product/etc/security/adb_keys",
+                )
+            write_build_provenance(paths.build_provenance, paths.target_files)
+            base_runner = FakeReleaseRunner(paths.output_dir)
+
+            def preserving_runner(command, *, env):
+                base_runner(command, env=env)
+                if Path(command[0]).name == "sign_target_files_apks":
+                    with zipfile.ZipFile(Path(command[-1]), "a") as archive:
+                        write_zip_symlink(
+                            archive,
+                            "BOOT/RAMDISK/adb_keys",
+                            b"/product/etc/security/adb_keys",
+                        )
+
+            published = self.sign_release(
+                paths,
+                runner=preserving_runner,
+                openssl_runner=FakeCryptoRunner(secret),
+            )
+
+            self.assertEqual(published, paths.output_dir)
 
     def test_rejects_source_filename_device_and_concurrent_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
