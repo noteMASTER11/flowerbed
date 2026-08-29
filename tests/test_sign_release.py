@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -18,7 +19,8 @@ SIGNING_HELPER = ROOT / "scripts/ubuntu/avb_signing_helper.py"
 
 APK_CERTS = '''\
 name="framework-res.apk" certificate="build/make/target/product/security/platform.x509.pem" private_key="build/make/target/product/security/platform.pk8"
-name="Settings.apk" certificate="vendor/example/security/releasekey.x509.pem" private_key="vendor/example/security/releasekey.pk8"
+name="Settings.apk" certificate="build/make/target/product/security/testkey.x509.pem" private_key="build/make/target/product/security/testkey.pk8"
+name="CtsCompilationApp.apk" certificate="cts/hostsidetests/compilation/certs/testkey.x509.pem" private_key="cts/hostsidetests/compilation/certs/testkey.pk8"
 '''
 
 APEX_KEYS = '''\
@@ -29,7 +31,6 @@ name="com.android.tzdata.apex" public_key="PRESIGNED" private_key="PRESIGNED" co
 MISC_INFO = '''\
 ab_update=true
 virtual_ab=true
-build_tags=test-keys
 avb_boot_key_path=build/make/target/product/security/testkey.pem
 avb_boot_algorithm=SHA256_RSA4096
 avb_vbmeta_key_path=build/make/target/product/security/testkey.pem
@@ -40,12 +41,19 @@ avb_vbmeta_vendor_key_path=build/make/target/product/security/testkey.pem
 avb_vbmeta_vendor_algorithm=SHA256_RSA4096
 '''
 
+SYSTEM_BUILD_PROP = '''\
+ro.product.system.device=fleur
+ro.system.build.tags=test-keys
+ro.build.tags=test-keys
+'''
 
-def write_target_files(path: Path) -> None:
+
+def write_target_files(path: Path, *, system_build_prop: str = SYSTEM_BUILD_PROP) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("META/apkcerts.txt", APK_CERTS)
         archive.writestr("META/apexkeys.txt", APEX_KEYS)
         archive.writestr("META/misc_info.txt", MISC_INFO)
+        archive.writestr("SYSTEM/build.prop", system_build_prop)
 
 
 def digest(value: str) -> str:
@@ -56,11 +64,35 @@ def file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def file_binding(path: Path) -> dict[str, object]:
+    metadata = path.stat()
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "size": metadata.st_size,
+        "sha256": file_digest(path),
+    }
+
+
+def helper_config(private_key: Path, public_key: Path, password_file: Path) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "password_file": str(password_file),
+        "keys": {
+            str(public_key): {
+                "private_key": str(private_key),
+                "private_identity": file_binding(private_key),
+                "public_identity": file_binding(public_key),
+            }
+        },
+    }
+
+
 def write_fake_keyset(keys_dir: Path, secret: str) -> None:
     keys_dir.mkdir(mode=0o700)
     public_dir = keys_dir / "public"
     public_dir.mkdir(mode=0o700)
-    android = ("platform", "releasekey")
+    android = ("platform", "releasekey", "testkey-f88799ce31c1")
     apex = ("com.android.art",)
     avb = ("avb_boot", "avb_vbmeta", "avb_vbmeta_system", "avb_vbmeta_vendor")
     for role in android:
@@ -158,6 +190,7 @@ class FakeReleaseRunner:
         self.fail_tool = fail_tool
         self.legacy_ota = legacy_ota
         self.calls = []
+        self.signing_input_bytes = None
 
     def __call__(self, command, *, env):
         command = tuple(str(item) for item in command)
@@ -165,6 +198,8 @@ class FakeReleaseRunner:
         if self.final_output.exists():
             raise AssertionError("final output published before all commands completed")
         self.calls.append((command, dict(env)))
+        if tool == "sign_target_files_apks":
+            self.signing_input_bytes = Path(command[-2]).read_bytes()
         if tool == self.fail_tool:
             raise subprocess.CalledProcessError(7, command)
         output = Path(command[-1])
@@ -196,7 +231,7 @@ class ReleaseOrchestrationTest(unittest.TestCase):
         self.sign_release = sign_release
 
     def make_fixture(self, root: Path):
-        target_files = root / "unsigned-target-files.zip"
+        target_files = root / "lineage_fleur-target_files.zip"
         android_root = root / "android"
         keys_dir = root / "keys"
         output_dir = root / "20260829T123456Z"
@@ -251,7 +286,10 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             )
             self.assertEqual(set(report["outputs"]), {paths.signed_target_files.name, paths.ota_zip.name, paths.fastboot_zip.name})
             self.assertTrue(report["public_fingerprints"])
-            self.assertTrue(all(name.startswith("-") for name in report["sanitized_options"]["sign_target_files_apks"]))
+            sanitized = report["sanitized_options"]["sign_target_files_apks"]
+            self.assertTrue(all(name.startswith("-") for name in sanitized))
+            self.assertTrue(all("/" not in name for name in sanitized))
+            self.assertNotIn("--signing_helper", sanitized)
             sums = paths.checksums.read_text(encoding="utf-8")
             self.assertIn(paths.ota_zip.name, sums)
             self.assertIn("public-keys/avb_boot.public.pem", sums)
@@ -266,6 +304,97 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             self.assertIn("ANDROID_PW_FILE", ota_env)
             self.assertNotIn("ANDROID_PW_FILE", img_env)
             self.assertTrue(all("ANDROID_SECURE_STORAGE_CMD" not in env for _, env in tool_runner.calls))
+            sign_command = tool_runner.calls[0][0]
+            helper_values = [
+                value
+                for value in sign_command
+                if value.startswith("--signing_helper=")
+            ]
+            self.assertTrue(helper_values)
+            self.assertTrue(
+                all(
+                    value.startswith(f"--signing_helper=/proc/{os.getpid()}/fd/")
+                    for value in helper_values
+                )
+            )
+            self.assertEqual(tool_runner.signing_input_bytes, paths.target_files.read_bytes())
+            self.assertTrue(sign_command[-2].startswith(f"/proc/{os.getpid()}/fd/"))
+
+    def test_rejects_source_filename_device_and_concurrent_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, secret = self.make_fixture(root)
+
+            wrong_name = paths.target_files.with_name("unsigned-target-files.zip")
+            paths.target_files.rename(wrong_name)
+            wrong_paths = self.SigningPaths(
+                wrong_name,
+                paths.android_root,
+                paths.keys_dir,
+                paths.output_dir,
+            )
+            with self.assertRaisesRegex(self.ReleaseSigningError, "filename"):
+                self.sign_release(
+                    wrong_paths,
+                    runner=lambda *_args, **_kwargs: self.fail("release tool must not run"),
+                    openssl_runner=lambda *_args, **_kwargs: self.fail("crypto must not run"),
+                )
+
+            wrong_name.rename(paths.target_files)
+            write_target_files(
+                paths.target_files,
+                system_build_prop=SYSTEM_BUILD_PROP.replace("fleur", "other"),
+            )
+            with self.assertRaisesRegex(self.ReleaseSigningError, "device"):
+                self.sign_release(
+                    paths,
+                    runner=lambda *_args, **_kwargs: self.fail("release tool must not run"),
+                    openssl_runner=lambda *_args, **_kwargs: self.fail("crypto must not run"),
+                )
+
+            write_target_files(paths.target_files)
+            base_runner = FakeReleaseRunner(paths.output_dir)
+
+            def replacing_runner(command, *, env):
+                base_runner(command, env=env)
+                if Path(command[0]).name == "sign_target_files_apks":
+                    replacement = root / "replacement.zip"
+                    write_target_files(replacement)
+                    os.replace(replacement, paths.target_files)
+
+            with self.assertRaisesRegex(self.ReleaseSigningError, "changed"):
+                self.sign_release(
+                    paths,
+                    runner=replacing_runner,
+                    openssl_runner=FakeCryptoRunner(secret),
+                )
+            self.assertFalse(paths.output_dir.exists())
+
+    def test_rejects_concurrent_helper_replacement_while_executing_pinned_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, secret = self.make_fixture(root)
+            helper = root / "avb_signing_helper.py"
+            helper.write_bytes(SIGNING_HELPER.read_bytes())
+            helper.chmod(0o755)
+            replacement = root / "replacement-helper.py"
+            replacement.write_text("#!/usr/bin/env python3\nraise SystemExit(99)\n", encoding="utf-8")
+            replacement.chmod(0o755)
+            base_runner = FakeReleaseRunner(paths.output_dir)
+
+            def replacing_runner(command, *, env):
+                base_runner(command, env=env)
+                if Path(command[0]).name == "sign_target_files_apks":
+                    os.replace(replacement, helper)
+
+            with self.assertRaisesRegex(self.ReleaseSigningError, "helper.*changed"):
+                self.sign_release(
+                    paths,
+                    runner=replacing_runner,
+                    openssl_runner=FakeCryptoRunner(secret),
+                    signing_helper=helper,
+                )
+            self.assertFalse(paths.output_dir.exists())
 
     def test_existing_output_fails_before_crypto_or_release_commands(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -406,7 +535,7 @@ class SigningCommandTest(unittest.TestCase):
     def test_builds_all_metadata_derived_commands_without_secret_transport(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            target_files = root / "unsigned.zip"
+            target_files = root / "lineage_fleur-target_files.zip"
             write_target_files(target_files)
             paths = self.SigningPaths(
                 target_files=target_files,
@@ -431,16 +560,22 @@ class SigningCommandTest(unittest.TestCase):
         self.assertIn("--avb_boot_key", sign)
         self.assertIn(str(public_pems / "avb_boot.public.pem"), sign)
         self.assertIn("--avb_boot_extra_args", sign)
-        self.assertIn(f"--signing_helper {SIGNING_HELPER}", sign)
+        self.assertIn(f"--signing_helper={SIGNING_HELPER}", sign)
         self.assertIn(
             "build/make/target/product/security/platform="
             + str(paths.keys_dir / "platform"),
             sign,
         )
         self.assertIn(
-            "vendor/example/security/releasekey="
-            + str(paths.keys_dir / "releasekey"),
+            "cts/hostsidetests/compilation/certs/testkey="
+            + str(paths.keys_dir / "testkey-f88799ce31c1"),
             sign,
+        )
+        self.assertFalse(
+            any(
+                value.startswith("build/make/target/product/security/testkey=")
+                for value in sign
+            )
         )
         self.assertIn(
             "com.android.art.apex=" + str(paths.keys_dir / "com.android.art"),
@@ -479,7 +614,18 @@ class SigningCommandTest(unittest.TestCase):
         self.assertNotIn("[[[", serialized)
         self.assertNotIn("pass:", serialized)
 
-    def test_rejects_generated_role_collisions(self):
+        nested = sign[sign.index("--avb_apex_extra_args") + 1]
+        self.assertEqual(nested, f"--signing_helper={SIGNING_HELPER}")
+        # apex_utils quotes this value as apexer's --signing_args operand;
+        # apexer then applies shlex.split before extending the avbtool command.
+        apexer_argv = shlex.split(f'--signing_args "{nested}"')
+        signing_args = apexer_argv[apexer_argv.index("--signing_args") + 1]
+        self.assertEqual(
+            shlex.split(signing_args),
+            [f"--signing_helper={SIGNING_HELPER}"],
+        )
+
+    def test_disambiguates_android_role_collisions_with_apex_roles(self):
         from scripts.ubuntu.signing_metadata import (
             ApexKey,
             ApkCertificate,
@@ -505,6 +651,8 @@ class SigningCommandTest(unittest.TestCase):
             misc_info={"ab_update": "true", "virtual_ab": "true"},
             source_key_stems=frozenset(),
             android_roles=frozenset({"com.android.art"}),
+            device="fleur",
+            build_tags=frozenset({"test-keys"}),
             uses_test_build_tags=True,
         )
         paths = self.SigningPaths(
@@ -514,13 +662,18 @@ class SigningCommandTest(unittest.TestCase):
             Path("/tmp/20260829T123456Z"),
         )
 
-        with self.assertRaisesRegex(self.ReleaseSigningError, "collid"):
-            self.build_signing_commands(
-                inventory,
-                paths,
-                signing_helper=SIGNING_HELPER,
-                public_key_dir=Path("/tmp/public-pem"),
-            )
+        commands = self.build_signing_commands(
+            inventory,
+            paths,
+            signing_helper=SIGNING_HELPER,
+            public_key_dir=Path("/tmp/public-pem"),
+        )
+
+        suffix = hashlib.sha256(b"source/com.android.art").hexdigest()[:12]
+        self.assertIn(
+            f"source/com.android.art=/tmp/keys/com.android.art-{suffix}",
+            commands.sign_target_files,
+        )
 
     def test_paths_require_utc_build_id_and_exact_artifact_names(self):
         paths = self.SigningPaths(
@@ -582,16 +735,7 @@ class AvbSigningHelperTest(unittest.TestCase):
             public_key.write_text("public-fixture", encoding="utf-8")
             secret = uuid.uuid4().hex
             password_file.write_text(f"[[[ {secret} ]]] {private_key}\n", encoding="utf-8")
-            config.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "password_file": str(password_file),
-                        "keys": {str(public_key): str(private_key)},
-                    }
-                ),
-                encoding="utf-8",
-            )
+            config.write_text(json.dumps(helper_config(private_key, public_key, password_file)), encoding="utf-8")
             for path in (private_key, password_file, config):
                 path.chmod(0o600)
             observations = {}
@@ -633,16 +777,7 @@ class AvbSigningHelperTest(unittest.TestCase):
             private_key.write_bytes(b"private")
             public_key.write_bytes(b"public")
             password_file.write_text(f"[[[ secret ]]] {private_key}\n", encoding="utf-8")
-            config.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "password_file": str(password_file),
-                        "keys": {str(public_key): str(private_key)},
-                    }
-                ),
-                encoding="utf-8",
-            )
+            config.write_text(json.dumps(helper_config(private_key, public_key, password_file)), encoding="utf-8")
             for path in (private_key, password_file, config):
                 path.chmod(0o600)
             runner = lambda *_args, **_kwargs: self.fail("openssl must not run")
@@ -699,6 +834,70 @@ class AvbSigningHelperTest(unittest.TestCase):
             self.assertEqual(public_key.read_bytes(), b"PUBLIC PEM FIXTURE\n")
             with self.assertRaisesRegex(self.AvbSigningError, "exists"):
                 self.export_public_key(private_key, public_key, password_file, runner=runner)
+
+    def test_rejects_private_key_replacement_during_signing_after_using_held_fd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = root / "avb_boot.pem"
+            public_key = root / "avb_boot.public.pem"
+            password_file = root / "passwords"
+            config = root / "helper.json"
+            private_key.write_bytes(b"original-private")
+            public_key.write_bytes(b"original-public")
+            password_file.write_text(f"[[[ secret ]]] {private_key}\n", encoding="utf-8")
+            config.write_text(
+                json.dumps(helper_config(private_key, public_key, password_file)),
+                encoding="utf-8",
+            )
+            for path in (private_key, password_file, config):
+                path.chmod(0o600)
+
+            def replacing_runner(command, *, input_data, pass_fds):
+                private_fd = int(command[command.index("-inkey") + 1].rsplit("/", 1)[1])
+                self.assertEqual(os.pread(private_fd, 4096, 0), b"original-private")
+                replacement = root / "replacement.pem"
+                replacement.write_bytes(b"replacement-private")
+                replacement.chmod(0o600)
+                os.replace(replacement, private_key)
+                return b"S" * 512
+
+            with self.assertRaisesRegex(self.AvbSigningError, "identity"):
+                self.sign_payload(
+                    config,
+                    "SHA256_RSA4096",
+                    public_key,
+                    b"padded-hash",
+                    runner=replacing_runner,
+                )
+
+    def test_rejects_public_key_replacement_before_openssl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = root / "avb_boot.pem"
+            public_key = root / "avb_boot.public.pem"
+            password_file = root / "passwords"
+            config = root / "helper.json"
+            private_key.write_bytes(b"original-private")
+            public_key.write_bytes(b"original-public")
+            password_file.write_text(f"[[[ secret ]]] {private_key}\n", encoding="utf-8")
+            config.write_text(
+                json.dumps(helper_config(private_key, public_key, password_file)),
+                encoding="utf-8",
+            )
+            replacement = root / "replacement.pem"
+            replacement.write_bytes(b"replacement-public")
+            os.replace(replacement, public_key)
+            for path in (private_key, public_key, password_file, config):
+                path.chmod(0o600)
+
+            with self.assertRaisesRegex(self.AvbSigningError, "identity"):
+                self.sign_payload(
+                    config,
+                    "SHA256_RSA4096",
+                    public_key,
+                    b"padded-hash",
+                    runner=lambda *_args, **_kwargs: self.fail("openssl must not run"),
+                )
 
 
 if __name__ == "__main__":

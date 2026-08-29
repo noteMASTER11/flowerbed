@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,7 +14,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import stat
 import subprocess
@@ -43,6 +43,9 @@ class ReleaseSigningError(RuntimeError):
 
 
 _BUILD_ID = re.compile(r"\d{8}T\d{6}Z\Z")
+_TARGET_FILES_NAME = re.compile(
+    r"lineage_fleur-target_files(?:-[A-Za-z0-9][A-Za-z0-9._-]*)?\.zip\Z"
+)
 _RENAME_NOREPLACE = 1
 _AT_FDCWD = -100
 _STANDARD_AVB_PARTITIONS = frozenset(
@@ -132,6 +135,63 @@ class SigningCommands:
     img_from_target_files: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True)
+class _InputEvidence:
+    filename: str
+    sha256: str
+    size: int
+    identity: _FileIdentity
+
+
+@dataclass
+class _PinnedFile:
+    source: Path
+    descriptor: int
+    identity: _FileIdentity
+    sha256: str
+
+    @property
+    def proc_path(self) -> Path:
+        return Path(f"/proc/{os.getpid()}/fd/{self.descriptor}")
+
+    def verify_named(self, label: str, *, verify_hash: bool = False) -> None:
+        if _descriptor_identity(self.descriptor) != self.identity or (
+            verify_hash and _sha256_descriptor(self.descriptor) != self.sha256
+        ):
+            raise ReleaseSigningError(f"{label} changed while signing")
+        try:
+            named = self.source.stat(follow_symlinks=False)
+        except OSError as error:
+            raise ReleaseSigningError(f"{label} changed while signing") from error
+        if _identity_from_stat(named) != self.identity:
+            raise ReleaseSigningError(f"{label} changed while signing")
+
+
+@dataclass(frozen=True)
+class _TargetSnapshot:
+    source: _PinnedFile
+    snapshot: _PinnedFile
+    evidence: _InputEvidence
+
+    @property
+    def proc_path(self) -> Path:
+        return self.snapshot.proc_path
+
+    def verify(self) -> None:
+        self.source.verify_named("target-files input")
+        if _descriptor_identity(self.snapshot.descriptor) != self.snapshot.identity:
+            raise ReleaseSigningError("target-files snapshot changed while signing")
+
+
 CommandRunner = Callable[..., None]
 Timestamp = Callable[[], str]
 
@@ -145,11 +205,13 @@ def build_signing_commands(
 ) -> SigningCommands:
     """Construct all signing commands from immutable target-files metadata."""
     try:
-        build_key_plan(inventory)
+        plan = build_key_plan(inventory)
     except KeyGenerationError as error:
         raise ReleaseSigningError("signing metadata has colliding generated key roles") from error
 
-    helper_args = f"--signing_helper {shlex.quote(str(signing_helper))}"
+    if not signing_helper.is_absolute() or any(character.isspace() for character in str(signing_helper)):
+        raise ReleaseSigningError("signing helper path must be absolute and contain no whitespace")
+    helper_args = f"--signing_helper={signing_helper}"
     command = [
         str(paths.host_tools / "sign_target_files_apks"),
         "-o",
@@ -159,13 +221,15 @@ def build_signing_commands(
         "-test-keys,+release-keys",
     ]
 
-    apk_mappings = {
-        certificate.certificate: paths.keys_dir / Path(certificate.certificate).name
-        for certificate in inventory.apk_certificates
-        if certificate.certificate != "PRESIGNED"
-    }
-    for source, destination in sorted(apk_mappings.items()):
-        command.extend(("-k", f"{source}={destination}"))
+    for mapping in plan.android_mappings:
+        if mapping.source_stem == "build/make/target/product/security/testkey":
+            continue
+        command.extend(
+            (
+                "-k",
+                f"{mapping.source_stem}={paths.keys_dir / mapping.destination_role}",
+            )
+        )
 
     non_presigned_apexes = tuple(apex for apex in inventory.apexes if not apex.presigned)
     for apex in non_presigned_apexes:
@@ -258,6 +322,7 @@ def sign_release(
     runner: CommandRunner = run_command,
     openssl_runner: OpenSslRunner = run_openssl,
     timestamp: Timestamp | None = None,
+    signing_helper: Path | None = None,
 ) -> Path:
     """Sign one target-files archive and atomically publish all public outputs."""
     now = _utc_timestamp if timestamp is None else timestamp
@@ -266,8 +331,7 @@ def sign_release(
         raise ReleaseSigningError("output directory already exists")
     if not paths.output_dir.parent.is_dir():
         raise ReleaseSigningError("output parent directory does not exist")
-    inventory = _validate_inputs(paths)
-    plan = _validate_keyset(inventory, paths.keys_dir)
+    _validate_target_files_path(paths.target_files)
 
     staging = Path(
         tempfile.mkdtemp(
@@ -276,59 +340,73 @@ def sign_release(
         )
     )
     os.chmod(staging, 0o700)
-    staging_paths = SigningPaths(
-        paths.target_files,
-        paths.android_root,
-        paths.keys_dir,
-        staging,
-        build_id=paths.build_id,
-    )
     runtime_dir = staging / ".signing-runtime"
     public_pem_dir = runtime_dir / "public-pem"
     config_path = runtime_dir / "avb-helper.json"
     published = False
     try:
-        public_pem_dir.mkdir(parents=True, mode=0o700)
-        try:
-            mappings = _export_runtime_public_pems(
-                plan,
-                paths.keys_dir,
-                public_pem_dir,
-                openssl_runner,
-            )
-        except AvbSigningError as error:
-            raise ReleaseSigningError("public key preparation failed") from error
-        _write_private_json(
-            config_path,
-            {
-                "schema_version": 1,
-                "password_file": str(paths.keys_dir / "passwords"),
-                "keys": mappings,
-            },
+        runtime_dir.mkdir(mode=0o700)
+        helper_source = (
+            Path(__file__).resolve().with_name("avb_signing_helper.py")
+            if signing_helper is None
+            else signing_helper
         )
-        helper = Path(__file__).resolve().with_name("avb_signing_helper.py")
-        commands = build_signing_commands(
-            inventory,
-            staging_paths,
-            signing_helper=helper,
-            public_key_dir=public_pem_dir,
-        )
-        private_environment = build_child_environment(staging_paths, config_path)
-        public_environment = build_public_environment(staging_paths)
+        with _snapshot_target_files(paths.target_files, runtime_dir) as target_snapshot:
+            with _pin_executable(helper_source) as pinned_helper:
+                inventory = _validate_inputs(paths, archive=target_snapshot.proc_path)
+                plan = _validate_keyset(inventory, paths.keys_dir)
+                staging_paths = SigningPaths(
+                    target_snapshot.proc_path,
+                    paths.android_root,
+                    paths.keys_dir,
+                    staging,
+                    build_id=paths.build_id,
+                )
+                public_pem_dir.mkdir(parents=True, mode=0o700)
+                try:
+                    mappings = _export_runtime_public_pems(
+                        plan,
+                        paths.keys_dir,
+                        public_pem_dir,
+                        openssl_runner,
+                    )
+                except AvbSigningError as error:
+                    raise ReleaseSigningError("public key preparation failed") from error
+                _write_private_json(
+                    config_path,
+                    {
+                        "schema_version": 2,
+                        "password_file": str(paths.keys_dir / "passwords"),
+                        "keys": mappings,
+                    },
+                )
+                commands = build_signing_commands(
+                    inventory,
+                    staging_paths,
+                    signing_helper=pinned_helper.proc_path,
+                    public_key_dir=public_pem_dir,
+                )
+                private_environment = build_child_environment(staging_paths, config_path)
+                public_environment = build_public_environment(staging_paths)
 
-        _run_release_tool(commands.sign_target_files, private_environment, runner)
-        _validate_zip(staging_paths.signed_target_files)
-        _run_release_tool(commands.ota_from_target_files, private_environment, runner)
-        _validate_payload_ota(staging_paths.ota_zip)
-        _run_release_tool(commands.img_from_target_files, public_environment, runner)
-        _validate_zip(staging_paths.fastboot_zip)
+                _run_release_tool(commands.sign_target_files, private_environment, runner)
+                target_snapshot.verify()
+                pinned_helper.verify_named("signing helper", verify_hash=True)
+                _validate_zip(staging_paths.signed_target_files)
+                _run_release_tool(commands.ota_from_target_files, private_environment, runner)
+                _validate_payload_ota(staging_paths.ota_zip)
+                _run_release_tool(commands.img_from_target_files, public_environment, runner)
+                _validate_zip(staging_paths.fastboot_zip)
 
-        _export_public_bundle(
-            plan,
-            paths.keys_dir,
-            public_pem_dir,
-            staging_paths.public_keys_dir,
-        )
+                _export_public_bundle(
+                    plan,
+                    paths.keys_dir,
+                    public_pem_dir,
+                    staging_paths.public_keys_dir,
+                )
+                target_snapshot.verify()
+                pinned_helper.verify_named("signing helper", verify_hash=True)
+                input_evidence = target_snapshot.evidence
         shutil.rmtree(runtime_dir)
         completed_at = now()
         _write_report(
@@ -338,6 +416,7 @@ def sign_release(
             commands,
             started_at,
             completed_at,
+            input_evidence,
         )
         _write_checksums(staging_paths)
         _fsync_directory(staging)
@@ -351,15 +430,135 @@ def sign_release(
     return paths.output_dir
 
 
-def _validate_inputs(paths: SigningPaths) -> SigningInventory:
+def _validate_target_files_path(path: Path) -> None:
+    if not _TARGET_FILES_NAME.fullmatch(path.name):
+        raise ReleaseSigningError("target-files filename does not identify fleur")
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ReleaseSigningError("target-files input is unavailable") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ReleaseSigningError("target-files input is unavailable")
+
+
+@contextmanager
+def _snapshot_target_files(source: Path, runtime_dir: Path):
+    source_fd = -1
+    snapshot_fd = -1
+    snapshot_path = runtime_dir / "target-files.snapshot.zip"
+    try:
+        source_fd = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        source_metadata = os.fstat(source_fd)
+        if not stat.S_ISREG(source_metadata.st_mode):
+            raise ReleaseSigningError("target-files input is unavailable")
+        source_identity = _identity_from_stat(source_metadata)
+        snapshot_fd = os.open(
+            snapshot_path,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o400,
+        )
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(snapshot_fd, view)
+                if written == 0:
+                    raise ReleaseSigningError("short write while snapshotting target-files")
+                view = view[written:]
+        os.fchmod(snapshot_fd, 0o400)
+        os.fsync(snapshot_fd)
+        snapshot_identity = _descriptor_identity(snapshot_fd)
+        source_pin = _PinnedFile(
+            source,
+            source_fd,
+            source_identity,
+            digest.hexdigest(),
+        )
+        snapshot_pin = _PinnedFile(
+            snapshot_path,
+            snapshot_fd,
+            snapshot_identity,
+            digest.hexdigest(),
+        )
+        source_pin.verify_named("target-files input")
+        yield _TargetSnapshot(
+            source_pin,
+            snapshot_pin,
+            _InputEvidence(
+                filename=source.name,
+                sha256=digest.hexdigest(),
+                size=snapshot_identity.size,
+                identity=source_identity,
+            ),
+        )
+    except OSError as error:
+        raise ReleaseSigningError("target-files snapshot failed") from error
+    finally:
+        if snapshot_fd >= 0:
+            os.close(snapshot_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
+
+
+@contextmanager
+def _pin_executable(path: Path):
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise ReleaseSigningError("signing helper is unavailable") from error
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or mode & 0o022
+        or not mode & 0o100
+    ):
+        os.close(descriptor)
+        raise ReleaseSigningError("signing helper is not a trusted executable")
+    pinned = _PinnedFile(
+        path,
+        descriptor,
+        _identity_from_stat(metadata),
+        _sha256_descriptor(descriptor),
+    )
+    try:
+        yield pinned
+    finally:
+        os.close(descriptor)
+
+
+def _validate_inputs(paths: SigningPaths, *, archive: Path | None = None) -> SigningInventory:
     if paths.output_dir.name != paths.build_id:
         raise ReleaseSigningError("final output directory must use the UTC build identifier")
-    if not paths.target_files.is_file() or paths.target_files.is_symlink():
-        raise ReleaseSigningError("target-files input is unavailable")
+    _validate_target_files_path(paths.target_files)
     try:
-        inventory = load_signing_inventory(paths.target_files)
+        inventory = load_signing_inventory(paths.target_files if archive is None else archive)
     except (OSError, ValueError, BadZipFile) as error:
         raise ReleaseSigningError("target-files signing metadata is invalid") from error
+    if inventory.device != "fleur":
+        raise ReleaseSigningError("target-files embedded device is not fleur")
     if inventory.misc_info.get("ab_update") != "true":
         raise ReleaseSigningError("fleur target-files must declare ab_update=true")
     if inventory.misc_info.get("virtual_ab") != "true":
@@ -475,19 +674,19 @@ def _export_runtime_public_pems(
     keys_dir: Path,
     public_pem_dir: Path,
     openssl_runner: OpenSslRunner,
-) -> dict[str, str]:
+) -> dict[str, dict[str, object]]:
     roles = [*plan.apex_names, *(f"avb_{partition}" for partition in plan.avb_roles)]
-    mappings: dict[str, str] = {}
+    mappings: dict[str, dict[str, object]] = {}
     for role in roles:
         private_key = keys_dir / f"{role}.pem"
         public_key = public_pem_dir / f"{role}.public.pem"
-        export_public_key(
+        mapping = export_public_key(
             private_key,
             public_key,
             keys_dir / "passwords",
             runner=openssl_runner,
         )
-        mappings[str(public_key)] = str(private_key)
+        mappings[str(public_key)] = mapping
     return mappings
 
 
@@ -623,6 +822,7 @@ def _write_report(
     commands: SigningCommands,
     started_at: str,
     completed_at: str,
+    input_evidence: _InputEvidence,
 ) -> None:
     artifacts = (
         staging_paths.signed_target_files,
@@ -635,15 +835,16 @@ def _write_report(
     report = {
         "schema_version": 1,
         "build_id": final_paths.build_id,
-        "device": "fleur",
+        "device": inventory.device,
         "build_properties": {
             "ab_update": inventory.misc_info.get("ab_update") == "true",
             "virtual_ab": inventory.misc_info.get("virtual_ab") == "true",
         },
         "timestamps": {"started_at": started_at, "completed_at": completed_at},
         "input": {
-            "sha256": _sha256(final_paths.target_files),
-            "size": final_paths.target_files.stat().st_size,
+            "filename": input_evidence.filename,
+            "sha256": input_evidence.sha256,
+            "size": input_evidence.size,
         },
         "outputs": {
             path.name: {"sha256": _sha256(path), "size": path.stat().st_size}
@@ -706,11 +907,21 @@ def _write_checksums(paths: SigningPaths) -> None:
 
 def _option_names(command: Sequence[str]) -> list[str]:
     names: set[str] = set()
-    for value in command[1:]:
-        if value.startswith("--"):
-            names.add(value.split("=", 1)[0])
-        elif len(value) == 2 and value.startswith("-"):
+    flags = {"-o", "--block"}
+    index = 1
+    while index < len(command):
+        value = command[index]
+        if value in flags:
             names.add(value)
+            index += 1
+        elif value.startswith("--") and "=" in value:
+            names.add(value.split("=", 1)[0])
+            index += 1
+        elif value.startswith("-"):
+            names.add(value)
+            index += 2
+        else:
+            index += 1
     return sorted(names)
 
 
@@ -720,6 +931,32 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             result.update(chunk)
     return result.hexdigest()
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    result = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            break
+        result.update(chunk)
+        offset += len(chunk)
+    return result.hexdigest()
+
+
+def _identity_from_stat(metadata: os.stat_result) -> _FileIdentity:
+    return _FileIdentity(
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _descriptor_identity(descriptor: int) -> _FileIdentity:
+    return _identity_from_stat(os.fstat(descriptor))
 
 
 def _rename_no_replace(source: Path, destination: Path) -> None:

@@ -47,6 +47,8 @@ class SigningInventory:
     misc_info: Mapping[str, str]
     source_key_stems: frozenset[str]
     android_roles: frozenset[str]
+    device: str
+    build_tags: frozenset[str]
     uses_test_build_tags: bool
 
 
@@ -56,6 +58,7 @@ _REQUIRED_MEMBERS = (
     "META/apkcerts.txt",
     "META/apexkeys.txt",
     "META/misc_info.txt",
+    "SYSTEM/build.prop",
 )
 
 
@@ -65,12 +68,21 @@ def load_signing_inventory(target_files: Path) -> SigningInventory:
         apk_text = _read_required_member(archive, _REQUIRED_MEMBERS[0])
         apex_text = _read_required_member(archive, _REQUIRED_MEMBERS[1])
         misc_text = _read_required_member(archive, _REQUIRED_MEMBERS[2])
+        system_build_prop_text = _read_required_member(archive, _REQUIRED_MEMBERS[3])
 
     apk_certificates = _parse_apkcerts(apk_text)
     apexes = _parse_apexkeys(apex_text)
     misc_info = _parse_misc_info(misc_text)
     avb_keys = _parse_avb_keys(misc_info)
-    return _assemble_inventory(apk_certificates, apexes, avb_keys, misc_info)
+    device, build_tags = _parse_build_identity(system_build_prop_text)
+    return _assemble_inventory(
+        apk_certificates,
+        apexes,
+        avb_keys,
+        misc_info,
+        device=device,
+        build_tags=build_tags,
+    )
 
 
 def _read_required_member(archive: ZipFile, member: str) -> str:
@@ -175,6 +187,61 @@ def _parse_misc_info(text: str) -> Mapping[str, str]:
     return MappingProxyType(dict(sorted(values.items())))
 
 
+def _parse_build_identity(text: str) -> tuple[str, frozenset[str]]:
+    properties = _parse_property_file(text, "SYSTEM/build.prop")
+    device = _required_consistent_property(
+        properties,
+        "ro.product.system.device",
+        ("ro.build.product", "ro.product.device"),
+        "device",
+    )
+    tag_value = _required_consistent_property(
+        properties,
+        "ro.build.tags",
+        ("ro.system.build.tags",),
+        "build tags",
+    )
+    build_tags = frozenset(tag.strip() for tag in tag_value.split(",") if tag.strip())
+    if not build_tags:
+        raise SigningMetadataError("SYSTEM/build.prop has empty build tags")
+    return device, build_tags
+
+
+def _parse_property_file(text: str, filename: str) -> Mapping[str, str]:
+    values: dict[str, str] = {}
+    for line_number, line in _iter_content_lines(text):
+        if "=" not in line:
+            raise SigningMetadataError(f"{filename} line {line_number} is not key=value")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value:
+            raise SigningMetadataError(f"{filename} line {line_number} has an empty property")
+        previous = values.get(key)
+        if previous is not None and previous != value:
+            raise SigningMetadataError(f"{filename} repeats {key} with conflicting values")
+        values[key] = value
+    return MappingProxyType(dict(sorted(values.items())))
+
+
+def _required_consistent_property(
+    properties: Mapping[str, str],
+    primary: str,
+    aliases: tuple[str, ...],
+    label: str,
+) -> str:
+    try:
+        value = properties[primary]
+    except KeyError as error:
+        raise SigningMetadataError(
+            f"SYSTEM/build.prop is missing canonical {label} property {primary}"
+        ) from error
+    conflicting = [name for name in aliases if name in properties and properties[name] != value]
+    if conflicting:
+        raise SigningMetadataError(f"SYSTEM/build.prop has ambiguous {label}")
+    return value
+
+
 def _parse_avb_keys(misc_info: Mapping[str, str]) -> tuple[AvbPartitionKey, ...]:
     avb_fields: dict[str, dict[str, str]] = {}
     for key, value in misc_info.items():
@@ -226,6 +293,9 @@ def _assemble_inventory(
     apexes: tuple[ApexKey, ...],
     avb_keys: tuple[AvbPartitionKey, ...],
     misc_info: Mapping[str, str],
+    *,
+    device: str,
+    build_tags: frozenset[str],
 ) -> SigningInventory:
     source_key_stems = {
         value
@@ -249,9 +319,6 @@ def _assemble_inventory(
         for certificate in apk_certificates
         if certificate.certificate != _PRESIGNED
     }
-    build_tags = {
-        tag.strip() for tag in misc_info.get("build_tags", "").split(",") if tag.strip()
-    }
     return SigningInventory(
         apk_certificates=tuple(sorted(apk_certificates, key=lambda record: record.name)),
         apexes=tuple(sorted(apexes, key=lambda record: record.name)),
@@ -259,6 +326,8 @@ def _assemble_inventory(
         misc_info=MappingProxyType(dict(sorted(misc_info.items()))),
         source_key_stems=frozenset(source_key_stems),
         android_roles=frozenset(android_roles),
+        device=device,
+        build_tags=frozenset(build_tags),
         uses_test_build_tags="test-keys" in build_tags,
     )
 

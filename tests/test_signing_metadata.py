@@ -39,6 +39,27 @@ avb_vbmeta_system_key_path=build/make/target/product/security/testkey.pem
 avb_vbmeta_system_algorithm=SHA256_RSA4096
 '''
 
+# Sanitized from the authorized local fleur target-files archive.
+REAL_MISC_INFO = '''\
+ab_update=true
+virtual_ab=true
+default_system_dev_certificate=build/make/target/product/security/testkey
+avb_boot_key_path=external/avb/test/data/testkey_rsa4096.pem
+avb_boot_algorithm=SHA256_RSA4096
+avb_vbmeta_key_path=external/avb/test/data/testkey_rsa4096.pem
+avb_vbmeta_algorithm=SHA256_RSA4096
+avb_vbmeta_system_key_path=external/avb/test/data/testkey_rsa4096.pem
+avb_vbmeta_system_algorithm=SHA256_RSA4096
+avb_vbmeta_vendor_key_path=external/avb/test/data/testkey_rsa4096.pem
+avb_vbmeta_vendor_algorithm=SHA256_RSA4096
+'''
+
+REAL_SYSTEM_BUILD_PROP = '''\
+ro.product.system.device=fleur
+ro.system.build.tags=test-keys
+ro.build.tags=test-keys
+'''
+
 
 def write_target_files(
     path: Path,
@@ -46,12 +67,14 @@ def write_target_files(
     apkcerts: str = APK_CERTS,
     apexkeys: str = APEX_KEYS,
     misc_info: str = MISC_INFO,
+    system_build_prop: str = REAL_SYSTEM_BUILD_PROP,
     omit: str | None = None,
 ) -> None:
     members = {
         "META/apkcerts.txt": apkcerts,
         "META/apexkeys.txt": apexkeys,
         "META/misc_info.txt": misc_info,
+        "SYSTEM/build.prop": system_build_prop,
     }
     with zipfile.ZipFile(path, "w") as archive:
         for name, text in members.items():
@@ -60,6 +83,68 @@ def write_target_files(
 
 
 class SigningMetadataTest(unittest.TestCase):
+    def test_loads_real_shaped_tags_and_device_from_canonical_system_build_prop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "lineage_fleur-target_files.zip"
+            write_target_files(target_files, misc_info=REAL_MISC_INFO)
+
+            inventory = load_signing_inventory(target_files)
+
+        self.assertEqual(inventory.device, "fleur")
+        self.assertEqual(inventory.build_tags, frozenset({"test-keys"}))
+        self.assertTrue(inventory.uses_test_build_tags)
+
+    def test_rejects_missing_canonical_system_build_prop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "lineage_fleur-target_files.zip"
+            write_target_files(
+                target_files,
+                misc_info=REAL_MISC_INFO,
+                omit="SYSTEM/build.prop",
+            )
+
+            with self.assertRaisesRegex(SigningMetadataError, "SYSTEM/build.prop"):
+                load_signing_inventory(target_files)
+
+    def test_rejects_conflicting_canonical_build_tag_properties(self):
+        conflicting = REAL_SYSTEM_BUILD_PROP.replace(
+            "ro.system.build.tags=test-keys",
+            "ro.system.build.tags=release-keys",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "lineage_fleur-target_files.zip"
+            write_target_files(
+                target_files,
+                misc_info=REAL_MISC_INFO,
+                system_build_prop=conflicting,
+            )
+
+            with self.assertRaisesRegex(SigningMetadataError, "build tags"):
+                load_signing_inventory(target_files)
+
+    def test_rejects_missing_or_ambiguous_canonical_build_identity_properties(self):
+        cases = {
+            "missing device": REAL_SYSTEM_BUILD_PROP.replace(
+                "ro.product.system.device=fleur\n", ""
+            ),
+            "missing tags": REAL_SYSTEM_BUILD_PROP.replace(
+                "ro.build.tags=test-keys\n", ""
+            ),
+            "ambiguous device": REAL_SYSTEM_BUILD_PROP
+            + "ro.product.device=other\n",
+        }
+        for label, properties in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                target_files = Path(directory) / "lineage_fleur-target_files.zip"
+                write_target_files(
+                    target_files,
+                    misc_info=REAL_MISC_INFO,
+                    system_build_prop=properties,
+                )
+
+                with self.assertRaisesRegex(SigningMetadataError, "device|build tags"):
+                    load_signing_inventory(target_files)
+
     def test_reads_required_member_directly(self):
         with tempfile.TemporaryDirectory() as directory:
             target_files = Path(directory) / "target-files.zip"
@@ -218,6 +303,8 @@ class SigningMetadataTest(unittest.TestCase):
             _parse_apexkeys(APEX_KEYS),
             _parse_avb_keys(_parse_misc_info(MISC_INFO)),
             _parse_misc_info(MISC_INFO),
+            device="fleur",
+            build_tags=frozenset({"test-keys"}),
         )
 
         self.assertEqual(inventory.android_roles, frozenset({"platform", "releasekey"}))

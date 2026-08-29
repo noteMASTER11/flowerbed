@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,7 @@ _SUPPORTED_ALGORITHM = "SHA256_RSA4096"
 _CONFIG_ENV = "FLEUR_AVB_SIGNING_CONFIG"
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _WRITE_FLAGS = (
-    os.O_WRONLY
+    os.O_RDWR
     | os.O_CREAT
     | os.O_EXCL
     | getattr(os, "O_CLOEXEC", 0)
@@ -70,13 +71,26 @@ def sign_payload(
     password_file, mappings = _load_config(config_path)
     requested_public_key = str(public_key)
     try:
-        private_key = Path(mappings[requested_public_key])
+        mapping = mappings[requested_public_key]
     except KeyError as error:
         raise AvbSigningError("unrecognized AVB public key path") from error
+    private_key = Path(mapping["private_key"])
 
-    private_fd = _open_private_key(private_key)
+    public_fd = _open_bound_file(
+        public_key,
+        mapping["public_identity"],
+        "AVB public key",
+        allowed_modes=frozenset((0o600, 0o644)),
+    )
+    private_fd = -1
     password = ""
     try:
+        private_fd = _open_bound_file(
+            private_key,
+            mapping["private_identity"],
+            "encrypted private key",
+            allowed_modes=frozenset((0o600,)),
+        )
         password = lookup_password(password_file, str(private_key))
         with _password_descriptor(password) as password_fd:
             command = [
@@ -94,11 +108,25 @@ def sign_payload(
                 input_data=payload,
                 pass_fds=(private_fd, password_fd),
             )
+        _revalidate_bound_file(
+            private_fd,
+            private_key,
+            mapping["private_identity"],
+            "encrypted private key",
+        )
+        _revalidate_bound_file(
+            public_fd,
+            public_key,
+            mapping["public_identity"],
+            "AVB public key",
+        )
     except PasswordLookupError as error:
         raise AvbSigningError("AVB key password lookup failed") from error
     finally:
         password = ""
-        os.close(private_fd)
+        if private_fd >= 0:
+            os.close(private_fd)
+        os.close(public_fd)
 
     if len(signature) != 512:
         raise AvbSigningError("OpenSSL returned an invalid AVB signature length")
@@ -111,9 +139,10 @@ def export_public_key(
     password_file: Path,
     *,
     runner: OpenSslRunner = run_openssl,
-) -> None:
+) -> dict[str, object]:
     """Export a public PEM from an encrypted private PEM via password fd."""
     private_fd = _open_private_key(private_key)
+    private_identity = _descriptor_identity(private_fd)
     output_fd = -1
     password = ""
     try:
@@ -144,6 +173,13 @@ def export_public_key(
         os.fsync(output_fd)
         if os.fstat(output_fd).st_size == 0:
             raise AvbSigningError("OpenSSL produced an empty public key")
+        public_identity = _descriptor_identity(output_fd)
+        _revalidate_bound_file(
+            private_fd,
+            private_key,
+            private_identity,
+            "encrypted private key",
+        )
     except (PasswordLookupError, OSError) as error:
         if isinstance(error, PasswordLookupError):
             wrapped = AvbSigningError("AVB key password lookup failed")
@@ -173,9 +209,14 @@ def export_public_key(
         if output_fd >= 0:
             os.close(output_fd)
         os.close(private_fd)
+    return {
+        "private_key": str(private_key),
+        "private_identity": private_identity,
+        "public_identity": public_identity,
+    }
 
 
-def _load_config(config_path: Path) -> tuple[Path, dict[str, str]]:
+def _load_config(config_path: Path) -> tuple[Path, dict[str, dict[str, object]]]:
     descriptor = _open_owned_private_file(config_path, "AVB helper config")
     try:
         with os.fdopen(descriptor, "r", encoding="utf-8") as source:
@@ -188,7 +229,7 @@ def _load_config(config_path: Path) -> tuple[Path, dict[str, str]]:
             os.close(descriptor)
     if not isinstance(config, dict):
         raise AvbSigningError("AVB helper config must be a JSON object")
-    if config.get("schema_version") != 1:
+    if config.get("schema_version") != 2:
         raise AvbSigningError("AVB helper config has an unsupported schema")
     password_file = config.get("password_file")
     mappings = config.get("keys")
@@ -196,15 +237,23 @@ def _load_config(config_path: Path) -> tuple[Path, dict[str, str]]:
         raise AvbSigningError("AVB helper config has an invalid password file")
     if not isinstance(mappings, dict) or not mappings:
         raise AvbSigningError("AVB helper config has no key mappings")
-    if not all(
-        isinstance(public, str)
-        and Path(public).is_absolute()
-        and isinstance(private, str)
-        and Path(private).is_absolute()
-        for public, private in mappings.items()
-    ):
-        raise AvbSigningError("AVB helper config has an invalid key mapping")
-    return Path(password_file), dict(mappings)
+    normalized: dict[str, dict[str, object]] = {}
+    for public, mapping in mappings.items():
+        if (
+            not isinstance(public, str)
+            or not Path(public).is_absolute()
+            or not isinstance(mapping, dict)
+            or set(mapping) != {"private_key", "private_identity", "public_identity"}
+            or not isinstance(mapping.get("private_key"), str)
+            or not Path(mapping["private_key"]).is_absolute()
+        ):
+            raise AvbSigningError("AVB helper config has an invalid key mapping")
+        normalized[public] = {
+            "private_key": mapping["private_key"],
+            "private_identity": _validate_config_identity(mapping["private_identity"]),
+            "public_identity": _validate_config_identity(mapping["public_identity"]),
+        }
+    return Path(password_file), normalized
 
 
 def _open_private_key(private_key: Path) -> int:
@@ -228,6 +277,94 @@ def _open_owned_private_file(path: Path, label: str) -> int:
         os.close(descriptor)
         raise AvbSigningError(f"{label} must be an owned mode-0600 regular file")
     return descriptor
+
+
+def _open_bound_file(
+    path: Path,
+    expected: dict[str, object],
+    label: str,
+    *,
+    allowed_modes: frozenset[int],
+) -> int:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, _READ_FLAGS)
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise AvbSigningError(f"{label} is unavailable") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) not in allowed_modes
+    ):
+        os.close(descriptor)
+        raise AvbSigningError(f"{label} has unsafe permissions")
+    if _descriptor_identity(descriptor) != expected:
+        os.close(descriptor)
+        raise AvbSigningError(f"{label} identity does not match the signing plan")
+    return descriptor
+
+
+def _revalidate_bound_file(
+    descriptor: int,
+    path: Path,
+    expected: dict[str, object],
+    label: str,
+) -> None:
+    if _descriptor_identity(descriptor) != expected:
+        raise AvbSigningError(f"{label} identity changed during signing")
+    try:
+        named = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise AvbSigningError(f"{label} identity changed during signing") from error
+    if (
+        not stat.S_ISREG(named.st_mode)
+        or named.st_dev != expected["device"]
+        or named.st_ino != expected["inode"]
+        or named.st_size != expected["size"]
+    ):
+        raise AvbSigningError(f"{label} identity changed during signing")
+
+
+def _descriptor_identity(descriptor: int) -> dict[str, object]:
+    metadata = os.fstat(descriptor)
+    result = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            break
+        result.update(chunk)
+        offset += len(chunk)
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "size": metadata.st_size,
+        "sha256": result.hexdigest(),
+    }
+
+
+def _validate_config_identity(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "device",
+        "inode",
+        "size",
+        "sha256",
+    }:
+        raise AvbSigningError("AVB helper config has an invalid key identity")
+    if (
+        not all(
+            type(value[name]) is int and value[name] >= 0
+            for name in ("device", "inode", "size")
+        )
+        or not isinstance(value["sha256"], str)
+        or len(value["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in value["sha256"])
+    ):
+        raise AvbSigningError("AVB helper config has an invalid key identity")
+    return dict(value)
 
 
 @contextmanager

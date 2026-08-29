@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
@@ -33,7 +34,14 @@ class KeyGenerationError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class AndroidKeyMapping:
+    source_stem: str
+    destination_role: str
+
+
+@dataclass(frozen=True)
 class KeyPlan:
+    android_mappings: tuple[AndroidKeyMapping, ...]
     android_roles: tuple[str, ...]
     apex_names: tuple[str, ...]
     avb_roles: tuple[str, ...]
@@ -71,22 +79,53 @@ _PATH_FLAGS = (
 )
 _OPEN_DELIMITER = "[[["
 _CLOSE_DELIMITER = "]]]"
+_DEFAULT_ANDROID_TEST_KEY = "build/make/target/product/security/testkey"
 
 
 def build_key_plan(source: Path | SigningInventory) -> KeyPlan:
     """Build a deterministic output-key plan from target-files metadata."""
     inventory = load_signing_inventory(source) if isinstance(source, Path) else source
-    android_roles = tuple(sorted(inventory.android_roles))
     apex_names = tuple(
         sorted({_apex_key_name(item.name) for item in inventory.apexes if not item.presigned})
     )
     avb_roles = tuple(item.partition for item in inventory.avb_keys)
-    for name in (*android_roles, *apex_names, *avb_roles):
+    for name in (*apex_names, *avb_roles):
         _validate_key_name(name)
-    output_bases = [*android_roles, *apex_names, *(f"avb_{role}" for role in avb_roles)]
-    if len(output_bases) != len(set(output_bases)):
+    fixed_roles = ["releasekey", *apex_names, *(f"avb_{role}" for role in avb_roles)]
+    if len(fixed_roles) != len(set(fixed_roles)):
         raise KeyGenerationError("key metadata produces colliding output names")
-    return KeyPlan(android_roles, apex_names, avb_roles)
+
+    source_stems = tuple(
+        sorted(
+            {
+                certificate.certificate
+                for certificate in inventory.apk_certificates
+                if certificate.certificate != "PRESIGNED"
+            }
+        )
+    )
+    basename_counts = Counter(Path(stem).name for stem in source_stems)
+    used_roles = set(fixed_roles)
+    mappings: list[AndroidKeyMapping] = []
+    for source_stem in source_stems:
+        if source_stem == _DEFAULT_ANDROID_TEST_KEY:
+            destination_role = "releasekey"
+        else:
+            basename = Path(source_stem).name
+            _validate_key_name(basename)
+            destination_role = basename
+            if basename_counts[basename] > 1 or destination_role in used_roles:
+                suffix = hashlib.sha256(source_stem.encode("utf-8")).hexdigest()[:12]
+                destination_role = f"{basename}-{suffix}"
+            if destination_role in used_roles:
+                raise KeyGenerationError("key metadata produces colliding output names")
+            used_roles.add(destination_role)
+        mappings.append(AndroidKeyMapping(source_stem, destination_role))
+
+    android_roles = tuple(sorted({"releasekey", *(item.destination_role for item in mappings)}))
+    for name in android_roles:
+        _validate_key_name(name)
+    return KeyPlan(tuple(mappings), android_roles, apex_names, avb_roles)
 
 
 def validate_private_destination(

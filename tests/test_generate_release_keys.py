@@ -22,7 +22,8 @@ HELPER = ROOT / "scripts/ubuntu/avb_password_helper.py"
 
 APK_CERTS = '''\
 name="framework-res.apk" certificate="build/make/target/product/security/platform.x509.pem" private_key="build/make/target/product/security/platform.pk8"
-name="Settings.apk" certificate="build/make/target/product/security/releasekey.x509.pem" private_key="build/make/target/product/security/releasekey.pk8"
+name="Settings.apk" certificate="build/make/target/product/security/testkey.x509.pem" private_key="build/make/target/product/security/testkey.pk8"
+name="CtsCompilationApp.apk" certificate="cts/hostsidetests/compilation/certs/testkey.x509.pem" private_key="cts/hostsidetests/compilation/certs/testkey.pk8"
 '''
 
 APEX_KEYS = '''\
@@ -31,7 +32,8 @@ name="com.android.tzdata.apex" public_key="PRESIGNED" private_key="PRESIGNED" co
 '''
 
 MISC_INFO = '''\
-build_tags=test-keys
+ab_update=true
+virtual_ab=true
 avb_boot_key_path=build/make/target/product/security/testkey.pem
 avb_boot_algorithm=SHA256_RSA4096
 avb_vbmeta_key_path=build/make/target/product/security/testkey.pem
@@ -42,12 +44,19 @@ avb_vbmeta_vendor_key_path=build/make/target/product/security/testkey.pem
 avb_vbmeta_vendor_algorithm=SHA256_RSA4096
 '''
 
+SYSTEM_BUILD_PROP = '''\
+ro.product.system.device=fleur
+ro.system.build.tags=test-keys
+ro.build.tags=test-keys
+'''
 
-def write_target_files(path: Path) -> None:
+
+def write_target_files(path: Path, *, apkcerts: str = APK_CERTS) -> None:
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("META/apkcerts.txt", APK_CERTS)
+        archive.writestr("META/apkcerts.txt", apkcerts)
         archive.writestr("META/apexkeys.txt", APEX_KEYS)
         archive.writestr("META/misc_info.txt", MISC_INFO)
+        archive.writestr("SYSTEM/build.prop", SYSTEM_BUILD_PROP)
 
 
 def digest_text(value: str) -> str:
@@ -263,11 +272,45 @@ class GenerateReleaseKeysTest(unittest.TestCase):
 
             plan = self.build_key_plan(target_files)
 
-        self.assertEqual(plan.android_roles, ("platform", "releasekey"))
+        self.assertEqual(
+            plan.android_roles,
+            ("platform", "releasekey", "testkey-f88799ce31c1"),
+        )
+        self.assertEqual(
+            tuple(
+                (mapping.source_stem, mapping.destination_role)
+                for mapping in plan.android_mappings
+            ),
+            (
+                ("build/make/target/product/security/platform", "platform"),
+                ("build/make/target/product/security/testkey", "releasekey"),
+                (
+                    "cts/hostsidetests/compilation/certs/testkey",
+                    "testkey-f88799ce31c1",
+                ),
+            ),
+        )
         self.assertIn("com.android.art", plan.apex_names)
         self.assertNotIn("com.android.tzdata", plan.apex_names)
         self.assertEqual(
             plan.avb_roles, ("boot", "vbmeta", "vbmeta_system", "vbmeta_vendor")
+        )
+
+    def test_plan_always_includes_releasekey_without_a_releasekey_source_stem(self):
+        platform_only = APK_CERTS.splitlines(keepends=True)[0]
+        with self.private_temp() as directory:
+            target_files = Path(directory) / "target-files.zip"
+            write_target_files(target_files, apkcerts=platform_only)
+
+            plan = self.build_key_plan(target_files)
+
+        self.assertEqual(plan.android_roles, ("platform", "releasekey"))
+        self.assertEqual(
+            tuple(
+                (mapping.source_stem, mapping.destination_role)
+                for mapping in plan.android_mappings
+            ),
+            (("build/make/target/product/security/platform", "platform"),),
         )
 
     def test_blank_or_mismatched_passphrase_fails_before_commands(self):
@@ -548,6 +591,7 @@ class GenerateReleaseKeysTest(unittest.TestCase):
                 {
                     str(keys_dir / "platform"),
                     str(keys_dir / "releasekey"),
+                    str(keys_dir / "testkey-f88799ce31c1"),
                     str(keys_dir / "com.android.art"),
                     str(keys_dir / "com.android.art.pem"),
                     str(keys_dir / "avb_boot.pem"),
