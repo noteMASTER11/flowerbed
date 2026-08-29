@@ -816,6 +816,25 @@ def _verify_boot_component_transform(
     if unsigned_fixed != signed_fixed or set(unsigned_header) != set(signed_header):
         raise VerificationError("signed boot header differs outside ramdisk size")
 
+    unsigned_trailer = unsigned_boot.get("ramdisk_trailer_metadata")
+    signed_trailer = signed_boot.get("ramdisk_trailer_metadata")
+    if (
+        not isinstance(unsigned_trailer, tuple)
+        or unsigned_trailer != signed_trailer
+    ):
+        raise VerificationError("signed boot ramdisk trailer metadata differs")
+    unsigned_padding = unsigned_boot.get("ramdisk_padding_size")
+    signed_padding = signed_boot.get("ramdisk_padding_size")
+    if (
+        not isinstance(unsigned_padding, int)
+        or isinstance(unsigned_padding, bool)
+        or not 0 <= unsigned_padding < 256
+        or not isinstance(signed_padding, int)
+        or isinstance(signed_padding, bool)
+        or not 0 <= signed_padding < 256
+    ):
+        raise VerificationError("boot ramdisk padding evidence is invalid")
+
     unsigned_entries = unsigned_boot.get("ramdisk_entries")
     signed_entries = signed_boot.get("ramdisk_entries")
     if not isinstance(unsigned_entries, Mapping) or not isinstance(signed_entries, Mapping):
@@ -853,6 +872,10 @@ def _verify_boot_component_transform(
         "kernel_sha256": unsigned_kernel,
         "dtb_sha256": unsigned_dtb,
         "ramdisk_changed_members": sorted(changed),
+        "ramdisk_padding_sizes": {
+            "unsigned": unsigned_padding,
+            "signed": signed_padding,
+        },
     }
 
 
@@ -915,6 +938,7 @@ def verify_kernel_boot_provenance(
         "kernel_sha256": component_evidence["kernel_sha256"],
         "dtb_sha256": component_evidence["dtb_sha256"],
         "ramdisk_changed_members": component_evidence["ramdisk_changed_members"],
+        "ramdisk_padding_sizes": component_evidence["ramdisk_padding_sizes"],
         "unsigned_boot_sha256": unsigned_boot["raw_sha256"],
         "signed_boot_sha256": signed_boot["raw_sha256"],
         "cfi_remains_enabled": True,
@@ -1482,7 +1506,7 @@ def _parse_boot_header_info(text: str) -> dict[str, str]:
             raise VerificationError("unpack_bootimg returned ambiguous header evidence")
         fields[key] = value.strip()
     required = {
-        "kernel size",
+        "kernel_size",
         "ramdisk size",
         "boot image header version",
         "command line args",
@@ -1493,14 +1517,15 @@ def _parse_boot_header_info(text: str) -> dict[str, str]:
     return fields
 
 
-def _parse_newc_ramdisk(data: bytes) -> dict[str, dict[str, object]]:
+def _parse_newc_ramdisk(data: bytes) -> dict[str, object]:
     entries: dict[str, dict[str, object]] = {}
     offset = 0
-    trailer_seen = False
+    trailer_metadata: tuple[int, ...] | None = None
+    trailer_end: int | None = None
     while offset + 110 <= len(data):
         header = data[offset : offset + 110]
-        if header[:6] not in (b"070701", b"070702"):
-            raise VerificationError("boot ramdisk is not a valid newc archive")
+        if header[:6] != b"070701":
+            raise VerificationError("boot ramdisk is not a canonical newc archive")
         try:
             values = tuple(
                 int(header[6 + index * 8 : 14 + index * 8], 16)
@@ -1526,15 +1551,34 @@ def _parse_newc_ramdisk(data: bytes) -> dict[str, dict[str, object]]:
         payload = data[offset : offset + size]
         offset = (offset + size + 3) & ~3
         if name == "TRAILER!!!":
-            trailer_seen = True
+            expected_trailer = (
+                300000 + len(entries),
+                0o755,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                11,
+                0,
+            )
+            if values != expected_trailer or payload:
+                raise VerificationError("boot ramdisk newc trailer is not canonical")
+            trailer_metadata = values
+            trailer_end = offset
             break
         parts = name.split("/")
+        if name in entries:
+            raise VerificationError(f"boot ramdisk has duplicate member {name!r}")
         if (
             not name
             or "\x00" in name
             or "\\" in name
             or name.startswith("/")
-            or name in entries
             or ".." in parts
             or any(part in {"", "."} for part in parts)
         ):
@@ -1553,11 +1597,20 @@ def _parse_newc_ramdisk(data: bytes) -> dict[str, dict[str, object]]:
             values[12],
         )
         entries[name] = {"metadata": metadata, "data": payload}
-    if not trailer_seen or any(data[offset:]):
-        raise VerificationError("boot ramdisk newc archive has invalid trailer")
+    if trailer_metadata is None or trailer_end is None:
+        raise VerificationError("boot ramdisk newc archive has missing trailer")
+    padding = data[trailer_end:]
+    expected_padding_size = (-trailer_end) % 256
+    if len(padding) != expected_padding_size or any(padding):
+        raise VerificationError("boot ramdisk newc archive has invalid padding")
     if not entries:
         raise VerificationError("boot ramdisk is empty")
-    return entries
+    return {
+        "entries": entries,
+        "trailer_metadata": trailer_metadata,
+        "trailer_end": trailer_end,
+        "padding_size": len(padding),
+    }
 
 
 def extract_boot_evidence(
@@ -1612,8 +1665,9 @@ def extract_boot_evidence(
         header = _parse_boot_header_info(header_text)
         try:
             header_sizes = {
-                name: int(header[f"{name} size"])
-                for name in expected_components
+                "kernel": int(header["kernel_size"]),
+                "ramdisk": int(header["ramdisk size"]),
+                "dtb": int(header["dtb size"]),
             }
         except ValueError as error:
             raise VerificationError("unpack_bootimg returned invalid component size") from error
@@ -1633,7 +1687,7 @@ def extract_boot_evidence(
             raise VerificationError("cannot decompress boot ramdisk") from error
         if cpio_path.is_symlink() or not cpio_path.is_file():
             raise VerificationError("boot ramdisk decompression produced no archive")
-        ramdisk_entries = _parse_newc_ramdisk(cpio_path.read_bytes())
+        ramdisk = _parse_newc_ramdisk(cpio_path.read_bytes())
         kernel_hash = sha256_file(unpacked / "kernel")
         dtb_hash = sha256_file(unpacked / "dtb")
     return {
@@ -1642,7 +1696,9 @@ def extract_boot_evidence(
         "kernel_sha256": kernel_hash,
         "dtb_sha256": dtb_hash,
         "boot_header": header,
-        "ramdisk_entries": ramdisk_entries,
+        "ramdisk_entries": ramdisk["entries"],
+        "ramdisk_trailer_metadata": ramdisk["trailer_metadata"],
+        "ramdisk_padding_size": ramdisk["padding_size"],
     }
 
 

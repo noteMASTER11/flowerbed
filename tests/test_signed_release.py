@@ -54,10 +54,18 @@ def write_zip_symlink(
     archive.writestr(member, target)
 
 
-def build_newc(entries: dict[str, tuple[int, bytes]]) -> bytes:
+def build_newc(
+    entries,
+    *,
+    trailer_data: bytes = b"",
+    include_trailer: bool = True,
+) -> bytes:
     output = bytearray()
-    inode = 1
-    for name, (mode, data) in [*entries.items(), ("TRAILER!!!", (0, b""))]:
+    inode = 300000
+    items = list(entries.items()) if isinstance(entries, dict) else list(entries)
+    if include_trailer:
+        items.append(("TRAILER!!!", (0o755, trailer_data)))
+    for name, (mode, data) in items:
         encoded = name.encode("utf-8") + b"\0"
         fields = (
             inode,
@@ -80,6 +88,8 @@ def build_newc(entries: dict[str, tuple[int, bytes]]) -> bytes:
         output.extend(data)
         output.extend(b"\0" * (-len(output) % 4))
         inode += 1
+    if include_trailer:
+        output.extend(b"\0" * (-len(output) % 256))
     return bytes(output)
 
 
@@ -350,10 +360,26 @@ class SignedReleasePolicyTest(unittest.TestCase):
             "boot_header": {
                 "boot image header version": "2",
                 "command line args": "console=tty0",
-                "kernel size": "6",
+                "kernel_size": "6",
                 "ramdisk size": "100",
                 "dtb size": "3",
             },
+            "ramdisk_trailer_metadata": (
+                300607,
+                0o755,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                11,
+                0,
+            ),
+            "ramdisk_padding_size": 236,
             "ramdisk_entries": {
                 "init": entry(b"init"),
                 "default.prop": {
@@ -392,6 +418,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
         signed["raw_sha256"] = "d" * 64
         signed["content_sha256"] = "f" * 64
         signed["boot_header"]["ramdisk size"] = "104"
+        signed["ramdisk_padding_size"] = 160
         signed["ramdisk_entries"]["prop.default"]["data"] = (
             b"ro.build.tags=release-keys\n"
             b"ro.build.display.id=BUILD\n"
@@ -463,6 +490,50 @@ class SignedReleasePolicyTest(unittest.TestCase):
         changed = copy.deepcopy(signed)
         changed["ramdisk_entries"]["init"]["data"] = b"mutated-init"
         with self.assertRaisesRegex(module.VerificationError, "ramdisk"):
+            module.verify_kernel_boot_provenance(
+                unsigned, changed, record, release_certificate
+            )
+        changed = copy.deepcopy(signed)
+        changed["ramdisk_entries"]["init"]["metadata"] = (
+            1,
+            stat.S_IFREG | 0o700,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        with self.assertRaisesRegex(module.VerificationError, "metadata"):
+            module.verify_kernel_boot_provenance(
+                unsigned, changed, record, release_certificate
+            )
+        changed = copy.deepcopy(signed)
+        changed["ramdisk_trailer_metadata"] = (
+            300608,
+            0o755,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            11,
+            0,
+        )
+        with self.assertRaisesRegex(module.VerificationError, "trailer"):
+            module.verify_kernel_boot_provenance(
+                unsigned, changed, record, release_certificate
+            )
+        changed = copy.deepcopy(signed)
+        changed["ramdisk_padding_size"] = 300
+        with self.assertRaisesRegex(module.VerificationError, "padding"):
             module.verify_kernel_boot_provenance(
                 unsigned, changed, record, release_certificate
             )
@@ -993,9 +1064,26 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     (output / "ramdisk").write_bytes(b"compressed-ramdisk")
                     (output / "dtb").write_bytes(b"dtb")
                     return (
-                        "kernel size: 6\nramdisk size: 18\n"
+                        "boot magic: ANDROID!\n"
+                        "kernel_size: 6\n"
+                        "kernel load address: 0x40080000\n"
+                        "ramdisk size: 18\n"
+                        "ramdisk load address: 0x47c80000\n"
+                        "second bootloader size: 0\n"
+                        "second bootloader load address: 0x00000000\n"
+                        "kernel tags load address: 0x4bc80000\n"
+                        "page size: 2048\n"
+                        "os version: 16.0.0\n"
+                        "os patch level: 2026-08\n"
                         "boot image header version: 2\n"
-                        "command line args: console=tty0\ndtb size: 3\n"
+                        "product name: \n"
+                        "command line args: console=tty0\n"
+                        "additional command line args: \n"
+                        "recovery dtbo size: 0\n"
+                        "recovery dtbo offset: 0x0000000000000000\n"
+                        "boot header size: 1660\n"
+                        "dtb size: 3\n"
+                        "dtb address: 0x000000004bc80000\n"
                     )
                 if tool == "lz4":
                     Path(command[-1]).write_bytes(ramdisk)
@@ -1014,13 +1102,18 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 b"prop.default",
                 evidence["ramdisk_entries"]["default.prop"]["data"],
             )
+            self.assertEqual(0o755, evidence["ramdisk_trailer_metadata"][1])
+            self.assertEqual(0, evidence["ramdisk_trailer_metadata"][6])
+            self.assertEqual(0, len(ramdisk) % 256)
             tools = [Path(command[0]).name for command in calls]
             self.assertEqual(["avbtool", "unpack_bootimg", "lz4"], tools)
             with self.assertRaisesRegex(module.VerificationError, "unsafe"):
                 module._parse_newc_ramdisk(
                     build_newc({"../escape": (stat.S_IFREG | 0o644, b"bad")})
                 )
-            with self.assertRaisesRegex(module.VerificationError, "trailer|truncated"):
+            with self.assertRaisesRegex(
+                module.VerificationError, "trailer|truncated|padding"
+            ):
                 module._parse_newc_ramdisk(ramdisk[:-20])
 
             empty = root / "empty.zip"
@@ -1028,6 +1121,38 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 pass
             with self.assertRaisesRegex(module.VerificationError, "boot"):
                 module.extract_boot_evidence(empty, root / "avbtool", runner=runner)
+
+    def test_newc_trailer_and_padding_are_canonical_and_fail_closed(self):
+        module = load_verifier()
+        entries = [("init", (stat.S_IFREG | 0o755, b"init"))]
+        ramdisk = build_newc(entries)
+        parsed = module._parse_newc_ramdisk(ramdisk)
+        self.assertEqual(b"init", parsed["entries"]["init"]["data"])
+        self.assertEqual(0o755, parsed["trailer_metadata"][1])
+        self.assertEqual(0, parsed["trailer_metadata"][6])
+        self.assertEqual((-parsed["trailer_end"]) % 256, parsed["padding_size"])
+        self.assertEqual(len(ramdisk), parsed["trailer_end"] + parsed["padding_size"])
+
+        noncanonical_trailer = bytearray(ramdisk)
+        trailer_offset = noncanonical_trailer.rfind(b"070701")
+        noncanonical_trailer[trailer_offset + 6 : trailer_offset + 14] = b"00000001"
+        crc_trailer = bytearray(ramdisk)
+        crc_trailer[trailer_offset : trailer_offset + 6] = b"070702"
+        invalid_archives = {
+            "nonzero trailer payload": build_newc(entries, trailer_data=b"x"),
+            "noncanonical trailer metadata": bytes(noncanonical_trailer),
+            "noncanonical trailer magic": bytes(crc_trailer),
+            "multiple trailer": ramdisk + build_newc([]),
+            "missing trailer": build_newc(entries, include_trailer=False),
+            "nonzero padding": ramdisk[:-1] + b"x",
+            "extra zero padding": ramdisk + b"\0",
+            "duplicate member": build_newc([entries[0], entries[0]]),
+        }
+        for label, archive in invalid_archives.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                module.VerificationError, "canonical|trailer|padding|duplicate"
+            ):
+                module._parse_newc_ramdisk(archive)
 
     def test_verifies_representative_apk_and_every_non_presigned_apex(self):
         module = load_verifier()
@@ -1936,11 +2061,26 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     (output / "ramdisk").write_bytes(compressed)
                     decompressed_ramdisks[str(output / "ramdisk")] = ramdisk
                     return (
-                        "kernel size: 6\n"
+                        "boot magic: ANDROID!\n"
+                        "kernel_size: 6\n"
+                        "kernel load address: 0x40080000\n"
                         f"ramdisk size: {len(compressed)}\n"
+                        "ramdisk load address: 0x47c80000\n"
+                        "second bootloader size: 0\n"
+                        "second bootloader load address: 0x00000000\n"
+                        "kernel tags load address: 0x4bc80000\n"
+                        "page size: 2048\n"
+                        "os version: 16.0.0\n"
+                        "os patch level: 2026-08\n"
                         "boot image header version: 2\n"
+                        "product name: \n"
                         "command line args: console=tty0\n"
+                        "additional command line args: \n"
+                        "recovery dtbo size: 0\n"
+                        "recovery dtbo offset: 0x0000000000000000\n"
+                        "boot header size: 1660\n"
                         "dtb size: 3\n"
+                        "dtb address: 0x000000004bc80000\n"
                     )
                 if tool == "lz4":
                     Path(command[-1]).write_bytes(
