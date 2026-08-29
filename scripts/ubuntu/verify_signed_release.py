@@ -154,6 +154,10 @@ class _AndroidToolchainSnapshot:
         self.android_root = android_root
         self.source_inventory = dict(files.sources)
         self.execution = execution
+        self.java_home = (
+            android_root / "prebuilts/jdk/jdk21/linux-x86"
+        )
+        self.apksigner_environment = _android_java_environment(self.java_home)
 
     def verify(self) -> None:
         self.execution.verify()
@@ -225,6 +229,19 @@ def _make_tree_writable(root: Path) -> None:
                 path.chmod(0o600)
 
 
+def _android_java_environment(java_home: Path) -> dict[str, str]:
+    java_home = Path(java_home)
+    environment = {
+        "JAVA_HOME": str(java_home),
+        "PATH": os.pathsep.join((str(java_home / "bin"), "/usr/bin", "/bin")),
+        "LC_ALL": "C.UTF-8",
+        "LANG": "C.UTF-8",
+    }
+    if temporary := os.environ.get("TMPDIR"):
+        environment["TMPDIR"] = temporary
+    return environment
+
+
 @contextmanager
 def snapshot_regular_files(paths: Mapping[str, Path]) -> Iterator[_FileSnapshot]:
     descriptors: dict[str, int] = {}
@@ -286,9 +303,11 @@ def snapshot_android_toolchain(android_root: Path) -> Iterator[_AndroidToolchain
         payload_scripts = root / "payload-scripts"
         host_tools.mkdir()
         payload_scripts.mkdir()
+        claimed_destinations: set[Path] = set()
         for label, snapshot_path in files.paths.items():
-            kind, name = label.split(":", 1)
-            destination = (host_tools if kind == "tool" else payload_scripts) / name
+            destination = _android_execution_destination(
+                root, label, claimed_destinations
+            )
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(snapshot_path, destination)
         _make_tree_read_only(root)
@@ -303,9 +322,40 @@ def snapshot_android_toolchain(android_root: Path) -> Iterator[_AndroidToolchain
             _make_tree_writable(root)
 
 
+def _android_execution_destination(
+    root: Path, label: str, claimed: set[Path]
+) -> Path:
+    try:
+        kind, name = label.split(":", 1)
+    except ValueError as error:
+        raise VerificationError("Android toolchain input label is invalid") from error
+    bases = {
+        "tool": Path(root) / "bin",
+        "framework": Path(root) / "framework",
+        "jdk": Path(root) / "jdk21",
+        "script": Path(root) / "payload-scripts",
+    }
+    parts = name.split("/")
+    if (
+        kind not in bases
+        or not name
+        or name.startswith("/")
+        or "\\" in name
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise VerificationError("Android toolchain input label is unsafe")
+    destination = bases[kind].joinpath(*parts)
+    if destination in claimed:
+        raise VerificationError("Android toolchain execution destination collision")
+    claimed.add(destination)
+    return destination
+
+
 def _android_toolchain_inputs(android_root: Path) -> dict[str, Path]:
     android_root = Path(android_root)
     source_tools = android_root / "out/host/linux-x86/bin"
+    source_framework = android_root / "out/host/linux-x86/framework"
+    source_java_home = android_root / "prebuilts/jdk/jdk21/linux-x86"
     source_scripts = android_root / "system/update_engine/scripts"
     inputs: dict[str, Path] = {}
     for name in ANDROID_TOOL_NAMES:
@@ -315,6 +365,29 @@ def _android_toolchain_inputs(android_root: Path) -> dict[str, Path]:
         if not path.is_file() or not os.access(path, os.X_OK):
             raise VerificationError(f"Android verification tool is unavailable or not executable: {name}")
         inputs[f"tool:{name}"] = path
+    if source_framework.is_symlink():
+        raise VerificationError("Android apksigner framework directory is a symlink")
+    if not source_framework.is_dir():
+        raise VerificationError("Android apksigner framework directory is unavailable")
+    apksigner_jar = source_framework / "apksigner.jar"
+    if apksigner_jar.is_symlink():
+        raise VerificationError("Android apksigner.jar is a symlink")
+    if not apksigner_jar.is_file():
+        raise VerificationError("Android apksigner.jar is unavailable")
+    inputs["framework:apksigner.jar"] = apksigner_jar
+    java_bin = source_java_home / "bin"
+    java = java_bin / "java"
+    if source_java_home.is_symlink() or java_bin.is_symlink():
+        raise VerificationError("Android JDK21 Java runtime path is a symlink")
+    if not source_java_home.is_dir() or not java_bin.is_dir():
+        raise VerificationError("Android JDK21 Java runtime is unavailable")
+    if java.is_symlink():
+        raise VerificationError("Android JDK21 Java executable is a symlink")
+    if not java.is_file():
+        raise VerificationError("Android JDK21 Java executable is unavailable")
+    if not os.access(java, os.X_OK):
+        raise VerificationError("Android JDK21 Java executable is not executable")
+    inputs["jdk:bin/java"] = java
     optional_sparse = source_tools / "simg2img"
     if optional_sparse.exists() or optional_sparse.is_symlink():
         if optional_sparse.is_symlink():
@@ -1030,7 +1103,11 @@ def verify_payload_properties(
 
 
 def _default_runner(
-    command: Sequence[str | Path], *, cwd: Path | None = None, timeout: int = 600
+    command: Sequence[str | Path],
+    *,
+    cwd: Path | None = None,
+    timeout: int = 600,
+    env: Mapping[str, str] | None = None,
 ) -> str:
     try:
         result = subprocess.run(
@@ -1040,6 +1117,7 @@ def _default_runner(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout,
+            env=None if env is None else dict(env),
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise VerificationError(f"verification command could not run: {Path(command[0]).name}") from error
@@ -1269,9 +1347,16 @@ def _certificate_fingerprint(
 
 
 def _apksigner_fingerprint(
-    package: Path, apksigner: Path, *, runner=_default_runner
+    package: Path,
+    apksigner: Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+    runner=_default_runner,
 ) -> str:
-    output = runner([apksigner, "verify", "--print-certs", package])
+    runner_options = {} if environment is None else {"env": environment}
+    output = runner(
+        [apksigner, "verify", "--print-certs", package], **runner_options
+    )
     matches = re.findall(
         r"certificate SHA-256 digest:\s*([0-9A-Fa-f]{64})", output, re.IGNORECASE
     )
@@ -1313,6 +1398,7 @@ def verify_package_signatures(
     public_keys: Path,
     host_tools: Path,
     *,
+    apksigner_environment: Mapping[str, str] | None = None,
     runner=_default_runner,
 ) -> dict[str, object]:
     """Verify installed packages against their exact destination key roles."""
@@ -1391,7 +1477,12 @@ def verify_package_signatures(
             if not certificate.is_file():
                 raise VerificationError(f"missing public certificate for APK role {role}")
             expected = _certificate_fingerprint(certificate, runner=runner)
-            actual = _apksigner_fingerprint(package, apksigner, runner=runner)
+            actual = _apksigner_fingerprint(
+                package,
+                apksigner,
+                environment=apksigner_environment,
+                runner=runner,
+            )
             if actual != expected:
                 raise VerificationError(f"APK signer fingerprint mismatch for {package_name}")
             apk_representatives.append(package_name)
@@ -1441,7 +1532,12 @@ def verify_package_signatures(
             if not certificate.is_file() or certificate.is_symlink():
                 raise VerificationError(f"missing APEX container public certificate for {name}")
             expected_container = _certificate_fingerprint(certificate, runner=runner)
-            actual_container = _apksigner_fingerprint(apex_path, apksigner, runner=runner)
+            actual_container = _apksigner_fingerprint(
+                apex_path,
+                apksigner,
+                environment=apksigner_environment,
+                runner=runner,
+            )
             if actual_container != expected_container:
                 raise VerificationError(f"APEX container fingerprint mismatch for {name}")
             payload_key = public_keys / f"{role}.avbpubkey"
@@ -1911,6 +2007,7 @@ def _verify_release_snapshotted(
         unsigned_plan,
         public_keys,
         host_tools,
+        apksigner_environment=args.apksigner_environment,
         runner=runner,
     )
     if package_evidence["presigned_apex"] != presigned:
@@ -2105,6 +2202,7 @@ def verify_release(
         snapshot_args.public_keys = public_snapshot
         snapshot_args.host_tools = toolchain.host_tools
         snapshot_args.payload_scripts = toolchain.payload_scripts
+        snapshot_args.apksigner_environment = toolchain.apksigner_environment
         result = _verify_release_snapshotted(
             snapshot_args,
             runner=runner,

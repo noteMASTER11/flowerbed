@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import struct
+import subprocess
 import tarfile
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -1178,7 +1179,11 @@ class SignedReleasePolicyTest(unittest.TestCase):
             root = Path(directory)
             android_root = root / "android"
             host_tools = android_root / "out/host/linux-x86/bin"
+            host_framework = android_root / "out/host/linux-x86/framework"
+            jdk_bin = android_root / "prebuilts/jdk/jdk21/linux-x86/bin"
             host_tools.mkdir(parents=True)
+            host_framework.mkdir(parents=True)
+            jdk_bin.mkdir(parents=True)
             for tool in (
                 "apksigner",
                 "deapexer",
@@ -1189,6 +1194,9 @@ class SignedReleasePolicyTest(unittest.TestCase):
             ):
                 (host_tools / tool).write_text("fixture\n", encoding="utf-8")
                 (host_tools / tool).chmod(0o755)
+            (host_framework / "apksigner.jar").write_bytes(b"jar-fixture")
+            (jdk_bin / "java").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (jdk_bin / "java").chmod(0o755)
             payload_info = android_root / "system/update_engine/scripts/payload_info.py"
             payload_info.parent.mkdir(parents=True)
             payload_info.write_text("# fixture\n", encoding="utf-8")
@@ -1373,8 +1381,9 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 encoding="utf-8",
             )
             commands = []
+            apksigner_environments = []
 
-            def runner(command, **_kwargs):
+            def runner(command, **kwargs):
                 command = tuple(str(item) for item in command)
                 commands.append(command)
                 tool = Path(command[0]).name
@@ -1396,6 +1405,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 if tool == "openssl":
                     return "sha256 Fingerprint=" + ":".join(["AB"] * 32) + "\n"
                 if tool == "apksigner":
+                    apksigner_environments.append(kwargs.get("env"))
                     return f"Signer #1 certificate SHA-256 digest: {fingerprint}\n"
                 if "-I" in command and "payload_info.py" in {Path(item).name for item in command}:
                     names = set(module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | {"md1img"}
@@ -1452,6 +1462,14 @@ class SignedReleasePolicyTest(unittest.TestCase):
             )
             self.assertEqual(result, json.loads(report.read_text(encoding="utf-8")))
             self.assertNotIn(str(root), report.read_text(encoding="utf-8"))
+            self.assertTrue(apksigner_environments)
+            for environment in apksigner_environments:
+                self.assertEqual(
+                    str(jdk_bin.parent), environment["JAVA_HOME"]
+                )
+                self.assertEqual(
+                    str(jdk_bin), environment["PATH"].split(os.pathsep)[0]
+                )
 
             (report).unlink()
             with zipfile.ZipFile(ota, "w") as archive:
@@ -1499,13 +1517,20 @@ class SignedReleasePolicyTest(unittest.TestCase):
             root = Path(directory)
             android = root / "android"
             tools = android / "out/host/linux-x86/bin"
+            framework = android / "out/host/linux-x86/framework"
+            jdk_bin = android / "prebuilts/jdk/jdk21/linux-x86/bin"
             scripts = android / "system/update_engine/scripts"
             tools.mkdir(parents=True)
+            framework.mkdir(parents=True)
+            jdk_bin.mkdir(parents=True)
             scripts.mkdir(parents=True)
             for name in module.ANDROID_TOOL_NAMES:
                 path = tools / name
                 path.write_bytes((name + "-original").encode())
                 path.chmod(0o755)
+            (framework / "apksigner.jar").write_bytes(b"apksigner-jar-original")
+            (jdk_bin / "java").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (jdk_bin / "java").chmod(0o755)
             (scripts / "payload_info.py").write_text("print('fixture')\n", encoding="utf-8")
             (scripts / "helper.py").write_text("VALUE = 'clean'\n", encoding="utf-8")
 
@@ -1522,6 +1547,19 @@ class SignedReleasePolicyTest(unittest.TestCase):
 
             (tools / "avbtool").write_bytes(b"avbtool-original")
             (tools / "avbtool").chmod(0o755)
+            with self.assertRaisesRegex(module.VerificationError, "changed"):
+                with module.snapshot_android_toolchain(android) as snapshot:
+                    self.assertEqual(
+                        b"apksigner-jar-original",
+                        (snapshot.root / "framework/apksigner.jar").read_bytes(),
+                    )
+                    (framework / "apksigner.jar").write_bytes(b"mutated")
+            (framework / "apksigner.jar").write_bytes(b"apksigner-jar-original")
+            with self.assertRaisesRegex(module.VerificationError, "changed"):
+                with module.snapshot_android_toolchain(android):
+                    (jdk_bin / "java").write_bytes(b"mutated-java")
+            (jdk_bin / "java").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (jdk_bin / "java").chmod(0o755)
             with self.assertRaisesRegex(module.VerificationError, "inventory changed"):
                 with module.snapshot_android_toolchain(android):
                     (scripts / "shadow.py").write_text(
@@ -1548,6 +1586,134 @@ class SignedReleasePolicyTest(unittest.TestCase):
             with self.assertRaisesRegex(module.VerificationError, "symlink"):
                 with module.snapshot_android_toolchain(android):
                     self.fail("symlinked Android tool must not be consumed")
+
+    def test_apksigner_snapshot_requires_safe_jar_and_preserves_launcher_layout(self):
+        module = load_verifier()
+
+        def make_fixture(root: Path, *, jar_kind: str, java_kind: str = "regular"):
+            android = root / "android"
+            tools = android / "out/host/linux-x86/bin"
+            framework = android / "out/host/linux-x86/framework"
+            jdk_bin = android / "prebuilts/jdk/jdk21/linux-x86/bin"
+            scripts = android / "system/update_engine/scripts"
+            tools.mkdir(parents=True)
+            if jar_kind == "parent-symlink":
+                outside_framework = root / "outside-framework"
+                outside_framework.mkdir()
+                (outside_framework / "apksigner.jar").write_bytes(b"outside")
+                os.symlink(outside_framework, framework)
+            else:
+                framework.mkdir(parents=True)
+            jdk_bin.mkdir(parents=True)
+            scripts.mkdir(parents=True)
+            for name in module.ANDROID_TOOL_NAMES:
+                path = tools / name
+                path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                path.chmod(0o755)
+            (tools / "apksigner").write_text(
+                "#!/bin/sh\n"
+                'jar="$(dirname "$0")/../framework/apksigner.jar"\n'
+                'test -r "$jar" || { echo "missing jar"; exit 9; }\n'
+                'exec java -jar "$jar" "$@"\n',
+                encoding="utf-8",
+            )
+            java = jdk_bin / "java"
+            if java_kind == "regular":
+                java.write_text(
+                    "#!/bin/sh\n"
+                    'printf "%s\\n" "$JAVA_HOME"\n'
+                    'printf "%s\\n" "$*"\n',
+                    encoding="utf-8",
+                )
+                java.chmod(0o755)
+            elif java_kind == "nonexec":
+                java.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                java.chmod(0o644)
+            elif java_kind == "symlink":
+                target = root / "outside-java"
+                target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                target.chmod(0o755)
+                os.symlink(target, java)
+            (scripts / "payload_info.py").write_text(
+                "print('fixture')\n", encoding="utf-8"
+            )
+            jar = framework / "apksigner.jar"
+            if jar_kind == "regular":
+                jar.write_bytes(b"jar-fixture")
+            elif jar_kind == "symlink":
+                target = root / "outside.jar"
+                target.write_bytes(b"outside")
+                os.symlink(target, jar)
+            return android
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            android = make_fixture(root, jar_kind="regular")
+            with module.snapshot_android_toolchain(android) as snapshot:
+                result = subprocess.run(
+                    [snapshot.host_tools / "apksigner", "verify"],
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    env=snapshot.apksigner_environment,
+                )
+                lines = result.stdout.splitlines()
+                self.assertEqual(
+                    android / "prebuilts/jdk/jdk21/linux-x86",
+                    Path(lines[0]),
+                )
+                self.assertIn("framework/apksigner.jar verify", lines[1])
+
+        for jar_kind, message in (
+            ("missing", "unavailable"),
+            ("symlink", "symlink"),
+            ("parent-symlink", "symlink"),
+        ):
+            with self.subTest(jar_kind=jar_kind), tempfile.TemporaryDirectory() as directory:
+                android = make_fixture(Path(directory), jar_kind=jar_kind)
+                with self.assertRaisesRegex(module.VerificationError, message):
+                    with module.snapshot_android_toolchain(android):
+                        self.fail("unsafe or missing apksigner.jar must not be consumed")
+
+        for java_kind, message in (
+            ("missing", "Java.*unavailable"),
+            ("symlink", "Java.*symlink"),
+            ("nonexec", "Java.*executable"),
+        ):
+            with self.subTest(java_kind=java_kind), tempfile.TemporaryDirectory() as directory:
+                android = make_fixture(
+                    Path(directory), jar_kind="regular", java_kind=java_kind
+                )
+                with self.assertRaisesRegex(module.VerificationError, message):
+                    with module.snapshot_android_toolchain(android):
+                        self.fail("unsafe or missing Android JDK21 java must not run")
+
+    def test_android_toolchain_execution_labels_reject_traversal_and_collisions(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            claimed: set[Path] = set()
+            self.assertEqual(
+                root / "framework/apksigner.jar",
+                module._android_execution_destination(
+                    root, "framework:apksigner.jar", claimed
+                ),
+            )
+            with self.assertRaisesRegex(module.VerificationError, "collision"):
+                module._android_execution_destination(
+                    root, "framework:apksigner.jar", claimed
+                )
+            for label in (
+                "unknown:file",
+                "tool:../framework/apksigner.jar",
+                "tool:/absolute",
+                r"tool:dir\file",
+                "script:dir//file",
+                "script:dir/./file",
+            ):
+                with self.subTest(label=label):
+                    with self.assertRaises(module.VerificationError):
+                        module._android_execution_destination(root, label, set())
 
     def test_isolated_python_tool_imports_only_from_snapshotted_root(self):
         module = load_verifier()
