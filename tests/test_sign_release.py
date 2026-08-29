@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -606,6 +607,77 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                     base_runner.container_material[f"{role}{suffix}"],
                     original_bytes,
                 )
+                self.assertFalse(paths.output_dir.exists())
+
+    def test_allows_zipwrite_metadata_round_trip_on_runtime_container_certificate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, secret = self.make_fixture(root)
+            base_runner = FakeReleaseRunner(paths.output_dir)
+
+            def zipwrite_runner(command, *, env):
+                if Path(command[0]).name == "sign_target_files_apks":
+                    runtime_key_dir = Path(command[command.index("-d") + 1])
+                    certificate = runtime_key_dir / "releasekey.x509.pem"
+                    original = certificate.stat(follow_symlinks=False)
+                    certificate.chmod(0o644)
+                    os.utime(
+                        certificate,
+                        ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000),
+                    )
+                    certificate.chmod(0o400)
+                    os.utime(
+                        certificate,
+                        ns=(original.st_atime_ns, original.st_mtime_ns),
+                    )
+                    restored = certificate.stat(follow_symlinks=False)
+                    self.assertEqual(stat.S_IMODE(restored.st_mode), 0o400)
+                    self.assertEqual(restored.st_mtime_ns, original.st_mtime_ns)
+                    self.assertNotEqual(restored.st_ctime_ns, original.st_ctime_ns)
+                base_runner(command, env=env)
+
+            published = self.sign_release(
+                paths,
+                runner=zipwrite_runner,
+                openssl_runner=FakeCryptoRunner(secret),
+            )
+
+            self.assertEqual(published, paths.output_dir)
+            self.assertTrue(paths.signed_target_files.is_file())
+
+    def test_rejects_runtime_container_snapshot_content_size_or_mode_change(self):
+        cases = ("content", "size", "mode")
+        for mutation in cases:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                paths, secret = self.make_fixture(root)
+                base_runner = FakeReleaseRunner(paths.output_dir)
+
+                def mutating_runner(command, *, env):
+                    if Path(command[0]).name == "sign_target_files_apks":
+                        runtime_key_dir = Path(command[command.index("-d") + 1])
+                        snapshot = runtime_key_dir / "releasekey.x509.pem"
+                        original = snapshot.read_bytes()
+                        if mutation == "mode":
+                            snapshot.chmod(0o444)
+                        else:
+                            snapshot.chmod(0o600)
+                            snapshot.write_bytes(
+                                (b"X" + original[1:])
+                                if mutation == "content"
+                                else original + b"X"
+                            )
+                            snapshot.chmod(0o400)
+                    base_runner(command, env=env)
+
+                with self.assertRaisesRegex(
+                    self.ReleaseSigningError, "container key snapshot.*changed"
+                ):
+                    self.sign_release(
+                        paths,
+                        runner=mutating_runner,
+                        openssl_runner=FakeCryptoRunner(secret),
+                    )
                 self.assertFalse(paths.output_dir.exists())
 
     def test_rejects_runtime_container_snapshot_replacement(self):

@@ -191,6 +191,24 @@ class _PinnedFile:
         if _identity_from_stat(named) != self.identity:
             raise ReleaseSigningError(f"{label} changed while signing")
 
+    def verify_runtime_snapshot(self, label: str) -> None:
+        try:
+            descriptor = os.fstat(self.descriptor)
+            named = self.source.stat(follow_symlinks=False)
+        except OSError as error:
+            raise ReleaseSigningError(f"{label} changed while signing") from error
+        for metadata in (descriptor, named):
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_dev != self.identity.device
+                or metadata.st_ino != self.identity.inode
+                or metadata.st_size != self.identity.size
+                or stat.S_IMODE(metadata.st_mode) != 0o400
+            ):
+                raise ReleaseSigningError(f"{label} changed while signing")
+        if _sha256_descriptor(self.descriptor) != self.sha256:
+            raise ReleaseSigningError(f"{label} changed while signing")
+
 
 @dataclass(frozen=True)
 class _TargetSnapshot:
@@ -235,7 +253,7 @@ class _ContainerKeysetSnapshot:
         for pinned in self.source_files:
             pinned.verify_named("container key source", verify_hash=True)
         for pinned in self.snapshot_files:
-            pinned.verify_named("container key snapshot", verify_hash=True)
+            pinned.verify_runtime_snapshot("container key snapshot")
 
 
 CommandRunner = Callable[..., None]
