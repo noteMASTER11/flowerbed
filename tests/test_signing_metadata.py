@@ -24,6 +24,10 @@ name="framework-res.apk" certificate="build/make/target/product/security/platfor
 name="Settings.apk" certificate="build/make/target/product/security/releasekey.x509.pem" private_key="build/make/target/product/security/releasekey.pk8"
 '''
 
+AOSP_PRESIGNED_APK = '''\
+name="AndroidXComposeStartupApp.apk" certificate="PRESIGNED" private_key="" partition="data"
+'''
+
 APEX_KEYS = '''\
 name="com.android.art.apex" public_key="build/make/target/product/security/com.android.art.avbpubkey" private_key="build/make/target/product/security/com.android.art.pem" container_certificate="build/make/target/product/security/platform.x509.pem" container_private_key="build/make/target/product/security/platform.pk8" partition="system"
 name="com.android.tzdata.apex" public_key="PRESIGNED" private_key="PRESIGNED" container_certificate="PRESIGNED" container_private_key="PRESIGNED" partition="system"
@@ -94,6 +98,25 @@ class SigningMetadataTest(unittest.TestCase):
         self.assertEqual(inventory.build_tags, frozenset({"test-keys"}))
         self.assertTrue(inventory.uses_test_build_tags)
 
+    def test_allows_empty_optional_properties_in_canonical_system_build_prop(self):
+        properties = (
+            REAL_SYSTEM_BUILD_PROP
+            + "ro.build.version.base_os=\n"
+            + "ro.wifi.channels=\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "lineage_fleur-target_files.zip"
+            write_target_files(
+                target_files,
+                misc_info=REAL_MISC_INFO,
+                system_build_prop=properties,
+            )
+
+            inventory = load_signing_inventory(target_files)
+
+        self.assertEqual(inventory.device, "fleur")
+        self.assertEqual(inventory.build_tags, frozenset({"test-keys"}))
+
     def test_rejects_missing_canonical_system_build_prop(self):
         with tempfile.TemporaryDirectory() as directory:
             target_files = Path(directory) / "lineage_fleur-target_files.zip"
@@ -145,6 +168,29 @@ class SigningMetadataTest(unittest.TestCase):
                 with self.assertRaisesRegex(SigningMetadataError, "device|build tags"):
                     load_signing_inventory(target_files)
 
+    def test_rejects_empty_canonical_build_identity_properties(self):
+        cases = {
+            "device": REAL_SYSTEM_BUILD_PROP.replace(
+                "ro.product.system.device=fleur",
+                "ro.product.system.device=",
+            ),
+            "build tags": REAL_SYSTEM_BUILD_PROP.replace(
+                "ro.build.tags=test-keys",
+                "ro.build.tags=",
+            ),
+        }
+        for label, properties in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                target_files = Path(directory) / "lineage_fleur-target_files.zip"
+                write_target_files(
+                    target_files,
+                    misc_info=REAL_MISC_INFO,
+                    system_build_prop=properties,
+                )
+
+                with self.assertRaisesRegex(SigningMetadataError, label):
+                    load_signing_inventory(target_files)
+
     def test_reads_required_member_directly(self):
         with tempfile.TemporaryDirectory() as directory:
             target_files = Path(directory) / "target-files.zip"
@@ -173,6 +219,28 @@ class SigningMetadataTest(unittest.TestCase):
             "build/make/target/product/security/testkey", inventory.source_key_stems
         )
         self.assertTrue(inventory.apexes[1].presigned)
+        self.assertNotIn("PRESIGNED", inventory.source_key_stems)
+
+    def test_loads_aosp_presigned_apk_with_empty_private_key_from_target_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "lineage_fleur-target_files.zip"
+            write_target_files(target_files, apkcerts=APK_CERTS + AOSP_PRESIGNED_APK)
+
+            inventory = load_signing_inventory(target_files)
+
+        certificate = next(
+            item
+            for item in inventory.apk_certificates
+            if item.name == "AndroidXComposeStartupApp.apk"
+        )
+        self.assertEqual(
+            certificate,
+            ApkCertificate(
+                "AndroidXComposeStartupApp.apk",
+                "PRESIGNED",
+                "PRESIGNED",
+            ),
+        )
         self.assertNotIn("PRESIGNED", inventory.source_key_stems)
 
     def test_rejects_missing_required_metadata_member(self):
@@ -241,6 +309,30 @@ class SigningMetadataTest(unittest.TestCase):
 
         with self.assertRaisesRegex(SigningMetadataError, "framework-res.apk"):
             _parse_apkcerts(mismatched)
+
+    def test_rejects_empty_private_key_for_non_presigned_apk(self):
+        for certificate in (
+            "build/make/target/product/security/platform.x509.pem",
+            "EXTERNAL",
+        ):
+            with self.subTest(certificate=certificate):
+                metadata = (
+                    f'name="App.apk" certificate="{certificate}" '
+                    'private_key="" partition="system"\n'
+                )
+
+                with self.assertRaisesRegex(SigningMetadataError, "private_key|empty field"):
+                    _parse_apkcerts(metadata)
+
+    def test_rejects_other_empty_required_apk_fields(self):
+        cases = (
+            'name="" certificate="PRESIGNED" private_key="" partition="data"\n',
+            'name="App.apk" certificate="" private_key="PRESIGNED" partition="data"\n',
+        )
+        for metadata in cases:
+            with self.subTest(metadata=metadata):
+                with self.assertRaisesRegex(SigningMetadataError, "empty field"):
+                    _parse_apkcerts(metadata)
 
     def test_rejects_apex_payload_key_stem_mismatch(self):
         mismatched = APEX_KEYS.replace("com.android.art.pem", "other.pem", 1)

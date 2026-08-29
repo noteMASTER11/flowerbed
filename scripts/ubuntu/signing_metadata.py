@@ -100,7 +100,11 @@ def _read_required_member(archive: ZipFile, member: str) -> str:
 
 def _parse_apkcerts(text: str) -> tuple[ApkCertificate, ...]:
     records: dict[str, ApkCertificate] = {}
-    for line_number, fields in _iter_metadata_records(text, "apkcerts.txt"):
+    for line_number, fields in _iter_metadata_records(
+        text,
+        "apkcerts.txt",
+        allowed_empty_fields=("private_key",),
+    ):
         values = _required_fields(
             fields,
             ("name", "certificate", "private_key"),
@@ -108,7 +112,15 @@ def _parse_apkcerts(text: str) -> tuple[ApkCertificate, ...]:
             line_number,
         )
         certificate = _normalize_key_stem(values["certificate"])
-        private_key = _normalize_key_stem(values["private_key"])
+        if not values["private_key"]:
+            if certificate != _PRESIGNED:
+                raise SigningMetadataError(
+                    f"apkcerts.txt line {line_number} has an empty private_key "
+                    f"for non-PRESIGNED APK {values['name']}"
+                )
+            private_key = _PRESIGNED
+        else:
+            private_key = _normalize_key_stem(values["private_key"])
         if certificate != private_key:
             raise SigningMetadataError(
                 f"apkcerts.txt line {line_number} has mismatched key stems for {values['name']}"
@@ -215,8 +227,10 @@ def _parse_property_file(text: str, filename: str) -> Mapping[str, str]:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
-        if not key or not value:
-            raise SigningMetadataError(f"{filename} line {line_number} has an empty property")
+        if not key:
+            raise SigningMetadataError(
+                f"{filename} line {line_number} has an empty property key"
+            )
         previous = values.get(key)
         if previous is not None and previous != value:
             raise SigningMetadataError(f"{filename} repeats {key} with conflicting values")
@@ -236,6 +250,10 @@ def _required_consistent_property(
         raise SigningMetadataError(
             f"SYSTEM/build.prop is missing canonical {label} property {primary}"
         ) from error
+    if not value:
+        raise SigningMetadataError(
+            f"SYSTEM/build.prop has empty canonical {label} property {primary}"
+        )
     conflicting = [name for name in aliases if name in properties and properties[name] != value]
     if conflicting:
         raise SigningMetadataError(f"SYSTEM/build.prop has ambiguous {label}")
@@ -332,7 +350,12 @@ def _assemble_inventory(
     )
 
 
-def _iter_metadata_records(text: str, filename: str):
+def _iter_metadata_records(
+    text: str,
+    filename: str,
+    *,
+    allowed_empty_fields: tuple[str, ...] = (),
+):
     for line_number, line in _iter_content_lines(text):
         try:
             tokens = shlex.split(line, comments=False, posix=True)
@@ -345,7 +368,7 @@ def _iter_metadata_records(text: str, filename: str):
                     f"{filename} line {line_number} contains a non key=value field"
                 )
             key, value = token.split("=", 1)
-            if not key or not value:
+            if not key or (not value and key not in allowed_empty_fields):
                 raise SigningMetadataError(
                     f"{filename} line {line_number} contains an empty field"
                 )
