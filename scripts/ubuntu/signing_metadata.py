@@ -74,11 +74,14 @@ def load_signing_inventory(target_files: Path) -> SigningInventory:
 
 
 def _read_required_member(archive: ZipFile, member: str) -> str:
+    members = [entry for entry in archive.infolist() if entry.filename == member]
+    if len(members) != 1:
+        raise SigningMetadataError(
+            f"target-files must contain exactly one required member {member}; found {len(members)}"
+        )
     try:
-        with archive.open(member) as source:
+        with archive.open(members[0]) as source:
             return source.read().decode("utf-8")
-    except KeyError as error:
-        raise SigningMetadataError(f"target-files is missing required member {member}") from error
     except UnicodeDecodeError as error:
         raise SigningMetadataError(f"target-files member {member} is not UTF-8") from error
 
@@ -92,11 +95,13 @@ def _parse_apkcerts(text: str) -> tuple[ApkCertificate, ...]:
             "apkcerts.txt",
             line_number,
         )
-        record = ApkCertificate(
-            name=values["name"],
-            certificate=_normalize_key_stem(values["certificate"]),
-            private_key=_normalize_key_stem(values["private_key"]),
-        )
+        certificate = _normalize_key_stem(values["certificate"])
+        private_key = _normalize_key_stem(values["private_key"])
+        if certificate != private_key:
+            raise SigningMetadataError(
+                f"apkcerts.txt line {line_number} has mismatched key stems for {values['name']}"
+            )
+        record = ApkCertificate(values["name"], certificate, private_key)
         _insert_record(records, record.name, record, "APK certificate")
     return tuple(records[name] for name in sorted(records))
 
@@ -128,12 +133,24 @@ def _parse_apexkeys(text: str) -> tuple[ApexKey, ...]:
             raise SigningMetadataError(
                 f"apexkeys.txt line {line_number} mixes PRESIGNED and key paths"
             )
+        public_key = _normalize_key_stem(values["public_key"])
+        private_key = _normalize_key_stem(values["private_key"])
+        container_certificate = _normalize_key_stem(values["container_certificate"])
+        container_private_key = _normalize_key_stem(values["container_private_key"])
+        if not presigned and public_key != private_key:
+            raise SigningMetadataError(
+                f"apexkeys.txt line {line_number} has mismatched payload key stems for {values['name']}"
+            )
+        if not presigned and container_certificate != container_private_key:
+            raise SigningMetadataError(
+                f"apexkeys.txt line {line_number} has mismatched container key stems for {values['name']}"
+            )
         record = ApexKey(
             name=values["name"],
-            public_key=_normalize_key_stem(values["public_key"]),
-            private_key=_normalize_key_stem(values["private_key"]),
-            container_certificate=_normalize_key_stem(values["container_certificate"]),
-            container_private_key=_normalize_key_stem(values["container_private_key"]),
+            public_key=public_key,
+            private_key=private_key,
+            container_certificate=container_certificate,
+            container_private_key=container_private_key,
             partition=values["partition"],
             presigned=presigned,
         )
@@ -159,17 +176,35 @@ def _parse_misc_info(text: str) -> Mapping[str, str]:
 
 
 def _parse_avb_keys(misc_info: Mapping[str, str]) -> tuple[AvbPartitionKey, ...]:
-    records: list[AvbPartitionKey] = []
-    for key, source_key in misc_info.items():
-        if not key.startswith("avb_") or not key.endswith("_key_path"):
+    avb_fields: dict[str, dict[str, str]] = {}
+    for key, value in misc_info.items():
+        if not key.startswith("avb_"):
             continue
-        partition = key[len("avb_") : -len("_key_path")]
+        if key.endswith("_key_path"):
+            partition = key[len("avb_") : -len("_key_path")]
+            field = "key_path"
+        elif key.endswith("_algorithm"):
+            partition = key[len("avb_") : -len("_algorithm")]
+            field = "algorithm"
+        else:
+            continue
         if not partition:
-            raise SigningMetadataError(f"invalid AVB key metadata name {key}")
-        algorithm_key = f"avb_{partition}_algorithm"
-        algorithm = misc_info.get(algorithm_key)
-        if algorithm is None:
-            raise SigningMetadataError(f"missing {algorithm_key} for AVB partition {partition}")
+            raise SigningMetadataError(f"invalid AVB metadata name {key}")
+        avb_fields.setdefault(partition, {})[field] = value
+
+    for partition in sorted(avb_fields):
+        fields = avb_fields[partition]
+        missing = {"key_path", "algorithm"} - fields.keys()
+        if missing:
+            raise SigningMetadataError(
+                f"AVB metadata for avb_{partition} is missing {', '.join(sorted(missing))}"
+            )
+
+    records: list[AvbPartitionKey] = []
+    for partition in sorted(avb_fields):
+        fields = avb_fields[partition]
+        source_key = fields["key_path"]
+        algorithm = fields["algorithm"]
         if algorithm != _SUPPORTED_AVB_ALGORITHM:
             raise SigningMetadataError(
                 f"unsupported AVB algorithm {algorithm} for partition {partition}"

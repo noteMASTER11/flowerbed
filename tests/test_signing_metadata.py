@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+import warnings
 import zipfile
 
 from scripts.ubuntu.signing_metadata import (
@@ -97,6 +98,22 @@ class SigningMetadataTest(unittest.TestCase):
             with self.assertRaisesRegex(SigningMetadataError, "META/apexkeys.txt"):
                 load_signing_inventory(target_files)
 
+    def test_rejects_duplicate_required_metadata_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "target-files.zip"
+            write_target_files(target_files)
+            with zipfile.ZipFile(target_files, "a") as archive:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    archive.writestr(
+                        "META/apkcerts.txt",
+                        'name="other.apk" certificate="other.x509.pem" '
+                        'private_key="other.pk8"\n',
+                    )
+
+            with self.assertRaisesRegex(SigningMetadataError, "META/apkcerts.txt"):
+                load_signing_inventory(target_files)
+
     def test_rejects_conflicting_duplicate_apex_name(self):
         duplicate = APEX_KEYS + (
             'name="com.android.art.apex" public_key="other.avbpubkey" '
@@ -118,6 +135,39 @@ class SigningMetadataTest(unittest.TestCase):
 
             with self.assertRaisesRegex(SigningMetadataError, "SHA256_RSA2048"):
                 load_signing_inventory(target_files)
+
+    def test_rejects_orphan_avb_algorithm_before_accepting_algorithms(self):
+        orphaned = MISC_INFO + "avb_vendor_algorithm=SHA256_RSA2048\n"
+
+        with self.assertRaisesRegex(SigningMetadataError, "avb_vendor"):
+            _parse_avb_keys(_parse_misc_info(orphaned))
+
+    def test_rejects_orphan_avb_key_path(self):
+        orphaned = (
+            MISC_INFO
+            + "avb_vendor_key_path=build/make/target/product/security/testkey.pem\n"
+        )
+
+        with self.assertRaisesRegex(SigningMetadataError, "avb_vendor"):
+            _parse_avb_keys(_parse_misc_info(orphaned))
+
+    def test_rejects_apk_certificate_and_private_key_stem_mismatch(self):
+        mismatched = APK_CERTS.replace("platform.pk8", "releasekey.pk8", 1)
+
+        with self.assertRaisesRegex(SigningMetadataError, "framework-res.apk"):
+            _parse_apkcerts(mismatched)
+
+    def test_rejects_apex_payload_key_stem_mismatch(self):
+        mismatched = APEX_KEYS.replace("com.android.art.pem", "other.pem", 1)
+
+        with self.assertRaisesRegex(SigningMetadataError, "com.android.art.apex"):
+            _parse_apexkeys(mismatched)
+
+    def test_rejects_apex_container_key_stem_mismatch(self):
+        mismatched = APEX_KEYS.replace("platform.pk8", "other.pk8", 1)
+
+        with self.assertRaisesRegex(SigningMetadataError, "com.android.art.apex"):
+            _parse_apexkeys(mismatched)
 
     def test_parses_quoted_apk_and_apex_records(self):
         certificates = _parse_apkcerts(APK_CERTS)
