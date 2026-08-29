@@ -85,6 +85,10 @@ def write_target_files(
     misc_info: str = MISC_INFO,
     otakeys: str = "\n",
 ) -> None:
+    unsigned_otacerts = io.BytesIO()
+    with zipfile.ZipFile(unsigned_otacerts, "w") as archive:
+        archive.writestr("lineage.x509.pem", b"lineage-certificate")
+        archive.writestr("testkey.x509.pem", b"test-certificate")
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("META/apkcerts.txt", APK_CERTS)
         archive.writestr("META/apexkeys.txt", APEX_KEYS)
@@ -92,6 +96,11 @@ def write_target_files(
         archive.writestr("META/otakeys.txt", otakeys)
         archive.writestr("SYSTEM/build.prop", system_build_prop)
         archive.writestr("IMAGES/boot.img", b"fixed-kernel-boot")
+        for name in (
+            "BOOT/RAMDISK/system/etc/security/otacerts.zip",
+            "SYSTEM/etc/security/otacerts.zip",
+        ):
+            archive.writestr(name, unsigned_otacerts.getvalue())
         plat_signers = b"".join(
             b'<signer signature="'
             + fixture_der(role).hex().encode()
@@ -330,6 +339,7 @@ class FakeReleaseRunner:
         self.container_material = {}
         self.config_bytes = None
         self.password_entry_paths = ()
+        self.working_directories = []
 
     def _record_container_stem(self, stem: Path) -> None:
         for suffix in (".pk8", ".x509.pem"):
@@ -342,6 +352,7 @@ class FakeReleaseRunner:
         if self.final_output.exists():
             raise AssertionError("final output published before all commands completed")
         self.calls.append((command, dict(env)))
+        self.working_directories.append(Path.cwd())
         if tool == "sign_target_files_apks":
             self.signing_input_bytes = Path(command[-2]).read_bytes()
             with zipfile.ZipFile(Path(command[-2])) as signing_input:
@@ -376,9 +387,18 @@ class FakeReleaseRunner:
         output.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(output, "w") as archive:
             if tool == "sign_target_files_apks":
+                canonical_otacerts = io.BytesIO()
+                with zipfile.ZipFile(canonical_otacerts, "w") as trust_archive:
+                    trust_archive.writestr(
+                        "releasekey.x509.pem",
+                        self.container_material["releasekey.x509.pem"],
+                    )
                 with zipfile.ZipFile(Path(command[-2])) as signing_input:
                     for member in signing_input.infolist():
-                        archive.writestr(member, signing_input.read(member))
+                        payload = signing_input.read(member)
+                        if member.filename.endswith("/otacerts.zip"):
+                            payload = canonical_otacerts.getvalue()
+                        archive.writestr(member, payload)
             elif tool == "ota_from_target_files":
                 archive.writestr(
                     "META-INF/com/android/metadata",
@@ -408,6 +428,28 @@ class PolicyMutatingReleaseRunner(FakeReleaseRunner):
                         fixture_der("platform").hex().encode(),
                         1,
                     )
+                archive.writestr(member, payload)
+
+
+class OtaCertMutatingReleaseRunner(FakeReleaseRunner):
+    def __call__(self, command, *, env):
+        super().__call__(command, env=env)
+        command = tuple(str(item) for item in command)
+        if Path(command[0]).name != "sign_target_files_apks":
+            return
+        output = Path(command[-1])
+        with zipfile.ZipFile(output) as archive:
+            entries = [(member, archive.read(member)) for member in archive.infolist()]
+        unsafe_otacerts = io.BytesIO()
+        with zipfile.ZipFile(unsafe_otacerts, "w") as trust_archive:
+            trust_archive.writestr(
+                "proc/1/fd/7/releasekey.x509.pem",
+                self.container_material["releasekey.x509.pem"],
+            )
+        with zipfile.ZipFile(output, "w") as archive:
+            for member, payload in entries:
+                if member.filename == "SYSTEM/etc/security/otacerts.zip":
+                    payload = unsafe_otacerts.getvalue()
                 archive.writestr(member, payload)
 
 
@@ -547,9 +589,11 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                 )
             self.assertTrue(sign_command[-2].startswith(f"/proc/{os.getpid()}/fd/"))
             runtime_key_dir = Path(sign_command[sign_command.index("-d") + 1])
-            self.assertTrue(
-                str(runtime_key_dir).startswith(f"/proc/{os.getpid()}/fd/")
+            self.assertEqual(Path("."), runtime_key_dir)
+            self.assertEqual(
+                "container-keys", tool_runner.working_directories[0].name
             )
+            self.assertNotEqual(paths.keys_dir, tool_runner.working_directories[0])
             self.assertNotEqual(runtime_key_dir, paths.keys_dir)
             self.assertNotIn(str(paths.keys_dir), "\n".join(sign_command))
             self.assertTrue(
@@ -564,7 +608,7 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             )
 
             expected_runtime_stems = {
-                str(runtime_key_dir / role)
+                role
                 for role in (
                     *MAC_ROLES,
                     "releasekey",
@@ -572,6 +616,7 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                     "com.android.art",
                 )
             }
+            expected_runtime_stems.add("./releasekey")
             self.assertEqual(set(tool_runner.password_entry_paths), expected_runtime_stems)
             self.assertEqual(
                 (paths.public_keys_dir / "platform.x509.pem").read_bytes(),
@@ -603,6 +648,20 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                 signed_policy = signed.read(
                     "SYSTEM/etc/selinux/plat_mac_permissions.xml"
                 )
+                for trust_name in (
+                    "BOOT/RAMDISK/system/etc/security/otacerts.zip",
+                    "SYSTEM/etc/security/otacerts.zip",
+                ):
+                    with zipfile.ZipFile(
+                        io.BytesIO(signed.read(trust_name))
+                    ) as trust_archive:
+                        self.assertEqual(
+                            ["releasekey.x509.pem"], trust_archive.namelist()
+                        )
+                        self.assertEqual(
+                            (paths.public_keys_dir / "releasekey.x509.pem").read_bytes(),
+                            trust_archive.read("releasekey.x509.pem"),
+                        )
             for role in MAC_ROLES:
                 self.assertIn(fixture_der(role).hex().encode(), unsigned_policy)
                 self.assertNotIn(fixture_der(role).hex().encode(), prepared_policy)
@@ -623,6 +682,27 @@ class ReleaseOrchestrationTest(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 self.ReleaseSigningError, "signed SELinux signer policy"
+            ):
+                self.sign_release(
+                    paths,
+                    runner=runner,
+                    openssl_runner=FakeCryptoRunner(secret),
+                )
+
+            self.assertEqual(
+                ["sign_target_files_apks"],
+                [Path(call[0][0]).name for call in runner.calls],
+            )
+            self.assertFalse(paths.output_dir.exists())
+
+    def test_rejects_unsafe_nested_otacerts_before_ota_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, secret = self.make_fixture(root)
+            runner = OtaCertMutatingReleaseRunner(paths.output_dir)
+
+            with self.assertRaisesRegex(
+                self.ReleaseSigningError, "signed OTA certificate inventory"
             ):
                 self.sign_release(
                     paths,
@@ -1329,13 +1409,11 @@ class SigningCommandTest(unittest.TestCase):
         self.assertIn("--avb_boot_extra_args", sign)
         self.assertIn(f"--signing_helper={SIGNING_HELPER}", sign)
         self.assertIn(
-            "build/make/target/product/security/platform="
-            + str(paths.keys_dir / "platform"),
+            "build/make/target/product/security/platform=platform",
             sign,
         )
         self.assertIn(
-            "cts/hostsidetests/compilation/certs/testkey="
-            + str(paths.keys_dir / "testkey-f88799ce31c1"),
+            "cts/hostsidetests/compilation/certs/testkey=testkey-f88799ce31c1",
             sign,
         )
         self.assertFalse(
@@ -1345,7 +1423,7 @@ class SigningCommandTest(unittest.TestCase):
             )
         )
         self.assertIn(
-            "com.android.art.apex=" + str(paths.keys_dir / "com.android.art"),
+            "com.android.art.apex=com.android.art",
             sign,
         )
         self.assertIn(
@@ -1414,7 +1492,7 @@ class SigningCommandTest(unittest.TestCase):
         self.assertEqual(tuple(private_environment["PATH"].split(os.pathsep)), expected)
         self.assertEqual(tuple(public_environment["PATH"].split(os.pathsep)), expected)
 
-    def test_maps_fleur_extra_recovery_key_to_releasekey(self):
+    def test_removes_redundant_fleur_extra_recovery_key_mapping(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target_files = root / "lineage_fleur-target_files.zip"
@@ -1446,9 +1524,11 @@ class SigningCommandTest(unittest.TestCase):
             "vendor/lineage/build/target/product/security/lineage="
             + str(paths.keys_dir / "releasekey")
         )
-        self.assertTrue(
+        self.assertFalse(
             any(sign[index : index + 2] == ["-k", expected] for index in range(len(sign) - 1))
         )
+        self.assertEqual(".", sign[sign.index("-d") + 1])
+        self.assertEqual("releasekey", commands.ota_from_target_files[2])
 
     def test_maps_nonblank_otakeys_source_to_releasekey(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1475,7 +1555,7 @@ class SigningCommandTest(unittest.TestCase):
 
         sign = list(commands.sign_target_files)
         expected = "vendor/custom/security/ota=" + str(paths.keys_dir / "releasekey")
-        self.assertTrue(
+        self.assertFalse(
             any(sign[index : index + 2] == ["-k", expected] for index in range(len(sign) - 1))
         )
 
@@ -1525,7 +1605,7 @@ class SigningCommandTest(unittest.TestCase):
 
         suffix = hashlib.sha256(b"source/com.android.art").hexdigest()[:12]
         self.assertIn(
-            f"source/com.android.art=/tmp/keys/com.android.art-{suffix}",
+            f"source/com.android.art=com.android.art-{suffix}",
             commands.sign_target_files,
         )
 

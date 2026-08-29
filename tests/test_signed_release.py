@@ -458,15 +458,8 @@ class SignedReleasePolicyTest(unittest.TestCase):
             archive.writestr("lineage.x509.pem", b"lineage-certificate")
             archive.writestr("testkey.x509.pem", b"test-certificate")
         signed_otacerts = io.BytesIO()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            with zipfile.ZipFile(signed_otacerts, "w") as archive:
-                archive.writestr(
-                    "proc/fixture/fd/7/releasekey.x509.pem", release_certificate
-                )
-                archive.writestr(
-                    "proc/fixture/fd/7/releasekey.x509.pem", release_certificate
-                )
+        with zipfile.ZipFile(signed_otacerts, "w") as archive:
+            archive.writestr("releasekey.x509.pem", release_certificate)
 
         metadata = (1, stat.S_IFREG | 0o644, 0, 0, 1, 0, 0, 0, 0, 0, 0)
 
@@ -697,6 +690,77 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 invalid_record,
                 release_certificate,
             )
+
+    def test_target_files_otacerts_require_exact_safe_unique_release_certificate(self):
+        module = load_verifier()
+        release_certificate = b"release-certificate"
+
+        def nested(*entries):
+            payload = io.BytesIO()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(payload, "w") as archive:
+                    for name, value in entries:
+                        archive.writestr(name, value)
+            return payload.getvalue()
+
+        members = {
+            "BOOT/RAMDISK/system/etc/security/otacerts.zip": nested(
+                ("releasekey.x509.pem", release_certificate)
+            ),
+            "SYSTEM/etc/security/otacerts.zip": nested(
+                ("releasekey.x509.pem", release_certificate)
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "signed.zip"
+            write_zip_entries(target_files, members)
+            evidence = module.verify_target_files_otacerts(
+                target_files, release_certificate
+            )
+            self.assertEqual(set(members), set(evidence))
+
+            attacks = {
+                "duplicate": nested(
+                    ("releasekey.x509.pem", release_certificate),
+                    ("releasekey.x509.pem", release_certificate),
+                ),
+                "proc path": nested(
+                    ("proc/1/fd/7/releasekey.x509.pem", release_certificate)
+                ),
+                "traversal": nested(
+                    ("../releasekey.x509.pem", release_certificate)
+                ),
+                "absolute": nested(
+                    ("/releasekey.x509.pem", release_certificate)
+                ),
+                "wrong certificate": nested(("releasekey.x509.pem", b"wrong")),
+            }
+            for label, payload in attacks.items():
+                changed = dict(members)
+                changed["SYSTEM/etc/security/otacerts.zip"] = payload
+                write_zip_entries(target_files, changed)
+                with self.subTest(label=label), self.assertRaises(
+                    module.VerificationError
+                ):
+                    module.verify_target_files_otacerts(
+                        target_files, release_certificate
+                    )
+
+            with zipfile.ZipFile(target_files, "w") as archive:
+                archive.writestr(
+                    "BOOT/RAMDISK/system/etc/security/otacerts.zip",
+                    members["BOOT/RAMDISK/system/etc/security/otacerts.zip"],
+                )
+                write_zip_symlink(
+                    archive,
+                    "SYSTEM/etc/security/otacerts.zip",
+                    members["SYSTEM/etc/security/otacerts.zip"],
+                )
+            with self.assertRaises(module.VerificationError):
+                module.verify_target_files_otacerts(
+                    target_files, release_certificate
+                )
 
     def test_target_files_relationship_requires_same_partitions_and_firmware(self):
         module = load_verifier()
@@ -2272,6 +2336,16 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 (public / f"avb_{partition}.public.pem").write_text(
                     f"pem-{partition}", encoding="utf-8"
                 )
+            release_certificate_bytes = (public / "releasekey.x509.pem").read_bytes()
+            unsigned_otacerts = io.BytesIO()
+            with zipfile.ZipFile(unsigned_otacerts, "w") as archive:
+                archive.writestr("lineage.x509.pem", b"lineage")
+                archive.writestr("testkey.x509.pem", b"testkey")
+            signed_otacerts = io.BytesIO()
+            with zipfile.ZipFile(signed_otacerts, "w") as archive:
+                archive.writestr(
+                    "releasekey.x509.pem", release_certificate_bytes
+                )
 
             apex_buffer = io.BytesIO()
             with zipfile.ZipFile(apex_buffer, "w") as apex:
@@ -2362,6 +2436,16 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         "BOOT/RAMDISK/adb_keys",
                         b"/product/etc/security/adb_keys",
                     )
+                    trust_payload = (
+                        unsigned_otacerts.getvalue()
+                        if path == unsigned
+                        else signed_otacerts.getvalue()
+                    )
+                    for trust_name in (
+                        "BOOT/RAMDISK/system/etc/security/otacerts.zip",
+                        "SYSTEM/etc/security/otacerts.zip",
+                    ):
+                        archive.writestr(trust_name, trust_payload)
 
             ota = root / "lineage-SIGNED-fleur.zip"
             with zipfile.ZipFile(ota, "w") as archive:
@@ -2475,23 +2559,6 @@ class SignedReleasePolicyTest(unittest.TestCase):
             )
             commands = []
             apksigner_environments = []
-            release_certificate_bytes = (public / "releasekey.x509.pem").read_bytes()
-            unsigned_otacerts = io.BytesIO()
-            with zipfile.ZipFile(unsigned_otacerts, "w") as archive:
-                archive.writestr("lineage.x509.pem", b"lineage")
-                archive.writestr("testkey.x509.pem", b"testkey")
-            signed_otacerts = io.BytesIO()
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                with zipfile.ZipFile(signed_otacerts, "w") as archive:
-                    archive.writestr(
-                        "proc/fixture/fd/7/releasekey.x509.pem",
-                        release_certificate_bytes,
-                    )
-                    archive.writestr(
-                        "proc/fixture/fd/7/releasekey.x509.pem",
-                        release_certificate_bytes,
-                    )
             unsigned_ramdisk = build_newc(
                 {
                     "init": (stat.S_IFREG | 0o755, b"init"),

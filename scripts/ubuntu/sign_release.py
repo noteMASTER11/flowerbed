@@ -44,6 +44,7 @@ try:
         mac_permissions_documents_from_archive,
         rewrite_mac_permissions,
         rewrite_target_files_mac_permissions,
+        validate_target_files_otacerts,
     )
     from scripts.ubuntu.signing_metadata import SigningInventory, load_signing_inventory
 except ModuleNotFoundError:  # Direct execution from scripts/ubuntu.
@@ -57,6 +58,7 @@ except ModuleNotFoundError:  # Direct execution from scripts/ubuntu.
         mac_permissions_documents_from_archive,
         rewrite_mac_permissions,
         rewrite_target_files_mac_permissions,
+        validate_target_files_otacerts,
     )
     from signing_metadata import SigningInventory, load_signing_inventory
 
@@ -294,25 +296,28 @@ def build_signing_commands(
         str(paths.host_tools / "sign_target_files_apks"),
         "-o",
         "-d",
-        str(paths.keys_dir),
+        ".",
         "--tag_changes",
         "-test-keys,+release-keys",
     ]
 
     for mapping in plan.android_mappings:
-        if mapping.source_stem == "build/make/target/product/security/testkey":
+        if (
+            mapping.source_stem == "build/make/target/product/security/testkey"
+            or mapping.source_stem in inventory.extra_ota_key_stems
+        ):
             continue
         command.extend(
             (
                 "-k",
-                f"{mapping.source_stem}={paths.keys_dir / mapping.destination_role}",
+                f"{mapping.source_stem}={mapping.destination_role}",
             )
         )
 
     non_presigned_apexes = tuple(apex for apex in inventory.apexes if not apex.presigned)
     for apex in non_presigned_apexes:
         role = _apex_role(apex.name)
-        command.extend(("--extra_apks", f"{apex.name}={paths.keys_dir / role}"))
+        command.extend(("--extra_apks", f"{apex.name}={role}"))
         command.extend(
             (
                 "--extra_apex_payload_key",
@@ -345,7 +350,7 @@ def build_signing_commands(
     ota = (
         str(paths.host_tools / "ota_from_target_files"),
         "-k",
-        str(paths.keys_dir / "releasekey"),
+        "releasekey",
         "--block",
         "--backup=true",
         str(paths.signed_target_files),
@@ -566,6 +571,7 @@ def sign_release(
                                 commands.sign_target_files,
                                 private_environment,
                                 runner,
+                                working_directory=container_snapshot.command_directory,
                             )
                             prepared_target_pin.verify_named(
                                 "prepared target-files", verify_hash=True
@@ -589,10 +595,16 @@ def sign_release(
                                 prepared_target_pin.proc_path,
                                 staging_paths.signed_target_files,
                             )
+                            _validate_signed_ota_certificates(
+                                staging_paths.signed_target_files,
+                                container_snapshot.command_directory
+                                / "releasekey.x509.pem",
+                            )
                             _run_release_tool(
                                 commands.ota_from_target_files,
                                 private_environment,
                                 runner,
+                                working_directory=container_snapshot.command_directory,
                             )
                             container_snapshot.verify()
                             pinned_passwords.verify_named(
@@ -1290,7 +1302,9 @@ def _write_runtime_password_file(
                 persistent_keys_dir / "passwords",
                 str(persistent_keys_dir / role),
             )
-            lines.append(f"[[[ {password} ]]] {snapshot.command_directory / role}\n")
+            lines.append(f"[[[ {password} ]]] {role}\n")
+            if role == "releasekey":
+                lines.append(f"[[[ {password} ]]] ./releasekey\n")
             password = ""
         payload = "".join(lines).encode("utf-8")
         _write_private_bytes(path, payload, "runtime password file")
@@ -1328,11 +1342,36 @@ def _run_release_tool(
     command: Sequence[str],
     environment: Mapping[str, str],
     runner: CommandRunner,
+    *,
+    working_directory: Path | None = None,
 ) -> None:
+    original_directory = -1
+    command_directory = -1
     try:
+        if working_directory is not None:
+            original_directory = os.open(
+                ".",
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            command_directory = os.open(
+                working_directory,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            os.fchdir(command_directory)
         runner(tuple(command), env=dict(environment))
     except (OSError, subprocess.SubprocessError) as error:
         raise ReleaseSigningError(f"{Path(command[0]).name} failed") from error
+    finally:
+        if original_directory >= 0:
+            os.fchdir(original_directory)
+        if command_directory >= 0:
+            os.close(command_directory)
+        if original_directory >= 0:
+            os.close(original_directory)
 
 
 def _inspect_zip(
@@ -1430,6 +1469,19 @@ def _validate_signed_selinux_policy(prepared: Path, signed: Path) -> None:
         raise ReleaseSigningError(
             "signed SELinux signer policy differs from prepared target-files"
         )
+
+
+def _validate_signed_ota_certificates(
+    signed_target_files: Path, release_certificate: Path
+) -> None:
+    try:
+        certificate = release_certificate.read_bytes()
+        with ZipFile(signed_target_files) as archive:
+            validate_target_files_otacerts(archive, certificate)
+    except (OSError, BadZipFile, MacPermissionsError) as error:
+        raise ReleaseSigningError(
+            f"signed OTA certificate inventory is invalid: {error}"
+        ) from error
 
 
 def _validate_payload_ota(path: Path) -> None:

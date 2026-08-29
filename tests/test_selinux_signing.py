@@ -247,7 +247,15 @@ class SelinuxSigningTest(unittest.TestCase):
             unsigned = root / "unsigned.zip"
             prepared = root / "prepared.zip"
             with zipfile.ZipFile(unsigned, "w") as archive:
-                archive.writestr("META/misc_info.txt", b"unchanged")
+                archive.writestr(
+                    "META/misc_info.txt",
+                    b"unchanged=value\n"
+                    b"extra_recovery_keys=vendor/lineage/security/lineage\n"
+                    b"extra_ota_keys=vendor/lineage/security/ota\n",
+                )
+                archive.writestr(
+                    "META/otakeys.txt", b"vendor/lineage/security/ota.x509.pem\n"
+                )
                 archive.writestr("IMAGES/large.img", b"x" * (2 * 1024 * 1024))
                 for name, value in documents.items():
                     archive.writestr(name, value)
@@ -255,7 +263,11 @@ class SelinuxSigningTest(unittest.TestCase):
                 unsigned, prepared, sources, releases
             )
             with zipfile.ZipFile(prepared) as archive:
-                self.assertEqual(b"unchanged", archive.read("META/misc_info.txt"))
+                self.assertEqual(
+                    b"unchanged=value\nextra_recovery_keys=\nextra_ota_keys=\n",
+                    archive.read("META/misc_info.txt"),
+                )
+                self.assertEqual(b"\n", archive.read("META/otakeys.txt"))
                 self.assertEqual(
                     b"x" * (2 * 1024 * 1024), archive.read("IMAGES/large.img")
                 )

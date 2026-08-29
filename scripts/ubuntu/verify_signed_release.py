@@ -34,6 +34,8 @@ try:
         expected_source_certificates,
         mac_permissions_documents_from_archive,
         rewrite_mac_permissions,
+        validate_otacerts_archive,
+        validate_target_files_otacerts,
     )
     from scripts.ubuntu.signing_metadata import load_signing_inventory
 except ModuleNotFoundError:
@@ -45,6 +47,8 @@ except ModuleNotFoundError:
         expected_source_certificates,
         mac_permissions_documents_from_archive,
         rewrite_mac_permissions,
+        validate_otacerts_archive,
+        validate_target_files_otacerts,
     )
     from signing_metadata import load_signing_inventory
 
@@ -783,33 +787,25 @@ def _validate_signed_boot_otacerts(
 ) -> None:
     try:
         with zipfile.ZipFile(io.BytesIO(unsigned_data)) as unsigned_archive:
-            unsigned_members = unsigned_archive.infolist()
-            for member in unsigned_members:
+            if not unsigned_archive.infolist():
+                raise VerificationError("unsigned boot OTA certificate inventory is empty")
+            for member in unsigned_archive.infolist():
                 unsigned_archive.read(member)
-        with zipfile.ZipFile(io.BytesIO(signed_data)) as signed_archive:
-            signed_members = signed_archive.infolist()
-            signed_payloads = [signed_archive.read(member) for member in signed_members]
-    except (zipfile.BadZipFile, OSError, RuntimeError) as error:
+        validate_otacerts_archive(signed_data, release_certificate)
+    except (zipfile.BadZipFile, OSError, RuntimeError, MacPermissionsError) as error:
         raise VerificationError("boot OTA certificate archive is invalid") from error
-    if not unsigned_members or len(signed_members) != len(unsigned_members):
-        raise VerificationError("boot OTA certificate inventory changed unexpectedly")
-    for member, payload in zip(signed_members, signed_payloads):
-        name = member.filename
-        parts = name.split("/")
-        file_type = (member.external_attr >> 16) & 0o170000
-        if (
-            not name
-            or "\x00" in name
-            or "\\" in name
-            or name.startswith("/")
-            or ".." in parts
-            or any(part in {"", "."} for part in parts)
-            or Path(name).name != "releasekey.x509.pem"
-            or file_type not in (0, stat.S_IFREG)
-        ):
-            raise VerificationError("boot OTA certificate member is unsafe")
-        if payload != release_certificate:
-            raise VerificationError("boot OTA certificate does not match releasekey")
+
+
+def verify_target_files_otacerts(
+    signed_target_files: Path, release_certificate: bytes
+) -> dict[str, str]:
+    try:
+        with zipfile.ZipFile(signed_target_files) as archive:
+            return validate_target_files_otacerts(archive, release_certificate)
+    except (OSError, zipfile.BadZipFile, RuntimeError, MacPermissionsError) as error:
+        raise VerificationError(
+            f"target-files OTA certificate inventory is invalid: {error}"
+        ) from error
 
 
 def _verify_boot_component_transform(
@@ -2909,6 +2905,9 @@ def _verify_release_snapshotted(
         release_certificate.read_bytes(),
     )
     kernel_evidence["source_application"] = source_provenance
+    ota_trust_evidence = verify_target_files_otacerts(
+        paths["signed_target_files"], release_certificate.read_bytes()
+    )
 
     with zipfile.ZipFile(paths["ota"]) as ota_archive:
         ota_metadata = verify_ota_metadata(
@@ -2999,6 +2998,7 @@ def _verify_release_snapshotted(
             "ota-whole-file-signature",
             "fastboot-target-files-binding",
             "selinux-mac-permissions",
+            "ota-trust-certificates",
         )
     ]
     result: dict[str, object] = {
@@ -3018,6 +3018,7 @@ def _verify_release_snapshotted(
         "target_files": target_relationship,
         "signing_provenance": signing_evidence,
         "selinux_mac_permissions": selinux_mac_permissions,
+        "ota_trust_certificates": ota_trust_evidence,
         "packages": package_evidence,
         "avb_public_fingerprints": avb_fingerprints,
         "public_bundle_fingerprints": public_fingerprints,

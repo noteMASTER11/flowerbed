@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import base64
 import binascii
+import io
 from pathlib import Path
 import re
 import shutil
@@ -61,6 +62,13 @@ EXPECTED_ROLE_TOPOLOGY = {
     "networkstack": (_SYSTEM_POLICY,),
     "nfc": (_SYSTEM_POLICY,),
 }
+EXPECTED_OTACERTS_MEMBERS = (
+    "BOOT/RAMDISK/system/etc/security/otacerts.zip",
+    "SYSTEM/etc/security/otacerts.zip",
+)
+_REDUNDANT_OTA_KEY_PROPERTIES = frozenset(
+    {"extra_recovery_keys", "extra_ota_keys"}
+)
 
 
 def certificate_der_from_pem(payload: bytes) -> bytes:
@@ -94,6 +102,71 @@ def certificate_der_from_pem(payload: bytes) -> bytes:
     if header_length + content_length != len(der):
         raise MacPermissionsError("certificate DER is invalid")
     return der
+
+
+def validate_otacerts_archive(payload: bytes, release_certificate: bytes) -> str:
+    """Require one canonically named regular release certificate in otacerts.zip."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            members = archive.infolist()
+            if len(members) != 1 or members[0].filename != "releasekey.x509.pem":
+                raise MacPermissionsError(
+                    "OTA certificate archive must contain one canonical releasekey"
+                )
+            member = members[0]
+            file_type = (member.external_attr >> 16) & 0o170000
+            if member.is_dir() or file_type not in (0, stat.S_IFREG):
+                raise MacPermissionsError("OTA certificate archive member is unsafe")
+            certificate = archive.read(member)
+    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
+        raise MacPermissionsError("OTA certificate archive is invalid") from error
+    if certificate != release_certificate:
+        raise MacPermissionsError("OTA certificate does not match releasekey")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def validate_target_files_otacerts(
+    archive: zipfile.ZipFile, release_certificate: bytes
+) -> dict[str, str]:
+    """Validate both Fleur OTA trust archives without extracting them."""
+    evidence: dict[str, str] = {}
+    for name in EXPECTED_OTACERTS_MEMBERS:
+        matches = [member for member in archive.infolist() if member.filename == name]
+        if len(matches) != 1:
+            raise MacPermissionsError(
+                f"target-files must contain exactly one OTA certificate member {name}"
+            )
+        file_type = (matches[0].external_attr >> 16) & 0o170000
+        if matches[0].is_dir() or file_type not in (0, stat.S_IFREG):
+            raise MacPermissionsError(
+                f"target-files OTA certificate member is not regular: {name}"
+            )
+        evidence[name] = validate_otacerts_archive(
+            archive.read(matches[0]), release_certificate
+        )
+    return evidence
+
+
+def _canonicalize_ota_trust_metadata(name: str, payload: bytes) -> bytes:
+    if name == "META/otakeys.txt":
+        return b"\n"
+    if name != "META/misc_info.txt":
+        return payload
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise MacPermissionsError("META/misc_info.txt is not UTF-8") from error
+    output: list[str] = []
+    for source_line in text.splitlines():
+        stripped = source_line.strip()
+        if stripped and not stripped.startswith("#"):
+            if "=" not in source_line:
+                raise MacPermissionsError("META/misc_info.txt is malformed")
+            key, _value = source_line.split("=", 1)
+            if key.strip() in _REDUNDANT_OTA_KEY_PROPERTIES:
+                source_line = f"{key}="
+        output.append(source_line)
+    return ("\n".join(output) + "\n").encode("utf-8")
 
 
 def mac_permissions_documents_from_archive(
@@ -220,6 +293,14 @@ def rewrite_target_files_mac_permissions(
                 for info in infos:
                     if info.filename in rewritten:
                         output_archive.writestr(info, rewritten[info.filename])
+                        continue
+                    if info.filename in {"META/misc_info.txt", "META/otakeys.txt"}:
+                        output_archive.writestr(
+                            info,
+                            _canonicalize_ota_trust_metadata(
+                                info.filename, input_archive.read(info)
+                            ),
+                        )
                         continue
                     if info.is_dir():
                         output_archive.writestr(info, b"")
