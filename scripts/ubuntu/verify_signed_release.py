@@ -431,7 +431,10 @@ def verify_avb_fingerprints(
     return {partition: actual[partition] for partition in REQUIRED_AVB_PARTITIONS}
 
 
-def _metadata_records(text: str, label: str):
+def _metadata_records(
+    text: str, label: str, *, allowed_empty_fields: Sequence[str] = ()
+):
+    allowed_empty = set(allowed_empty_fields)
     for line_number, line in enumerate(text.splitlines(), start=1):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -445,7 +448,11 @@ def _metadata_records(text: str, label: str):
             if "=" not in token:
                 raise VerificationError(f"{label} line {line_number} is malformed")
             key, value = token.split("=", 1)
-            if not key or not value or key in fields:
+            if (
+                not key
+                or (not value and key not in allowed_empty)
+                or key in fields
+            ):
                 raise VerificationError(f"{label} line {line_number} is malformed")
             fields[key] = value
         yield fields
@@ -486,15 +493,21 @@ def _normalized_key_stem(value: str) -> str:
 
 
 def verify_signing_metadata_paths(apkcerts: str, apexkeys: str, misc_info: str) -> list[str]:
-    """Reject standard test key paths and enumerate explicitly permitted APEXes."""
-    for fields in _metadata_records(apkcerts, "apkcerts.txt"):
-        for name in ("certificate", "private_key"):
-            if name not in fields:
-                raise VerificationError(f"apkcerts.txt is missing {name}")
-            _reject_test_key_path(fields[name])
-        if _normalized_key_stem(fields["certificate"]) != _normalized_key_stem(
-            fields["private_key"]
-        ):
+    """Validate preserved package metadata and reject test keys in rewritten misc data."""
+    for fields in _metadata_records(
+        apkcerts, "apkcerts.txt", allowed_empty_fields=("private_key",)
+    ):
+        if not fields.get("name") or not fields.get("certificate") or "private_key" not in fields:
+            raise VerificationError("apkcerts.txt has an incomplete record")
+        certificate = fields["certificate"]
+        private_key = fields["private_key"]
+        if certificate == "PRESIGNED":
+            if private_key not in ("", "PRESIGNED"):
+                raise VerificationError("apkcerts.txt mixes PRESIGNED and key paths")
+            continue
+        if not private_key:
+            raise VerificationError("apkcerts.txt has an empty private_key")
+        if _normalized_key_stem(certificate) != _normalized_key_stem(private_key):
             raise VerificationError("apkcerts.txt has mismatched certificate/private key stems")
 
     presigned: list[str] = []
@@ -515,8 +528,6 @@ def verify_signing_metadata_paths(apkcerts: str, apexkeys: str, misc_info: str) 
                 raise VerificationError("apexkeys.txt mixes PRESIGNED and key paths")
             presigned.append(fields["name"])
         else:
-            for value in values:
-                _reject_test_key_path(value)
             if _normalized_key_stem(values[0]) != _normalized_key_stem(values[1]):
                 raise VerificationError("apexkeys.txt has mismatched payload key stems")
             if _normalized_key_stem(values[2]) != _normalized_key_stem(values[3]):
@@ -906,43 +917,32 @@ def _exact_android_key_mapping(plan) -> dict[str, str]:
     return mapping
 
 
-def verify_signed_key_plan(signed_target_files: Path, unsigned_inventory, plan) -> None:
+def verify_signed_key_plan(
+    unsigned_target_files: Path,
+    signed_target_files: Path,
+    unsigned_inventory,
+    plan,
+) -> None:
+    metadata_members = ("META/apkcerts.txt", "META/apexkeys.txt")
+    try:
+        with zipfile.ZipFile(unsigned_target_files) as unsigned, zipfile.ZipFile(
+            signed_target_files
+        ) as signed:
+            for member in metadata_members:
+                if _read_unique_bytes(unsigned, member) != _read_unique_bytes(signed, member):
+                    raise VerificationError(
+                        f"signed signing metadata was not preserved: {member}"
+                    )
+    except zipfile.BadZipFile as error:
+        raise VerificationError("target-files signing metadata archive is invalid") from error
+
     inventory = load_signing_inventory(signed_target_files)
-    expected_apk = {item.name: item for item in unsigned_inventory.apk_certificates}
-    actual_apk = {item.name: item for item in inventory.apk_certificates}
-    if set(actual_apk) != set(expected_apk):
-        raise VerificationError("signed APK inventory differs from unsigned target-files")
-    mapping = _exact_android_key_mapping(plan)
-    apex_roles = set(plan.apex_names)
+    if inventory.apk_certificates != unsigned_inventory.apk_certificates:
+        raise VerificationError("signed APK metadata was not preserved logically")
+    if inventory.apexes != unsigned_inventory.apexes:
+        raise VerificationError("signed APEX metadata was not preserved logically")
+    _exact_android_key_mapping(plan)
     avb_roles = {f"avb_{name}" for name in plan.avb_roles}
-    for name, item in actual_apk.items():
-        source = expected_apk[name]
-        if source.certificate == "PRESIGNED":
-            if item.certificate != "PRESIGNED" or item.private_key != "PRESIGNED":
-                raise VerificationError(f"signed APK PRESIGNED role mismatch: {name}")
-            continue
-        expected_role = mapping.get(_canonical_key_path(source.certificate))
-        if expected_role is None:
-            raise VerificationError(f"unsigned APK source key is absent from key plan: {name}")
-        if _key_role(item.certificate) != expected_role or _key_role(item.private_key) != expected_role:
-            raise VerificationError(f"signed APK exact key role mismatch: {name}")
-    expected_apex = {item.name: item for item in unsigned_inventory.apexes}
-    actual_apex = {item.name: item for item in inventory.apexes}
-    if set(actual_apex) != set(expected_apex):
-        raise VerificationError("signed APEX inventory differs from unsigned target-files")
-    for item in inventory.apexes:
-        source = expected_apex[item.name]
-        if source.presigned:
-            if not item.presigned:
-                raise VerificationError(f"signed APEX PRESIGNED role mismatch: {item.name}")
-            continue
-        expected = item.name.removesuffix(".apex")
-        if expected not in apex_roles:
-            raise VerificationError(f"signed APEX is outside key plan: {item.name}")
-        if _key_role(item.public_key) != expected or _key_role(item.private_key) != expected:
-            raise VerificationError(f"signed APEX payload key role mismatch: {item.name}")
-        if _key_role(item.container_certificate) != expected or _key_role(item.container_private_key) != expected:
-            raise VerificationError(f"signed APEX container key role mismatch: {item.name}")
     if {f"avb_{item.partition}" for item in inventory.avb_keys} != avb_roles:
         raise VerificationError("signed AVB key roles differ from key plan")
 
@@ -1280,14 +1280,21 @@ def verify_package_signatures(
     signed_target_files: Path,
     apkcerts: str,
     apexkeys: str,
+    plan,
     public_keys: Path,
     host_tools: Path,
     *,
     runner=_default_runner,
 ) -> dict[str, object]:
-    """Verify one APK per certificate and every non-presigned APEX."""
-    apk_records = list(_metadata_records(apkcerts, "apkcerts.txt"))
+    """Verify installed packages against their exact destination key roles."""
+    apk_records = list(
+        _metadata_records(
+            apkcerts, "apkcerts.txt", allowed_empty_fields=("private_key",)
+        )
+    )
     apex_records = list(_metadata_records(apexkeys, "apexkeys.txt"))
+    android_mapping = _exact_android_key_mapping(plan)
+    apex_roles = set(plan.apex_names)
     public_keys = Path(public_keys)
     apksigner = Path(host_tools) / "apksigner"
     deapexer = Path(host_tools) / "deapexer"
@@ -1304,22 +1311,51 @@ def verify_package_signatures(
         prefix="flowerbed-package-proof-"
     ) as directory:
         root = Path(directory)
-        representatives: dict[str, Mapping[str, str]] = {}
+        members = _archive_members(archive, allow_symlinks=True)
+        by_basename: dict[str, list[zipfile.ZipInfo]] = {}
+        for member in members.values():
+            if not member.is_dir():
+                by_basename.setdefault(Path(member.filename).name, []).append(member)
+
+        representatives: dict[
+            str, list[tuple[str, zipfile.ZipInfo]]
+        ] = {}
+        apk_names: set[str] = set()
         for fields in apk_records:
             certificate = fields.get("certificate")
             package_name = fields.get("name")
-            if not certificate or not package_name:
+            private_key = fields.get("private_key")
+            if not certificate or not package_name or private_key is None:
                 raise VerificationError("apkcerts.txt has an incomplete record")
+            if package_name in apk_names:
+                raise VerificationError(f"apkcerts.txt repeats package {package_name}")
+            apk_names.add(package_name)
             if certificate == "PRESIGNED":
-                if fields.get("private_key") != "PRESIGNED":
+                if private_key not in ("", "PRESIGNED"):
                     raise VerificationError(f"APK {package_name} mixes PRESIGNED and release keys")
                 presigned_apk.append(package_name)
                 continue
-            representatives.setdefault(_key_role(certificate), fields)
+            if not private_key or _normalized_key_stem(certificate) != _normalized_key_stem(
+                private_key
+            ):
+                raise VerificationError(f"APK {package_name} has mismatched signing keys")
+            matches = by_basename.get(package_name, [])
+            if not matches:
+                continue
+            if len(matches) != 1:
+                raise VerificationError(
+                    f"target-files must contain exactly one package named {package_name}; "
+                    f"found {len(matches)}"
+                )
+            source = _canonical_key_path(_normalized_key_stem(certificate))
+            role = android_mapping.get(source)
+            if role is None:
+                raise VerificationError(
+                    f"installed APK {package_name} has no destination key mapping"
+                )
+            representatives.setdefault(role, []).append((package_name, matches[0]))
         for role in sorted(representatives):
-            fields = representatives[role]
-            package_name = fields["name"]
-            member = _find_unique_by_basename(archive, package_name)
+            package_name, member = min(representatives[role], key=lambda item: item[0])
             package = root / f"apk-{len(apk_representatives)}-{package_name}"
             package.write_bytes(archive.read(member))
             certificate = public_keys / f"{role}.x509.pem"
@@ -1332,6 +1368,7 @@ def verify_package_signatures(
             apk_representatives.append(package_name)
             fingerprints[f"apk:{role}"] = actual
 
+        apex_names_seen: set[str] = set()
         for fields in apex_records:
             name = fields.get("name", "")
             values = [
@@ -1345,22 +1382,40 @@ def verify_package_signatures(
             ]
             if not name or any(not value for value in values):
                 raise VerificationError("apexkeys.txt has an incomplete record")
+            if name in apex_names_seen:
+                raise VerificationError(f"apexkeys.txt repeats package {name}")
+            apex_names_seen.add(name)
             if all(value == "PRESIGNED" for value in values):
                 presigned_apex.append(name)
                 continue
             if any(value == "PRESIGNED" for value in values):
                 raise VerificationError(f"APEX {name} mixes PRESIGNED and release keys")
-            member = _find_unique_by_basename(archive, name)
+            if _normalized_key_stem(values[0]) != _normalized_key_stem(values[1]):
+                raise VerificationError(f"APEX {name} has mismatched payload signing keys")
+            if _normalized_key_stem(values[2]) != _normalized_key_stem(values[3]):
+                raise VerificationError(f"APEX {name} has mismatched container signing keys")
+            matches = by_basename.get(name, [])
+            if not matches:
+                continue
+            if len(matches) != 1:
+                raise VerificationError(
+                    f"target-files must contain exactly one package named {name}; "
+                    f"found {len(matches)}"
+                )
+            member = matches[0]
+            role = name.removesuffix(".apex")
+            if role not in apex_roles:
+                raise VerificationError(f"installed APEX {name} is outside destination key plan")
             apex_path = root / f"apex-{len(verified_apex)}-{name}"
             apex_path.write_bytes(archive.read(member))
-            container_role = _key_role(fields["container_certificate"])
-            certificate = public_keys / f"{container_role}.x509.pem"
+            certificate = public_keys / f"{role}.x509.pem"
+            if not certificate.is_file() or certificate.is_symlink():
+                raise VerificationError(f"missing APEX container public certificate for {name}")
             expected_container = _certificate_fingerprint(certificate, runner=runner)
             actual_container = _apksigner_fingerprint(apex_path, apksigner, runner=runner)
             if actual_container != expected_container:
                 raise VerificationError(f"APEX container fingerprint mismatch for {name}")
-            payload_role = _key_role(fields["public_key"])
-            payload_key = public_keys / f"{payload_role}.avbpubkey"
+            payload_key = public_keys / f"{role}.avbpubkey"
             if not payload_key.is_file():
                 raise VerificationError(f"missing APEX payload public key for {name}")
             extracted_payload = root / f"deapexed-{len(verified_apex)}"
@@ -1387,7 +1442,7 @@ def verify_package_signatures(
             payload_path.write_bytes(payload)
             payload_fingerprint = _verify_avb_public_key(
                 payload_path,
-                payload_role,
+                role,
                 public_keys,
                 avbtool,
                 runner=runner,
@@ -1794,7 +1849,12 @@ def _verify_release_snapshotted(
         fingerprint_public_bundle(public_keys),
         expected_build_provenance,
     )
-    verify_signed_key_plan(paths["signed_target_files"], unsigned_inventory, unsigned_plan)
+    verify_signed_key_plan(
+        paths["unsigned_target_files"],
+        paths["signed_target_files"],
+        unsigned_inventory,
+        unsigned_plan,
+    )
     target_relationship = compare_target_files(
         paths["unsigned_target_files"],
         paths["signed_target_files"],
@@ -1821,6 +1881,7 @@ def _verify_release_snapshotted(
         paths["signed_target_files"],
         apkcerts,
         apexkeys,
+        unsigned_plan,
         public_keys,
         host_tools,
         runner=runner,

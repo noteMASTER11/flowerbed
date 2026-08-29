@@ -94,25 +94,35 @@ class SignedReleasePolicyTest(unittest.TestCase):
         fingerprints = {name: hashlib.sha256(name.encode()).hexdigest() for name in ("boot", "vbmeta", "vbmeta_system", "vbmeta_vendor")}
         self.assertEqual(fingerprints, module.verify_avb_fingerprints(fingerprints, dict(fingerprints)))
 
-    def test_rejects_standard_test_key_paths_and_reports_presigned_apex(self):
+    def test_allows_preserved_source_paths_but_rejects_test_keys_in_misc(self):
         module = load_verifier()
         avb_metadata = "".join(
             f"avb_{partition}_key_path=release/avb_{partition}.pem\n"
             f"avb_{partition}_algorithm=SHA256_RSA4096\n"
             for partition in module.REQUIRED_AVB_PARTITIONS
         )
-        with self.assertRaisesRegex(module.VerificationError, "test certificate"):
-            module.verify_signing_metadata_paths(
-                'name="Settings.apk" certificate="build/make/target/product/security/testkey.x509.pem" private_key="build/make/target/product/security/testkey.pk8"\n',
-                'name="com.android.tzdata.apex" public_key="PRESIGNED" private_key="PRESIGNED" container_certificate="PRESIGNED" container_private_key="PRESIGNED" partition="system"\n',
-                "default_system_dev_certificate=releasekey\n" + avb_metadata,
-            )
         permitted = module.verify_signing_metadata_paths(
-            'name="Settings.apk" certificate="release/platform.x509.pem" private_key="release/platform.pk8"\n',
+            'name="Settings.apk" certificate="build/make/target/product/security/testkey.x509.pem" private_key="build/make/target/product/security/testkey.pk8"\n'
+            'name="AndroidXComposeStartupApp.apk" certificate="PRESIGNED" private_key="" partition="data"\n',
+            'name="com.android.art.apex" public_key="build/make/target/product/security/com.android.art.avbpubkey" private_key="build/make/target/product/security/com.android.art.pem" container_certificate="build/make/target/product/security/platform.x509.pem" container_private_key="build/make/target/product/security/platform.pk8" partition="system"\n'
             'name="com.android.tzdata.apex" public_key="PRESIGNED" private_key="PRESIGNED" container_certificate="PRESIGNED" container_private_key="PRESIGNED" partition="system"\n',
             "default_system_dev_certificate=release/releasekey\n" + avb_metadata,
         )
         self.assertEqual(["com.android.tzdata.apex"], permitted)
+        with self.assertRaisesRegex(module.VerificationError, "test certificate"):
+            module.verify_signing_metadata_paths(
+                'name="Settings.apk" certificate="build/make/target/product/security/testkey.x509.pem" private_key="build/make/target/product/security/testkey.pk8"\n',
+                "",
+                "default_system_dev_certificate=build/make/target/product/security/testkey\n"
+                + avb_metadata,
+            )
+        with self.assertRaisesRegex(module.VerificationError, "malformed|private_key"):
+            module.verify_signing_metadata_paths(
+                'name="Settings.apk" certificate="release/platform.x509.pem" private_key=""\n',
+                "",
+                "default_system_dev_certificate=release/releasekey\n"
+                + avb_metadata,
+            )
         with self.assertRaisesRegex(module.VerificationError, "vbmeta_vendor"):
             module.verify_signing_metadata_paths(
                 'name="Settings.apk" certificate="release/platform.x509.pem" private_key="release/platform.pk8"\n',
@@ -495,7 +505,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     build_provenance,
                 )
 
-    def test_signed_apk_roles_follow_exact_unsigned_package_mapping(self):
+    def test_signed_key_metadata_is_preserved_raw_and_logically(self):
         module = load_verifier()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -510,26 +520,48 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     "ro.build.tags=test-keys\nro.system.build.tags=test-keys\n"
                 ),
             }
-            for path, apkcerts in (
-                (
-                    unsigned,
-                    'name="Alpha.apk" certificate="source/platform.x509.pem" private_key="source/platform.pk8"\n'
-                    'name="Beta.apk" certificate="source/media.x509.pem" private_key="source/media.pk8"\n',
-                ),
-                (
-                    signed,
-                    'name="Alpha.apk" certificate="release/media.x509.pem" private_key="release/media.pk8"\n'
-                    'name="Beta.apk" certificate="release/platform.x509.pem" private_key="release/platform.pk8"\n',
-                ),
-            ):
+            apkcerts = (
+                'name="ANGLE.apk" certificate="build/make/target/product/security/testkey.x509.pem" private_key="build/make/target/product/security/testkey.pk8"\n'
+                'name="Aperture.apk" certificate="build/make/target/product/security/testkey.x509.pem" private_key="build/make/target/product/security/testkey.pk8"\n'
+            )
+            apexkeys = (
+                'name="com.android.art.apex" public_key="build/make/target/product/security/com.android.art.avbpubkey" '
+                'private_key="build/make/target/product/security/com.android.art.pem" '
+                'container_certificate="build/make/target/product/security/platform.x509.pem" '
+                'container_private_key="build/make/target/product/security/platform.pk8" partition="system"\n'
+            )
+            common["META/apexkeys.txt"] = apexkeys
+            for path in (unsigned, signed):
                 with zipfile.ZipFile(path, "w") as archive:
                     for name, value in common.items():
                         archive.writestr(name, value)
                     archive.writestr("META/apkcerts.txt", apkcerts)
             inventory = module.load_signing_inventory(unsigned)
             plan = module.build_key_plan(inventory)
-            with self.assertRaisesRegex(module.VerificationError, "Alpha.apk"):
-                module.verify_signed_key_plan(signed, inventory, plan)
+            module.verify_signed_key_plan(unsigned, signed, inventory, plan)
+
+            with zipfile.ZipFile(signed, "w") as archive:
+                for name, value in common.items():
+                    archive.writestr(name, value)
+                archive.writestr(
+                    "META/apkcerts.txt",
+                    apkcerts.replace("Aperture.apk", "Changed.apk"),
+                )
+            with self.assertRaisesRegex(module.VerificationError, "preserved"):
+                module.verify_signed_key_plan(unsigned, signed, inventory, plan)
+
+            with zipfile.ZipFile(signed, "w") as archive:
+                for name, value in common.items():
+                    archive.writestr(
+                        name,
+                        value.replace("com.android.art", "com.android.runtime")
+                        if name == "META/apexkeys.txt"
+                        else value,
+                    )
+                archive.writestr("META/apkcerts.txt", apkcerts)
+            with self.assertRaisesRegex(module.VerificationError, "preserved"):
+                module.verify_signed_key_plan(unsigned, signed, inventory, plan)
+
             for mappings in (
                 (
                     SimpleNamespace(source_stem="source/platform", destination_role="platform"),
@@ -544,7 +576,9 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     android_mappings=mappings, apex_names=(), avb_roles=(),
                 )
                 with self.assertRaisesRegex(module.VerificationError, "canonical.*collision"):
-                    module.verify_signed_key_plan(signed, inventory, collision_plan)
+                    module.verify_signed_key_plan(
+                        unsigned, unsigned, inventory, collision_plan
+                    )
 
     def test_fastboot_images_and_android_info_must_match_signed_target_files(self):
         module = load_verifier()
@@ -647,7 +681,10 @@ class SignedReleasePolicyTest(unittest.TestCase):
             target = root / "signed-target.zip"
             public = root / "public-keys"
             public.mkdir()
-            (public / "platform.x509.pem").write_text("certificate", encoding="utf-8")
+            (public / "releasekey.x509.pem").write_text("certificate", encoding="utf-8")
+            (public / "com.android.art.x509.pem").write_text(
+                "apex certificate", encoding="utf-8"
+            )
             (public / "com.android.art.avbpubkey").write_bytes(b"apex-public")
             (public / "com.android.art.public.pem").write_text("public pem", encoding="utf-8")
             nested = io.BytesIO()
@@ -657,15 +694,15 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 archive.writestr("SYSTEM/app/Settings/Settings.apk", b"apk")
                 archive.writestr("SYSTEM/apex/com.android.art.apex", nested.getvalue())
             apkcerts = (
-                'name="Settings.apk" certificate="release/platform.x509.pem" '
-                'private_key="release/platform.pk8"\n'
+                'name="Settings.apk" certificate="build/make/target/product/security/testkey.x509.pem" '
+                'private_key="build/make/target/product/security/testkey.pk8"\n'
                 'name="WebView.apk" certificate="PRESIGNED" private_key="PRESIGNED"\n'
             )
             apexkeys = (
-                'name="com.android.art.apex" public_key="release/com.android.art.avbpubkey" '
-                'private_key="release/com.android.art.pem" '
-                'container_certificate="release/platform.x509.pem" '
-                'container_private_key="release/platform.pk8" partition="system"\n'
+                'name="com.android.art.apex" public_key="build/make/target/product/security/com.android.art.avbpubkey" '
+                'private_key="build/make/target/product/security/com.android.art.pem" '
+                'container_certificate="build/make/target/product/security/platform.x509.pem" '
+                'container_private_key="build/make/target/product/security/platform.pk8" partition="system"\n'
                 'name="com.android.tzdata.apex" public_key="PRESIGNED" private_key="PRESIGNED" '
                 'container_certificate="PRESIGNED" container_private_key="PRESIGNED" partition="system"\n'
             )
@@ -690,6 +727,15 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 target,
                 apkcerts,
                 apexkeys,
+                SimpleNamespace(
+                    android_mappings=(
+                        SimpleNamespace(
+                            source_stem="build/make/target/product/security/testkey",
+                            destination_role="releasekey",
+                        ),
+                    ),
+                    apex_names=("com.android.art",),
+                ),
                 public,
                 root / "host-tools",
                 runner=runner,
@@ -708,6 +754,166 @@ class SignedReleasePolicyTest(unittest.TestCase):
             self.assertIn("extract", deapexer_command)
             verify_command = next(command for command in commands if "verify_image" in command)
             self.assertEqual("com.android.art.public.pem", Path(verify_command[verify_command.index("--key") + 1]).name)
+
+            with self.assertRaisesRegex(module.VerificationError, "destination key plan"):
+                module.verify_package_signatures(
+                    target,
+                    apkcerts,
+                    apexkeys,
+                    SimpleNamespace(
+                        android_mappings=(
+                            SimpleNamespace(
+                                source_stem="build/make/target/product/security/testkey",
+                                destination_role="releasekey",
+                            ),
+                        ),
+                        apex_names=(),
+                    ),
+                    public,
+                    root / "host-tools",
+                    runner=runner,
+                )
+
+    def test_apk_representative_uses_present_aperture_and_destination_role(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "signed-target.zip"
+            public = root / "public-keys"
+            public.mkdir()
+            (public / "releasekey.x509.pem").write_text(
+                "certificate", encoding="utf-8"
+            )
+            with zipfile.ZipFile(target, "w") as archive:
+                archive.writestr("SYSTEM/app/Aperture/Aperture.apk", b"signed-apk")
+            apkcerts = (
+                'name="ANGLE.apk" certificate="build/make/target/product/security/testkey.x509.pem" '
+                'private_key="build/make/target/product/security/testkey.pk8"\n'
+                'name="Aperture.apk" certificate="build/make/target/product/security/testkey.x509.pem" '
+                'private_key="build/make/target/product/security/testkey.pk8"\n'
+            )
+            plan = SimpleNamespace(
+                android_mappings=(
+                    SimpleNamespace(
+                        source_stem="build/make/target/product/security/testkey",
+                        destination_role="releasekey",
+                    ),
+                ),
+                apex_names=(),
+            )
+            commands = []
+
+            def runner(command, **_kwargs):
+                command = tuple(str(item) for item in command)
+                commands.append(command)
+                if Path(command[0]).name == "openssl":
+                    return "sha256 Fingerprint=" + ":".join(["AB"] * 32) + "\n"
+                if Path(command[0]).name == "apksigner":
+                    return "Signer #1 certificate SHA-256 digest: " + "ab" * 32 + "\n"
+                self.fail(command)
+
+            evidence = module.verify_package_signatures(
+                target,
+                apkcerts,
+                "",
+                plan,
+                public,
+                root / "host-tools",
+                runner=runner,
+            )
+
+            self.assertEqual(["Aperture.apk"], evidence["apk_representatives"])
+            self.assertEqual("ab" * 32, evidence["public_fingerprints"]["apk:releasekey"])
+            self.assertFalse(any("ANGLE.apk" in " ".join(command) for command in commands))
+
+    def test_installed_apk_mapping_certificate_signature_and_basename_fail_closed(self):
+        module = load_verifier()
+        apkcerts = (
+            'name="Aperture.apk" certificate="build/make/target/product/security/testkey.x509.pem" '
+            'private_key="build/make/target/product/security/testkey.pk8"\n'
+        )
+        mapped = SimpleNamespace(
+            android_mappings=(
+                SimpleNamespace(
+                    source_stem="build/make/target/product/security/testkey",
+                    destination_role="releasekey",
+                ),
+            ),
+            apex_names=(),
+        )
+        unmapped = SimpleNamespace(android_mappings=(), apex_names=())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            public = root / "public-keys"
+            public.mkdir()
+            target = root / "signed-target.zip"
+            with zipfile.ZipFile(target, "w") as archive:
+                archive.writestr("SYSTEM/app/Aperture/Aperture.apk", b"apk")
+
+            with self.assertRaisesRegex(module.VerificationError, "mapping"):
+                module.verify_package_signatures(
+                    target, apkcerts, "", unmapped, public, root / "host-tools"
+                )
+            with self.assertRaisesRegex(module.VerificationError, "certificate"):
+                module.verify_package_signatures(
+                    target, apkcerts, "", mapped, public, root / "host-tools"
+                )
+
+            (public / "releasekey.x509.pem").write_text(
+                "certificate", encoding="utf-8"
+            )
+
+            def mismatch_runner(command, **_kwargs):
+                if Path(command[0]).name == "openssl":
+                    return "sha256 Fingerprint=" + ":".join(["AB"] * 32) + "\n"
+                if Path(command[0]).name == "apksigner":
+                    return "Signer #1 certificate SHA-256 digest: " + "cd" * 32 + "\n"
+                self.fail(command)
+
+            with self.assertRaisesRegex(module.VerificationError, "fingerprint"):
+                module.verify_package_signatures(
+                    target,
+                    apkcerts,
+                    "",
+                    mapped,
+                    public,
+                    root / "host-tools",
+                    runner=mismatch_runner,
+                )
+
+            with zipfile.ZipFile(target, "w") as archive:
+                archive.writestr("SYSTEM/app/Aperture/Aperture.apk", b"one")
+                archive.writestr("PRODUCT/app/Aperture/Aperture.apk", b"two")
+            with self.assertRaisesRegex(module.VerificationError, "exactly one"):
+                module.verify_package_signatures(
+                    target, apkcerts, "", mapped, public, root / "host-tools"
+                )
+
+    def test_absent_only_apk_role_is_not_selected_or_required(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "signed-target.zip"
+            public = root / "public-keys"
+            public.mkdir()
+            with zipfile.ZipFile(target, "w") as archive:
+                archive.writestr("META/member", b"fixture")
+            apkcerts = (
+                'name="ANGLE.apk" certificate="build/make/target/product/security/testkey.x509.pem" '
+                'private_key="build/make/target/product/security/testkey.pk8"\n'
+            )
+
+            evidence = module.verify_package_signatures(
+                target,
+                apkcerts,
+                "",
+                SimpleNamespace(android_mappings=(), apex_names=()),
+                public,
+                root / "host-tools",
+                runner=lambda *_args, **_kwargs: self.fail("tool must not run"),
+            )
+
+            self.assertEqual([], evidence["apk_representatives"])
 
     def test_verifies_all_required_avb_images_against_public_bundle(self):
         module = load_verifier()
@@ -856,14 +1062,16 @@ class SignedReleasePolicyTest(unittest.TestCase):
             signed = root / "lineage_fleur-SIGNED-target_files.zip"
             common = {
                 "META/apkcerts.txt": (
-                    'name="Settings.apk" certificate="release/platform.x509.pem" '
-                    'private_key="release/platform.pk8"\n'
+                    'name="ANGLE.apk" certificate="build/make/target/product/security/testkey.x509.pem" '
+                    'private_key="build/make/target/product/security/testkey.pk8"\n'
+                    'name="Settings.apk" certificate="build/make/target/product/security/testkey.x509.pem" '
+                    'private_key="build/make/target/product/security/testkey.pk8"\n'
                 ),
                 "META/apexkeys.txt": (
-                    'name="com.android.art.apex" public_key="release/com.android.art.avbpubkey" '
-                    'private_key="release/com.android.art.pem" '
-                    'container_certificate="release/platform.x509.pem" '
-                    'container_private_key="release/platform.pk8" partition="system"\n'
+                    'name="com.android.art.apex" public_key="build/make/target/product/security/com.android.art.avbpubkey" '
+                    'private_key="build/make/target/product/security/com.android.art.pem" '
+                    'container_certificate="build/make/target/product/security/platform.x509.pem" '
+                    'container_private_key="build/make/target/product/security/platform.pk8" partition="system"\n'
                 ),
                 "META/misc_info.txt": (
                     "ab_update=true\nvirtual_ab=true\n"
@@ -895,18 +1103,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
             for path, tags in ((unsigned, "test-keys"), (signed, "release-keys")):
                 with zipfile.ZipFile(path, "w") as archive:
                     for name, value in common.items():
-                        if name == "META/apexkeys.txt":
-                            continue
                         archive.writestr(name, value)
-                    archive.writestr(
-                        "META/apexkeys.txt",
-                        common["META/apexkeys.txt"]
-                        if path == unsigned
-                        else common["META/apexkeys.txt"].replace(
-                            'container_certificate="release/platform.x509.pem" container_private_key="release/platform.pk8"',
-                            'container_certificate="release/com.android.art.x509.pem" container_private_key="release/com.android.art.pk8"',
-                        ),
-                    )
                     archive.writestr(
                         "SYSTEM/build.prop",
                         f"ro.product.system.device=fleur\nro.build.tags={tags}\nro.system.build.tags={tags}\n",
