@@ -145,12 +145,15 @@ class SignedReleasePolicyTest(unittest.TestCase):
             f"avb_{partition}_algorithm=SHA256_RSA4096\n"
             for partition in module.REQUIRED_AVB_PARTITIONS
         )
+        optional_empty_misc = "building_oem_image=\nmkbootimg_init_args=\n"
         permitted = module.verify_signing_metadata_paths(
             'name="Settings.apk" certificate="build/make/target/product/security/testkey.x509.pem" private_key="build/make/target/product/security/testkey.pk8"\n'
             'name="AndroidXComposeStartupApp.apk" certificate="PRESIGNED" private_key="" partition="data"\n',
             'name="com.android.art.apex" public_key="build/make/target/product/security/com.android.art.avbpubkey" private_key="build/make/target/product/security/com.android.art.pem" container_certificate="build/make/target/product/security/platform.x509.pem" container_private_key="build/make/target/product/security/platform.pk8" partition="system"\n'
             'name="com.android.tzdata.apex" public_key="PRESIGNED" private_key="PRESIGNED" container_certificate="PRESIGNED" container_private_key="PRESIGNED" partition="system"\n',
-            "default_system_dev_certificate=release/releasekey\n" + avb_metadata,
+            "default_system_dev_certificate=release/releasekey\n"
+            + optional_empty_misc
+            + avb_metadata,
         )
         self.assertEqual(["com.android.tzdata.apex"], permitted)
         with self.assertRaisesRegex(module.VerificationError, "test certificate"):
@@ -177,6 +180,22 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     "",
                 ),
             )
+        with self.assertRaisesRegex(module.VerificationError, "vbmeta_vendor"):
+            module.verify_signing_metadata_paths(
+                'name="Settings.apk" certificate="release/platform.x509.pem" private_key="release/platform.pk8"\n',
+                "",
+                "default_system_dev_certificate=release/releasekey\n"
+                + optional_empty_misc
+                + avb_metadata.replace(
+                    "avb_vbmeta_vendor_key_path=release/avb_vbmeta_vendor.pem",
+                    "avb_vbmeta_vendor_key_path=",
+                ),
+            )
+        for malformed in ("building_oem_image\n", "=value\n"):
+            with self.assertRaises(module.VerificationError):
+                module.verify_signing_metadata_paths(
+                    "", "", malformed + avb_metadata
+                )
 
     def test_kernel_provenance_rejects_pre_fix_and_requires_content_match(self):
         module = load_verifier()
@@ -1119,6 +1138,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 ),
                 "META/misc_info.txt": (
                     "ab_update=true\nvirtual_ab=true\n"
+                    "building_oem_image=\nmkbootimg_init_args=\n"
                     "default_system_dev_certificate=release/releasekey\n"
                     + "".join(
                         f"avb_{partition}_key_path=release/avb_{partition}.pem\n"

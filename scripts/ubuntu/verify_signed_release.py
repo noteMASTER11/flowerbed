@@ -83,6 +83,9 @@ TEST_KEY_PREFIXES = (
     "build/make/target/product/security/",
     "external/avb/test/",
 )
+OPTIONAL_EMPTY_MISC_PROPERTIES = frozenset(
+    ("building_oem_image", "mkbootimg_init_args")
+)
 FASTBOOT_ALLOWED_MEMBERS = {
     "android-info.txt",
     *(f"{partition}.img" for partition in REQUIRED_FASTBOOT_IMAGES),
@@ -541,7 +544,13 @@ def verify_signing_metadata_paths(apkcerts: str, apexkeys: str, misc_info: str) 
                 raise VerificationError("apexkeys.txt has mismatched container key stems")
 
     misc = _parse_properties(misc_info, "misc_info.txt")
-    for value in misc.values():
+    for name, value in misc.items():
+        if not value:
+            if name not in OPTIONAL_EMPTY_MISC_PROPERTIES:
+                raise VerificationError(
+                    f"misc_info.txt has an empty property {name}"
+                )
+            continue
         _reject_test_key_path(value)
     for partition in REQUIRED_AVB_PARTITIONS:
         key_name = f"avb_{partition}_key_path"
