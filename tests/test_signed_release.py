@@ -174,6 +174,46 @@ def write_zip_entries(path: Path, entries: dict[str, bytes]) -> None:
             archive.writestr(name, value)
 
 
+MAC_SEINFO_ROLES = {
+    "platform": "platform",
+    "sdk_sandbox": "sdk_sandbox",
+    "bluetooth": "bluetooth",
+    "media": "media",
+    "network_stack": "networkstack",
+    "nfc": "nfc",
+}
+
+
+def mac_der(role: str, *, release: bool = False) -> bytes:
+    payload = f"{'release' if release else 'source'}-{role}".encode()
+    return b"\x30" + bytes((len(payload),)) + payload
+
+
+def mac_pem(role: str) -> bytes:
+    value = mac_der(role, release=True)
+    return (
+        b"-----BEGIN CERTIFICATE-----\n"
+        + base64.b64encode(value)
+        + b"\n-----END CERTIFICATE-----\n"
+    )
+
+
+def mac_policy(*, signed: bool) -> bytes:
+    signers = b"".join(
+        b'<signer signature="'
+        + mac_der(role, release=signed).hex().encode()
+        + b'"><seinfo value="'
+        + seinfo.encode()
+        + b'"/></signer>'
+        for seinfo, role in MAC_SEINFO_ROLES.items()
+    )
+    return (
+        b'<?xml version="1.0" encoding="iso-8859-1"?><policy>'
+        + signers
+        + b"</policy>"
+    )
+
+
 class SignedReleasePolicyTest(unittest.TestCase):
     def _payload(self, manifest: bytes = b"manifest", signatures: bytes = b"sig"):
         header = struct.pack(">4sQQI", b"CrAU", 2, len(manifest), len(signatures))
@@ -951,6 +991,10 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 "application_evidence_sha256": "d" * 64,
                 "unsigned_target_files": {"sha256": "e" * 64},
             }
+            selinux_mac_permissions = {
+                "members": {"SYSTEM/etc/selinux/plat_mac_permissions.xml": {}},
+                "roles": {"platform": {"occurrences": 1}},
+            }
             report = {
                 "schema_version": 2,
                 "device": "fleur",
@@ -967,10 +1011,14 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 "presigned_allowlist": allowlist,
                 "public_fingerprints": public_fingerprints,
                 "build_provenance": json.loads(json.dumps(build_provenance)),
+                "selinux_mac_permissions": json.loads(
+                    json.dumps(selinux_mac_permissions)
+                ),
             }
             evidence = module.verify_signer_report(
                 report, paths, metadata, key_plan, allowlist, public_fingerprints,
                 build_provenance,
+                selinux_mac_permissions,
             )
             self.assertEqual(
                 module._path_evidence(paths["ota"])["sha256"],
@@ -981,6 +1029,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 module.verify_signer_report(
                     report, paths, metadata, key_plan, allowlist, public_fingerprints,
                     build_provenance,
+                    selinux_mac_permissions,
                 )
             report["outputs"][paths["ota"].name]["sha256"] = module._path_evidence(paths["ota"])["sha256"]
             report["build_provenance"]["session_nonce"] = "0" * 64
@@ -988,6 +1037,22 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 module.verify_signer_report(
                     report, paths, metadata, key_plan, allowlist, public_fingerprints,
                     build_provenance,
+                    selinux_mac_permissions,
+                )
+            report["build_provenance"] = json.loads(json.dumps(build_provenance))
+            report["selinux_mac_permissions"]["roles"]["platform"][
+                "occurrences"
+            ] = 2
+            with self.assertRaisesRegex(module.VerificationError, "SELinux"):
+                module.verify_signer_report(
+                    report,
+                    paths,
+                    metadata,
+                    key_plan,
+                    allowlist,
+                    public_fingerprints,
+                    build_provenance,
+                    selinux_mac_permissions,
                 )
 
     def test_signed_key_metadata_is_preserved_raw_and_logically(self):
@@ -1349,6 +1414,70 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     module.verify_fastboot_against_target_files(
                         unsigned, signed, fastboot
                     )
+
+    def test_selinux_mac_permissions_require_exact_release_certificates(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsigned = root / "unsigned.zip"
+            signed = root / "signed.zip"
+            public = root / "public"
+            public.mkdir()
+            unsigned_entries = {
+                "SYSTEM/etc/selinux/plat_mac_permissions.xml": mac_policy(
+                    signed=False
+                ),
+                "VENDOR/etc/selinux/vendor_mac_permissions.xml": (
+                    b'<?xml version="1.0" encoding="iso-8859-1"?><policy>'
+                    b'<signer signature="'
+                    + mac_der("platform").hex().encode()
+                    + b'"><seinfo value="platform"/></signer></policy>'
+                ),
+                "SYSTEM_EXT/etc/selinux/system_ext_mac_permissions.xml": (
+                    b'<?xml version="1.0" encoding="iso-8859-1"?>'
+                    b"<policy></policy>"
+                ),
+            }
+            signed_entries = dict(unsigned_entries)
+            for name, value in tuple(signed_entries.items()):
+                for role in MAC_SEINFO_ROLES.values():
+                    value = value.replace(
+                        mac_der(role).hex().encode(),
+                        mac_der(role, release=True).hex().encode(),
+                    )
+                signed_entries[name] = value
+            for role in MAC_SEINFO_ROLES.values():
+                (public / f"{role}.x509.pem").write_bytes(mac_pem(role))
+            write_zip_entries(unsigned, unsigned_entries)
+            write_zip_entries(signed, signed_entries)
+            evidence = module.verify_selinux_mac_permissions(
+                unsigned, signed, public
+            )
+            self.assertEqual(2, evidence["roles"]["platform"]["occurrences"])
+
+            attacks = {
+                "old source remains": dict(unsigned_entries),
+                "wrong release": {
+                    **signed_entries,
+                    "VENDOR/etc/selinux/vendor_mac_permissions.xml": signed_entries[
+                        "VENDOR/etc/selinux/vendor_mac_permissions.xml"
+                    ].replace(
+                        mac_der("platform", release=True).hex().encode(),
+                        mac_der("media", release=True).hex().encode(),
+                    ),
+                },
+                "missing member": {
+                    name: value
+                    for name, value in signed_entries.items()
+                    if not name.startswith("VENDOR/")
+                },
+            }
+            for label, entries in attacks.items():
+                write_zip_entries(signed, entries)
+                with self.subTest(label=label), self.assertRaises(
+                    module.VerificationError
+                ):
+                    module.verify_selinux_mac_permissions(unsigned, signed, public)
 
     def test_sku_files_require_exact_installed_paths(self):
         module = load_verifier()
@@ -2122,8 +2251,11 @@ class SignedReleasePolicyTest(unittest.TestCase):
             (verifier_repo / "update_verifier.py").write_text("# fixture\n", encoding="utf-8")
             public = root / "public-keys"
             public.mkdir()
-            for role in ("releasekey", "platform"):
-                (public / f"{role}.x509.pem").write_text("certificate", encoding="utf-8")
+            (public / "releasekey.x509.pem").write_text(
+                "certificate", encoding="utf-8"
+            )
+            for role in MAC_SEINFO_ROLES.values():
+                (public / f"{role}.x509.pem").write_bytes(mac_pem(role))
             (public / "com.android.art.avbpubkey").write_bytes(b"apex-key")
             (public / "com.android.art.public.pem").write_text("apex pem", encoding="utf-8")
             (public / "com.android.art.x509.pem").write_text("apex certificate", encoding="utf-8")
@@ -2196,6 +2328,27 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         "ro.build.version.base_os=\n"
                         f"ro.product.system.device=fleur\nro.build.tags={tags}\nro.system.build.tags={tags}\n",
                     )
+                    archive.writestr(
+                        "SYSTEM/etc/selinux/plat_mac_permissions.xml",
+                        mac_policy(signed=path == signed),
+                    )
+                    platform_certificate = mac_der(
+                        "platform", release=path == signed
+                    )
+                    archive.writestr(
+                        "VENDOR/etc/selinux/vendor_mac_permissions.xml",
+                        b'<?xml version="1.0" encoding="iso-8859-1"?><policy>'
+                        b'<signer signature="'
+                        + platform_certificate.hex().encode()
+                        + b'"><seinfo value="platform"/></signer></policy>',
+                    )
+                    for partition in ("ODM", "PRODUCT", "SYSTEM_EXT"):
+                        archive.writestr(
+                            f"{partition}/etc/selinux/"
+                            f"{partition.lower()}_mac_permissions.xml",
+                            b'<?xml version="1.0" encoding="iso-8859-1"?>'
+                            b"<policy></policy>",
+                        )
                     write_zip_symlink(
                         archive,
                         "BOOT/RAMDISK/adb_keys",
@@ -2284,6 +2437,9 @@ class SignedReleasePolicyTest(unittest.TestCase):
             }
             build_provenance.write_text(json.dumps(build_record), encoding="utf-8")
             signer_report = root / "signing-report.json"
+            selinux_evidence = module.verify_selinux_mac_permissions(
+                unsigned, signed, public
+            )
             signer_report.write_text(
                 json.dumps(
                     {
@@ -2304,6 +2460,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         "build_provenance": module.build_provenance_evidence(
                             build_provenance, build_record
                         ),
+                        "selinux_mac_permissions": selinux_evidence,
                     }
                 ),
                 encoding="utf-8",
@@ -2501,6 +2658,10 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 },
             )
             self.assertEqual("pass", result["status"])
+            self.assertEqual(
+                set(MAC_SEINFO_ROLES.values()),
+                set(result["selinux_mac_permissions"]["roles"]),
+            )
             self.assertEqual(
                 hashlib.sha256(fixed_boot).hexdigest(),
                 result["kernel_provenance"]["boot_content_sha256"],

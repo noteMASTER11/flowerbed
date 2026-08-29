@@ -38,12 +38,26 @@ try:
         run_openssl,
     )
     from scripts.ubuntu.generate_release_keys import KeyGenerationError, build_key_plan
+    from scripts.ubuntu.selinux_signing import (
+        MacPermissionsError,
+        certificate_der_from_pem,
+        mac_permissions_documents_from_archive,
+        rewrite_mac_permissions,
+        rewrite_target_files_mac_permissions,
+    )
     from scripts.ubuntu.signing_metadata import SigningInventory, load_signing_inventory
 except ModuleNotFoundError:  # Direct execution from scripts/ubuntu.
     from build_provenance import BuildProvenanceError, validate_final_build_provenance
     from avb_password_helper import PasswordLookupError, lookup_password, parse_password_file
     from avb_signing_helper import AvbSigningError, OpenSslRunner, export_public_key, run_openssl
     from generate_release_keys import KeyGenerationError, build_key_plan
+    from selinux_signing import (
+        MacPermissionsError,
+        certificate_der_from_pem,
+        mac_permissions_documents_from_archive,
+        rewrite_mac_permissions,
+        rewrite_target_files_mac_permissions,
+    )
     from signing_metadata import SigningInventory, load_signing_inventory
 
 
@@ -425,6 +439,7 @@ def sign_release(
     runtime_password_path = runtime_dir / "android-passwords"
     published = False
     provenance_pins: tuple[_PinnedFile, _PinnedFile, _InputEvidence] | None = None
+    prepared_target_pin: _PinnedFile | None = None
     try:
         runtime_dir.mkdir(mode=0o700)
         if paths.build_provenance is None:
@@ -474,8 +489,32 @@ def sign_release(
                         plan=plan,
                         container_keys_dir=container_snapshot.command_directory,
                     )
+                    source_certificates = _load_source_certificates(
+                        plan, paths.android_root
+                    )
+                    release_certificates = _load_release_certificates(
+                        plan, container_snapshot.command_directory
+                    )
+                    prepared_target_path = runtime_dir / "prepared-target-files.zip"
+                    try:
+                        selinux_evidence = rewrite_target_files_mac_permissions(
+                            target_snapshot.proc_path,
+                            prepared_target_path,
+                            source_certificates,
+                            release_certificates,
+                        )
+                        os.chmod(prepared_target_path, 0o400)
+                        with prepared_target_path.open("rb") as prepared_file:
+                            os.fsync(prepared_file.fileno())
+                    except (OSError, MacPermissionsError) as error:
+                        raise ReleaseSigningError(
+                            f"SELinux signer policy rewrite failed: {error}"
+                        ) from error
+                    prepared_target_pin = _open_prepared_target_files(
+                        prepared_target_path
+                    )
                     staging_paths = SigningPaths(
-                        target_snapshot.proc_path,
+                        prepared_target_pin.proc_path,
                         paths.android_root,
                         container_snapshot.command_directory,
                         staging,
@@ -528,6 +567,9 @@ def sign_release(
                                 private_environment,
                                 runner,
                             )
+                            prepared_target_pin.verify_named(
+                                "prepared target-files", verify_hash=True
+                            )
                             target_snapshot.verify()
                             container_snapshot.verify()
                             pinned_helper.verify_named(
@@ -568,6 +610,9 @@ def sign_release(
                                 staging_paths.public_keys_dir,
                             )
                             target_snapshot.verify()
+                            prepared_target_pin.verify_named(
+                                "prepared target-files", verify_hash=True
+                            )
                             container_snapshot.verify()
                             pinned_helper.verify_named(
                                 "signing helper", verify_hash=True
@@ -595,6 +640,7 @@ def sign_release(
             plan,
             provenance_evidence,
             build_record,
+            selinux_evidence,
         )
         _write_checksums(staging_paths)
         _fsync_directory(staging)
@@ -609,6 +655,8 @@ def sign_release(
         if provenance_pins is not None:
             os.close(provenance_pins[0].descriptor)
             os.close(provenance_pins[1].descriptor)
+        if prepared_target_pin is not None:
+            os.close(prepared_target_pin.descriptor)
     return paths.output_dir
 
 
@@ -948,6 +996,115 @@ def _validate_inputs(paths: SigningPaths, *, archive: Path | None = None) -> Sig
     if not java.is_file() or not os.access(java, os.X_OK):
         raise ReleaseSigningError("required Android JDK21 java is unavailable")
     return inventory
+
+
+def _load_source_certificates(plan, android_root: Path) -> dict[str, tuple[bytes, ...]]:
+    certificates: dict[str, list[bytes]] = {}
+    for mapping in plan.android_mappings:
+        path = android_root / f"{mapping.source_stem}.x509.pem"
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                raise ReleaseSigningError("source signing certificate is unsafe")
+            payload = bytearray()
+            offset = 0
+            while True:
+                chunk = os.pread(descriptor, 64 * 1024, offset)
+                if not chunk:
+                    break
+                payload.extend(chunk)
+                offset += len(chunk)
+            if _identity_from_stat(path.stat(follow_symlinks=False)) != _identity_from_stat(
+                metadata
+            ):
+                raise ReleaseSigningError("source signing certificate changed")
+            certificate = certificate_der_from_pem(bytes(payload))
+        except OSError as error:
+            raise ReleaseSigningError("source signing certificate is unavailable") from error
+        except MacPermissionsError as error:
+            raise ReleaseSigningError("source signing certificate is invalid") from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        certificates.setdefault(mapping.destination_role, []).append(certificate)
+    return {
+        role: tuple(dict.fromkeys(values))
+        for role, values in certificates.items()
+    }
+
+
+def _load_release_certificates(plan, certificate_dir: Path) -> dict[str, bytes]:
+    certificates: dict[str, bytes] = {}
+    for role in plan.android_roles:
+        try:
+            certificates[role] = certificate_der_from_pem(
+                (certificate_dir / f"{role}.x509.pem").read_bytes()
+            )
+        except (OSError, MacPermissionsError) as error:
+            raise ReleaseSigningError("release signing certificate is invalid") from error
+    return certificates
+
+
+def _open_prepared_target_files(path: Path) -> _PinnedFile:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+        ):
+            os.close(descriptor)
+            descriptor = -1
+            raise ReleaseSigningError("prepared target-files is unsafe")
+        return _PinnedFile(
+            path,
+            descriptor,
+            _identity_from_stat(metadata),
+            _sha256_descriptor(descriptor),
+        )
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise ReleaseSigningError("prepared target-files is unavailable") from error
+
+
+def _validate_mac_permissions_rewrite(
+    target_files: Path,
+    plan,
+    android_root: Path,
+    certificate_dir: Path,
+) -> dict[str, object]:
+    try:
+        with ZipFile(target_files) as archive:
+            documents = mac_permissions_documents_from_archive(archive)
+        _rewritten, evidence = rewrite_mac_permissions(
+            documents,
+            _load_source_certificates(plan, android_root),
+            _load_release_certificates(plan, certificate_dir),
+        )
+    except (BadZipFile, MacPermissionsError) as error:
+        raise ReleaseSigningError(
+            f"SELinux signer policy rewrite failed: {error}"
+        ) from error
+    return evidence
 
 
 def _validate_key_directory(keys_dir: Path) -> None:
@@ -1374,6 +1531,7 @@ def _write_report(
     plan,
     provenance_evidence: _InputEvidence,
     build_record: Mapping[str, object],
+    selinux_evidence: Mapping[str, object],
 ) -> None:
     artifacts = (
         staging_paths.signed_target_files,
@@ -1410,6 +1568,7 @@ def _write_report(
             for path in artifacts
         },
         "input_metadata_sha256": input_metadata_sha256,
+        "selinux_mac_permissions": selinux_evidence,
         "key_plan": {
             "android_mappings": [
                 {
@@ -1612,7 +1771,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except (OSError, json.JSONDecodeError, BuildProvenanceError) as error:
                 raise ReleaseSigningError(f"build provenance validation failed: {error}") from error
-            _validate_keyset(inventory, paths.keys_dir)
+            plan = _validate_keyset(inventory, paths.keys_dir)
+            _validate_mac_permissions_rewrite(
+                paths.target_files,
+                plan,
+                paths.android_root,
+                paths.keys_dir,
+            )
             build_signing_commands(
                 inventory,
                 paths,

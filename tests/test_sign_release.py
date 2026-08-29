@@ -18,9 +18,37 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SIGNING_HELPER = ROOT / "scripts/ubuntu/avb_signing_helper.py"
+MAC_ROLES = (
+    "platform",
+    "sdk_sandbox",
+    "bluetooth",
+    "media",
+    "networkstack",
+    "nfc",
+)
+
+
+def fixture_der(name: str, *, release: bool = False) -> bytes:
+    payload = (f"{'release' if release else 'source'}-{name}").encode()
+    return b"\x30" + bytes((len(payload),)) + payload
+
+
+def fixture_pem(value: bytes) -> bytes:
+    import base64
+
+    return (
+        b"-----BEGIN CERTIFICATE-----\n"
+        + base64.b64encode(value)
+        + b"\n-----END CERTIFICATE-----\n"
+    )
 
 APK_CERTS = '''\
 name="framework-res.apk" certificate="build/make/target/product/security/platform.x509.pem" private_key="build/make/target/product/security/platform.pk8"
+name="SdkSandbox.apk" certificate="build/make/target/product/security/sdk_sandbox.x509.pem" private_key="build/make/target/product/security/sdk_sandbox.pk8"
+name="Bluetooth.apk" certificate="build/make/target/product/security/bluetooth.x509.pem" private_key="build/make/target/product/security/bluetooth.pk8"
+name="Media.apk" certificate="build/make/target/product/security/media.x509.pem" private_key="build/make/target/product/security/media.pk8"
+name="NetworkStack.apk" certificate="build/make/target/product/security/networkstack.x509.pem" private_key="build/make/target/product/security/networkstack.pk8"
+name="Nfc.apk" certificate="build/make/target/product/security/nfc.x509.pem" private_key="build/make/target/product/security/nfc.pk8"
 name="Settings.apk" certificate="build/make/target/product/security/testkey.x509.pem" private_key="build/make/target/product/security/testkey.pk8"
 name="CtsCompilationApp.apk" certificate="cts/hostsidetests/compilation/certs/testkey.x509.pem" private_key="cts/hostsidetests/compilation/certs/testkey.pk8"
 '''
@@ -64,6 +92,31 @@ def write_target_files(
         archive.writestr("META/otakeys.txt", otakeys)
         archive.writestr("SYSTEM/build.prop", system_build_prop)
         archive.writestr("IMAGES/boot.img", b"fixed-kernel-boot")
+        plat_signers = b"".join(
+            b'<signer signature="'
+            + fixture_der(role).hex().encode()
+            + b'"><seinfo value="'
+            + ("network_stack" if role == "networkstack" else role).encode()
+            + b'"/></signer>'
+            for role in MAC_ROLES
+        )
+        archive.writestr(
+            "SYSTEM/etc/selinux/plat_mac_permissions.xml",
+            b'<?xml version="1.0" encoding="iso-8859-1"?><policy>'
+            + plat_signers
+            + b"</policy>",
+        )
+        archive.writestr(
+            "VENDOR/etc/selinux/vendor_mac_permissions.xml",
+            b'<?xml version="1.0" encoding="iso-8859-1"?><policy><signer signature="'
+            + fixture_der("platform").hex().encode()
+            + b'"><seinfo value="platform"/></signer></policy>',
+        )
+        for partition in ("ODM", "PRODUCT", "SYSTEM_EXT"):
+            archive.writestr(
+                f"{partition}/etc/selinux/{partition.lower()}_mac_permissions.xml",
+                b'<?xml version="1.0" encoding="iso-8859-1"?><policy></policy>',
+            )
 
 
 def write_zip_symlink(
@@ -148,16 +201,20 @@ def write_fake_keyset(keys_dir: Path, secret: str) -> None:
     keys_dir.mkdir(mode=0o700)
     public_dir = keys_dir / "public"
     public_dir.mkdir(mode=0o700)
-    android = ("platform", "releasekey", "testkey-f88799ce31c1")
+    android = tuple(sorted((*MAC_ROLES, "releasekey", "testkey-f88799ce31c1")))
     apex = ("com.android.art",)
     avb = ("avb_boot", "avb_vbmeta", "avb_vbmeta_system", "avb_vbmeta_vendor")
     for role in android:
         (keys_dir / f"{role}.pk8").write_bytes((role + "-pk8").encode("ascii"))
-        (keys_dir / f"{role}.x509.pem").write_text(role + "-certificate\n", encoding="utf-8")
+        (keys_dir / f"{role}.x509.pem").write_bytes(
+            fixture_pem(fixture_der(role, release=True))
+        )
     for role in apex:
         (keys_dir / f"{role}.pem").write_bytes((role + "-encrypted").encode("ascii"))
         (keys_dir / f"{role}.pk8").write_bytes((role + "-pk8").encode("ascii"))
-        (keys_dir / f"{role}.x509.pem").write_text(role + "-certificate\n", encoding="utf-8")
+        (keys_dir / f"{role}.x509.pem").write_bytes(
+            fixture_pem(fixture_der(role, release=True))
+        )
         (public_dir / f"{role}.avbpubkey").write_bytes((role + "-avb-public").encode("ascii"))
     for role in avb:
         (keys_dir / f"{role}.pem").write_bytes((role + "-encrypted").encode("ascii"))
@@ -214,6 +271,20 @@ def write_fake_host_tools(android_root: Path) -> None:
         path = tools / name
         path.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
         path.chmod(0o755)
+    for role in (*MAC_ROLES, "testkey"):
+        certificate = (
+            android_root
+            / "build/make/target/product/security"
+            / f"{role}.x509.pem"
+        )
+        certificate.parent.mkdir(parents=True, exist_ok=True)
+        certificate.write_bytes(fixture_pem(fixture_der(role)))
+    cts_certificate = (
+        android_root
+        / "cts/hostsidetests/compilation/certs/testkey.x509.pem"
+    )
+    cts_certificate.parent.mkdir(parents=True, exist_ok=True)
+    cts_certificate.write_bytes(fixture_pem(fixture_der("cts-testkey")))
 
 
 def write_fake_android_jdk(android_root: Path) -> Path:
@@ -255,6 +326,7 @@ class FakeReleaseRunner:
         self.legacy_ota = legacy_ota
         self.calls = []
         self.signing_input_bytes = None
+        self.signing_mac_permissions = None
         self.container_material = {}
         self.config_bytes = None
         self.password_entry_paths = ()
@@ -272,6 +344,10 @@ class FakeReleaseRunner:
         self.calls.append((command, dict(env)))
         if tool == "sign_target_files_apks":
             self.signing_input_bytes = Path(command[-2]).read_bytes()
+            with zipfile.ZipFile(Path(command[-2])) as signing_input:
+                self.signing_mac_permissions = signing_input.read(
+                    "SYSTEM/etc/selinux/plat_mac_permissions.xml"
+                )
             self.config_bytes = Path(env["FLEUR_AVB_SIGNING_CONFIG"]).read_bytes()
             password_lines = Path(env["ANDROID_PW_FILE"]).read_text(
                 encoding="utf-8"
@@ -300,8 +376,9 @@ class FakeReleaseRunner:
         output.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(output, "w") as archive:
             if tool == "sign_target_files_apks":
-                archive.writestr("META/misc_info.txt", MISC_INFO)
-                archive.writestr("META/otakeys.txt", "\n")
+                with zipfile.ZipFile(Path(command[-2])) as signing_input:
+                    for member in signing_input.infolist():
+                        archive.writestr(member, signing_input.read(member))
             elif tool == "ota_from_target_files":
                 archive.writestr(
                     "META-INF/com/android/metadata",
@@ -439,7 +516,14 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                     for value in helper_values
                 )
             )
-            self.assertEqual(tool_runner.signing_input_bytes, paths.target_files.read_bytes())
+            self.assertNotEqual(
+                tool_runner.signing_input_bytes, paths.target_files.read_bytes()
+            )
+            for role in MAC_ROLES:
+                self.assertIn(
+                    fixture_der(role, release=True).hex().encode(),
+                    tool_runner.signing_mac_permissions,
+                )
             self.assertTrue(sign_command[-2].startswith(f"/proc/{os.getpid()}/fd/"))
             runtime_key_dir = Path(sign_command[sign_command.index("-d") + 1])
             self.assertTrue(
@@ -461,7 +545,7 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             expected_runtime_stems = {
                 str(runtime_key_dir / role)
                 for role in (
-                    "platform",
+                    *MAC_ROLES,
                     "releasekey",
                     "testkey-f88799ce31c1",
                     "com.android.art",
@@ -475,6 +559,39 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             self.assertEqual(
                 (paths.public_keys_dir / "com.android.art.x509.pem").read_bytes(),
                 tool_runner.container_material["com.android.art.x509.pem"],
+            )
+
+    def test_rewrites_mac_permissions_before_partition_image_signing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, secret = self.make_fixture(root)
+            runner = FakeReleaseRunner(paths.output_dir)
+
+            self.sign_release(
+                paths,
+                runner=runner,
+                openssl_runner=FakeCryptoRunner(secret),
+            )
+
+            prepared_policy = runner.signing_mac_permissions
+            with zipfile.ZipFile(paths.target_files) as unsigned:
+                unsigned_policy = unsigned.read(
+                    "SYSTEM/etc/selinux/plat_mac_permissions.xml"
+                )
+            with zipfile.ZipFile(paths.signed_target_files) as signed:
+                signed_policy = signed.read(
+                    "SYSTEM/etc/selinux/plat_mac_permissions.xml"
+                )
+            for role in MAC_ROLES:
+                self.assertIn(fixture_der(role).hex().encode(), unsigned_policy)
+                self.assertNotIn(fixture_der(role).hex().encode(), prepared_policy)
+                self.assertIn(
+                    fixture_der(role, release=True).hex().encode(), prepared_policy
+                )
+            self.assertEqual(prepared_policy, signed_policy)
+            report = json.loads(paths.report.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(MAC_ROLES), set(report["selinux_mac_permissions"]["roles"])
             )
 
     def test_generated_zip_validation_rejects_unsafe_members(self):
@@ -629,13 +746,6 @@ class ReleaseOrchestrationTest(unittest.TestCase):
 
             def preserving_runner(command, *, env):
                 base_runner(command, env=env)
-                if Path(command[0]).name == "sign_target_files_apks":
-                    with zipfile.ZipFile(Path(command[-1]), "a") as archive:
-                        write_zip_symlink(
-                            archive,
-                            "BOOT/RAMDISK/adb_keys",
-                            b"/product/etc/security/adb_keys",
-                        )
 
             published = self.sign_release(
                 paths,
@@ -1013,6 +1123,42 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                 self.assertEqual(main(arguments), 1)
 
             self.assertIn("JDK21 java", stderr.getvalue())
+            self.assertFalse(paths.output_dir.exists())
+
+    def test_dry_run_rejects_incomplete_mac_permissions_policy(self):
+        from scripts.ubuntu.sign_release import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, _secret = self.make_fixture(root)
+            with zipfile.ZipFile(paths.target_files) as archive:
+                entries = {
+                    member.filename: archive.read(member)
+                    for member in archive.infolist()
+                }
+            policy_name = "SYSTEM/etc/selinux/plat_mac_permissions.xml"
+            entries[policy_name] = entries[policy_name].replace(
+                b'<signer signature="'
+                + fixture_der("nfc").hex().encode()
+                + b'"><seinfo value="nfc"/></signer>',
+                b"",
+            )
+            with zipfile.ZipFile(paths.target_files, "w") as archive:
+                for name, value in entries.items():
+                    archive.writestr(name, value)
+            write_build_provenance(paths.build_provenance, paths.target_files)
+            arguments = [
+                "--target-files", str(paths.target_files),
+                "--android-root", str(paths.android_root),
+                "--keys-dir", str(paths.keys_dir),
+                "--output-dir", str(paths.output_dir),
+                "--build-provenance", str(paths.build_provenance),
+                "--dry-run",
+            ]
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                self.assertEqual(1, main(arguments))
+            self.assertIn("SELinux signer policy", stderr.getvalue())
             self.assertFalse(paths.output_dir.exists())
 
     def test_signing_rejects_missing_android_jdk_java_before_subprocess(self):

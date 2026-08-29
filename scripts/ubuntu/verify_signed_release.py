@@ -28,10 +28,24 @@ try:
         validate_final_build_provenance,
     )
     from scripts.ubuntu.generate_release_keys import build_key_plan
+    from scripts.ubuntu.selinux_signing import (
+        MacPermissionsError,
+        certificate_der_from_pem,
+        expected_source_certificates,
+        mac_permissions_documents_from_archive,
+        rewrite_mac_permissions,
+    )
     from scripts.ubuntu.signing_metadata import load_signing_inventory
 except ModuleNotFoundError:
     from build_provenance import BuildProvenanceError, validate_final_build_provenance
     from generate_release_keys import build_key_plan
+    from selinux_signing import (
+        MacPermissionsError,
+        certificate_der_from_pem,
+        expected_source_certificates,
+        mac_permissions_documents_from_archive,
+        rewrite_mac_permissions,
+    )
     from signing_metadata import load_signing_inventory
 
 try:
@@ -1170,6 +1184,7 @@ def verify_signer_report(
     expected_presigned: Mapping[str, object],
     expected_public_fingerprints: Mapping[str, str],
     expected_build_provenance: Mapping[str, object],
+    expected_selinux_mac_permissions: Mapping[str, object],
 ) -> dict[str, object]:
     if report.get("schema_version") != 2 or report.get("device") != "fleur":
         raise VerificationError("signer report schema/device is invalid")
@@ -1207,6 +1222,12 @@ def verify_signer_report(
         raise VerificationError("signer report public-key fingerprints are invalid")
     if report.get("build_provenance") != dict(expected_build_provenance):
         raise VerificationError("signer report build provenance binding is invalid")
+    if report.get("selinux_mac_permissions") != dict(
+        expected_selinux_mac_permissions
+    ):
+        raise VerificationError(
+            "signer report SELinux mac_permissions binding is invalid"
+        )
     return {
         "input_sha256": actual_input["sha256"],
         "report_bound_outputs": bound_outputs,
@@ -1215,6 +1236,7 @@ def verify_signer_report(
         "presigned_allowlist": dict(expected_presigned),
         "public_fingerprints": dict(expected_public_fingerprints),
         "build_provenance": dict(expected_build_provenance),
+        "selinux_mac_permissions": dict(expected_selinux_mac_permissions),
     }
 
 
@@ -1460,6 +1482,44 @@ def verify_ota_whole_file_signature(
         "execution": "isolated-clean-export",
         "export_sha256": export_sha256,
     }
+
+
+def verify_selinux_mac_permissions(
+    unsigned_target_files: Path,
+    signed_target_files: Path,
+    public_keys: Path,
+) -> dict[str, object]:
+    try:
+        with zipfile.ZipFile(unsigned_target_files) as unsigned, zipfile.ZipFile(
+            signed_target_files
+        ) as signed:
+            unsigned_documents = mac_permissions_documents_from_archive(unsigned)
+            signed_documents = mac_permissions_documents_from_archive(signed)
+        if set(unsigned_documents) != set(signed_documents):
+            raise VerificationError(
+                "signed mac_permissions member inventory differs from unsigned"
+            )
+        source_certificates = expected_source_certificates(unsigned_documents)
+        release_certificates = {
+            role: certificate_der_from_pem(
+                (Path(public_keys) / f"{role}.x509.pem").read_bytes()
+            )
+            for role in source_certificates
+        }
+        expected_documents, evidence = rewrite_mac_permissions(
+            unsigned_documents,
+            source_certificates,
+            release_certificates,
+        )
+    except (OSError, zipfile.BadZipFile, MacPermissionsError) as error:
+        raise VerificationError(
+            f"SELinux mac_permissions verification failed: {error}"
+        ) from error
+    if signed_documents != expected_documents:
+        raise VerificationError(
+            "signed mac_permissions mappings do not match release certificates"
+        )
+    return evidence
 
 
 def _read_unique_bytes(archive: zipfile.ZipFile, name: str) -> bytes:
@@ -2755,6 +2815,11 @@ def _verify_release_snapshotted(
     metadata_hashes = target_metadata_hashes(paths["unsigned_target_files"])
     expected_key_plan = key_plan_evidence(unsigned_plan)
     approved_presigned = presigned_inventory(unsigned_inventory)
+    selinux_mac_permissions = verify_selinux_mac_permissions(
+        paths["unsigned_target_files"],
+        paths["signed_target_files"],
+        public_keys,
+    )
     try:
         signer_report = json.loads(Path(args.signing_report).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -2767,6 +2832,7 @@ def _verify_release_snapshotted(
         approved_presigned,
         fingerprint_public_bundle(public_keys),
         expected_build_provenance,
+        selinux_mac_permissions,
     )
     verify_signed_key_plan(
         paths["unsigned_target_files"],
@@ -2932,6 +2998,7 @@ def _verify_release_snapshotted(
             "ota-payload-and-firmware",
             "ota-whole-file-signature",
             "fastboot-target-files-binding",
+            "selinux-mac-permissions",
         )
     ]
     result: dict[str, object] = {
@@ -2950,6 +3017,7 @@ def _verify_release_snapshotted(
         "sku_mapping": sku_mapping,
         "target_files": target_relationship,
         "signing_provenance": signing_evidence,
+        "selinux_mac_permissions": selinux_mac_permissions,
         "packages": package_evidence,
         "avb_public_fingerprints": avb_fingerprints,
         "public_bundle_fingerprints": public_fingerprints,
