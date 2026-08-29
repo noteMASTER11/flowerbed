@@ -95,20 +95,23 @@ def build_key_plan(source: Path | SigningInventory) -> KeyPlan:
     if len(fixed_roles) != len(set(fixed_roles)):
         raise KeyGenerationError("key metadata produces colliding output names")
 
-    source_stems = tuple(
-        sorted(
-            {
-                certificate.certificate
-                for certificate in inventory.apk_certificates
-                if certificate.certificate != "PRESIGNED"
-            }
-        )
-    )
+    apk_source_stems = {
+        certificate.certificate
+        for certificate in inventory.apk_certificates
+        if certificate.certificate != "PRESIGNED"
+    }
+    extra_ota_key_stems = set(inventory.extra_ota_key_stems)
+    collisions = (apk_source_stems & extra_ota_key_stems) - {
+        _DEFAULT_ANDROID_TEST_KEY
+    }
+    if collisions:
+        raise KeyGenerationError("extra OTA key collides with an APK source key mapping")
+    source_stems = tuple(sorted(apk_source_stems | extra_ota_key_stems))
     basename_counts = Counter(Path(stem).name for stem in source_stems)
     used_roles = set(fixed_roles)
     mappings: list[AndroidKeyMapping] = []
     for source_stem in source_stems:
-        if source_stem == _DEFAULT_ANDROID_TEST_KEY:
+        if source_stem == _DEFAULT_ANDROID_TEST_KEY or source_stem in extra_ota_key_stems:
             destination_role = "releasekey"
         else:
             basename = Path(source_stem).name

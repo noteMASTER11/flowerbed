@@ -48,6 +48,7 @@ REAL_MISC_INFO = '''\
 ab_update=true
 virtual_ab=true
 default_system_dev_certificate=build/make/target/product/security/testkey
+extra_recovery_keys=vendor/lineage/build/target/product/security/lineage
 avb_boot_key_path=external/avb/test/data/testkey_rsa4096.pem
 avb_boot_algorithm=SHA256_RSA4096
 avb_vbmeta_key_path=external/avb/test/data/testkey_rsa4096.pem
@@ -97,6 +98,48 @@ class SigningMetadataTest(unittest.TestCase):
         self.assertEqual(inventory.device, "fleur")
         self.assertEqual(inventory.build_tags, frozenset({"test-keys"}))
         self.assertTrue(inventory.uses_test_build_tags)
+        self.assertEqual(
+            inventory.extra_ota_key_stems,
+            ("vendor/lineage/build/target/product/security/lineage",),
+        )
+
+    def test_parses_extra_ota_key_lists_deterministically(self):
+        extra = REAL_MISC_INFO + (
+            "extra_ota_keys=vendor/keys/secondary.x509.pem "
+            "vendor/lineage/build/target/product/security/lineage.pk8 "
+            "vendor/keys/secondary\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            target_files = Path(directory) / "lineage_fleur-target_files.zip"
+            write_target_files(target_files, misc_info=extra)
+
+            inventory = load_signing_inventory(target_files)
+
+        self.assertEqual(
+            inventory.extra_ota_key_stems,
+            (
+                "vendor/keys/secondary",
+                "vendor/lineage/build/target/product/security/lineage",
+            ),
+        )
+
+    def test_rejects_unsafe_extra_ota_key_stems(self):
+        for unsafe in (
+            "/absolute/key",
+            "vendor/../lineage",
+            "vendor//lineage",
+            r"vendor\lineage",
+            "PRESIGNED",
+        ):
+            with self.subTest(unsafe=unsafe), tempfile.TemporaryDirectory() as directory:
+                target_files = Path(directory) / "lineage_fleur-target_files.zip"
+                write_target_files(
+                    target_files,
+                    misc_info=REAL_MISC_INFO + f"extra_ota_keys={unsafe}\n",
+                )
+
+                with self.assertRaisesRegex(SigningMetadataError, "extra_ota_keys"):
+                    load_signing_inventory(target_files)
 
     def test_allows_empty_optional_properties_in_canonical_system_build_prop(self):
         properties = (

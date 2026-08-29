@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import shlex
 from types import MappingProxyType
 from typing import Mapping
@@ -50,10 +51,12 @@ class SigningInventory:
     device: str
     build_tags: frozenset[str]
     uses_test_build_tags: bool
+    extra_ota_key_stems: tuple[str, ...] = ()
 
 
 _PRESIGNED = "PRESIGNED"
 _SUPPORTED_AVB_ALGORITHM = "SHA256_RSA4096"
+_SAFE_KEY_PATH_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _REQUIRED_MEMBERS = (
     "META/apkcerts.txt",
     "META/apexkeys.txt",
@@ -306,6 +309,28 @@ def _parse_avb_keys(misc_info: Mapping[str, str]) -> tuple[AvbPartitionKey, ...]
     return tuple(sorted(records, key=lambda record: record.partition))
 
 
+def _parse_extra_ota_key_stems(misc_info: Mapping[str, str]) -> tuple[str, ...]:
+    stems: set[str] = set()
+    for property_name in ("extra_recovery_keys", "extra_ota_keys"):
+        for value in misc_info.get(property_name, "").split():
+            if (
+                value == _PRESIGNED
+                or value.startswith("/")
+                or "\\" in value
+                or "\x00" in value
+                or any(
+                    component in {"", ".", ".."}
+                    or not _SAFE_KEY_PATH_COMPONENT.fullmatch(component)
+                    for component in value.split("/")
+                )
+            ):
+                raise SigningMetadataError(
+                    f"misc_info.txt {property_name} contains an unsafe key stem"
+                )
+            stems.add(_normalize_key_stem(value))
+    return tuple(sorted(stems))
+
+
 def _assemble_inventory(
     apk_certificates: tuple[ApkCertificate, ...],
     apexes: tuple[ApexKey, ...],
@@ -315,6 +340,7 @@ def _assemble_inventory(
     device: str,
     build_tags: frozenset[str],
 ) -> SigningInventory:
+    extra_ota_key_stems = _parse_extra_ota_key_stems(misc_info)
     source_key_stems = {
         value
         for certificate in apk_certificates
@@ -332,6 +358,7 @@ def _assemble_inventory(
                 )
             )
     source_key_stems.update(record.source_key for record in avb_keys)
+    source_key_stems.update(extra_ota_key_stems)
     android_roles = {
         Path(certificate.certificate).name
         for certificate in apk_certificates
@@ -347,6 +374,7 @@ def _assemble_inventory(
         device=device,
         build_tags=frozenset(build_tags),
         uses_test_build_tags="test-keys" in build_tags,
+        extra_ota_key_stems=extra_ota_key_stems,
     )
 
 

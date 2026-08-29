@@ -52,11 +52,13 @@ ro.build.tags=test-keys
 '''
 
 
-def write_target_files(path: Path, *, apkcerts: str = APK_CERTS) -> None:
+def write_target_files(
+    path: Path, *, apkcerts: str = APK_CERTS, misc_info: str = MISC_INFO
+) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("META/apkcerts.txt", apkcerts)
         archive.writestr("META/apexkeys.txt", APEX_KEYS)
-        archive.writestr("META/misc_info.txt", MISC_INFO)
+        archive.writestr("META/misc_info.txt", misc_info)
         archive.writestr("SYSTEM/build.prop", SYSTEM_BUILD_PROP)
 
 
@@ -323,6 +325,21 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             ),
             (("build/make/target/product/security/platform", "platform"),),
         )
+
+    def test_plan_rejects_extra_ota_key_collision_with_apk_mapping(self):
+        with self.private_temp() as directory:
+            target_files = Path(directory) / "target-files.zip"
+            write_target_files(
+                target_files,
+                misc_info=(
+                    MISC_INFO
+                    + "extra_recovery_keys="
+                    + "build/make/target/product/security/platform\n"
+                ),
+            )
+
+            with self.assertRaisesRegex(self.KeyGenerationError, "collid"):
+                self.build_key_plan(target_files)
 
     def test_dry_run_rejects_missing_android_host_avbtool(self):
         with self.private_temp() as directory:

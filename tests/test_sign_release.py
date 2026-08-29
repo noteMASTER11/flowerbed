@@ -49,11 +49,16 @@ ro.build.tags=test-keys
 '''
 
 
-def write_target_files(path: Path, *, system_build_prop: str = SYSTEM_BUILD_PROP) -> None:
+def write_target_files(
+    path: Path,
+    *,
+    system_build_prop: str = SYSTEM_BUILD_PROP,
+    misc_info: str = MISC_INFO,
+) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("META/apkcerts.txt", APK_CERTS)
         archive.writestr("META/apexkeys.txt", APEX_KEYS)
-        archive.writestr("META/misc_info.txt", MISC_INFO)
+        archive.writestr("META/misc_info.txt", misc_info)
         archive.writestr("SYSTEM/build.prop", system_build_prop)
         archive.writestr("IMAGES/boot.img", b"fixed-kernel-boot")
 
@@ -945,6 +950,42 @@ class SigningCommandTest(unittest.TestCase):
 
         self.assertEqual(tuple(private_environment["PATH"].split(os.pathsep)), expected)
         self.assertEqual(tuple(public_environment["PATH"].split(os.pathsep)), expected)
+
+    def test_maps_fleur_extra_recovery_key_to_releasekey(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target_files = root / "lineage_fleur-target_files.zip"
+            write_target_files(
+                target_files,
+                misc_info=(
+                    MISC_INFO
+                    + "extra_recovery_keys="
+                    + "vendor/lineage/build/target/product/security/lineage\n"
+                ),
+            )
+            paths = self.SigningPaths(
+                target_files=target_files,
+                android_root=root / "android",
+                keys_dir=root / "keys",
+                output_dir=root / "20260829T123456Z",
+            )
+            inventory = self.load_signing_inventory(target_files)
+
+            commands = self.build_signing_commands(
+                inventory,
+                paths,
+                signing_helper=SIGNING_HELPER,
+                public_key_dir=paths.output_dir / ".signing-runtime/public-pem",
+            )
+
+        sign = list(commands.sign_target_files)
+        expected = (
+            "vendor/lineage/build/target/product/security/lineage="
+            + str(paths.keys_dir / "releasekey")
+        )
+        self.assertTrue(
+            any(sign[index : index + 2] == ["-k", expected] for index in range(len(sign) - 1))
+        )
 
     def test_disambiguates_android_role_collisions_with_apex_roles(self):
         from scripts.ubuntu.signing_metadata import (
