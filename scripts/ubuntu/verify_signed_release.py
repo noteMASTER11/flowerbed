@@ -71,6 +71,20 @@ EXPECTED_AVB_CHAIN_PARTITIONS = (
     ("vbmeta_system", 2),
     ("vbmeta_vendor", 3),
 )
+FASTBOOT_PRODUCER_CONTROL_PROPERTIES = (
+    "super_image_in_update_package",
+    "bootloader_in_update_package",
+    "dynamic_partition_list",
+    "super_block_devices",
+    "dynamic_partition_retrofit",
+    "build_super_partition",
+    "extfs_sparse_flag",
+)
+FASTBOOT_PRESERVED_METADATA = (
+    "META/ab_partitions.txt",
+    "META/fastboot-info.txt",
+    "OTA/android-info.txt",
+)
 REQUIRED_ANDROID_PAYLOAD_PARTITIONS = (
     "boot",
     "dtbo",
@@ -1481,6 +1495,50 @@ def _parse_fastboot_partition_list(data: bytes) -> tuple[str, ...]:
     return partitions
 
 
+def _verify_fastboot_producer_controls(
+    unsigned: zipfile.ZipFile,
+    unsigned_members: Mapping[str, zipfile.ZipInfo],
+    signed: zipfile.ZipFile,
+    signed_members: Mapping[str, zipfile.ZipInfo],
+) -> str:
+    for member_name in ("META/misc_info.txt", *FASTBOOT_PRESERVED_METADATA):
+        _require_regular_archive_member(unsigned_members, member_name)
+        _require_regular_archive_member(signed_members, member_name)
+    unsigned_misc = _parse_properties(
+        _read_unique_text(unsigned, "META/misc_info.txt"), "META/misc_info.txt"
+    )
+    signed_misc = _parse_properties(
+        _read_unique_text(signed, "META/misc_info.txt"), "META/misc_info.txt"
+    )
+    controls: dict[str, object] = {}
+    for property_name in FASTBOOT_PRODUCER_CONTROL_PROPERTIES:
+        unsigned_value = (
+            property_name in unsigned_misc,
+            unsigned_misc.get(property_name),
+        )
+        signed_value = (
+            property_name in signed_misc,
+            signed_misc.get(property_name),
+        )
+        if signed_value != unsigned_value:
+            raise VerificationError(
+                f"fastboot producer control changed after signing: {property_name}"
+            )
+        controls[property_name] = unsigned_value
+    for member_name in FASTBOOT_PRESERVED_METADATA:
+        unsigned_bytes = _read_unique_bytes(unsigned, member_name)
+        signed_bytes = _read_unique_bytes(signed, member_name)
+        if signed_bytes != unsigned_bytes:
+            raise VerificationError(
+                f"fastboot producer control changed after signing: {member_name}"
+            )
+        controls[member_name] = hashlib.sha256(unsigned_bytes).hexdigest()
+    serialized = json.dumps(
+        controls, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
 def _derive_fastboot_member_mapping(
     target: zipfile.ZipFile,
     members: Mapping[str, zipfile.ZipInfo],
@@ -1657,11 +1715,19 @@ def _validate_fastboot_info(
 
 
 def verify_fastboot_against_target_files(
-    signed_target_files: Path, fastboot: Path
+    unsigned_target_files: Path, signed_target_files: Path, fastboot: Path
 ) -> dict[str, object]:
-    with zipfile.ZipFile(signed_target_files) as target, zipfile.ZipFile(fastboot) as images:
+    with (
+        zipfile.ZipFile(unsigned_target_files) as unsigned,
+        zipfile.ZipFile(signed_target_files) as target,
+        zipfile.ZipFile(fastboot) as images,
+    ):
+        unsigned_members = _archive_members(unsigned, allow_symlinks=True)
         target_members = _archive_members(target, allow_symlinks=True)
         fastboot_members = _archive_members(images)
+        producer_controls_sha256 = _verify_fastboot_producer_controls(
+            unsigned, unsigned_members, target, target_members
+        )
         mapping, dynamic_partitions = _derive_fastboot_member_mapping(
             target, target_members
         )
@@ -1702,6 +1768,7 @@ def verify_fastboot_against_target_files(
                 hashes[partition] = hashlib.sha256(fastboot_bytes).hexdigest()
                 image_names.append(output_name)
     return {
+        "producer_controls_sha256": producer_controls_sha256,
         "android_info_sha256": hashlib.sha256(fastboot_info).hexdigest(),
         "fastboot_info_sha256": hashlib.sha256(packaged_fastboot_info).hexdigest(),
         "commands": list(commands),
@@ -2830,7 +2897,9 @@ def _verify_release_snapshotted(
         raise VerificationError("OTA boot does not match signed target-files boot")
 
     fastboot_evidence = verify_fastboot_against_target_files(
-        paths["signed_target_files"], paths["fastboot"]
+        paths["unsigned_target_files"],
+        paths["signed_target_files"],
+        paths["fastboot"],
     )
     if fastboot_evidence["image_sha256"]["boot"] != signed_boot["raw_sha256"]:
         raise VerificationError("fastboot boot does not match signed target-files boot")

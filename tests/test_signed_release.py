@@ -1069,12 +1069,16 @@ class SignedReleasePolicyTest(unittest.TestCase):
         module = load_verifier()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            target = root / "target.zip"
+            unsigned = root / "unsigned.zip"
+            target = root / "signed.zip"
             fastboot = root / "fastboot.zip"
             target_entries, fastboot_entries = fleur_fastboot_entries()
+            write_zip_entries(unsigned, target_entries)
             write_zip_entries(target, target_entries)
             write_zip_entries(fastboot, fastboot_entries)
-            evidence = module.verify_fastboot_against_target_files(target, fastboot)
+            evidence = module.verify_fastboot_against_target_files(
+                unsigned, target, fastboot
+            )
             expected_images = sorted(
                 f"{partition}.img"
                 for partition in FLEUR_IMAGE_PARTITIONS + FLEUR_RADIO_PARTITIONS
@@ -1091,16 +1095,23 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 hashlib.sha256(FLEUR_FASTBOOT_INFO.encode()).hexdigest(),
                 evidence["fastboot_info_sha256"],
             )
+            self.assertRegex(
+                evidence["producer_controls_sha256"], r"^[0-9a-f]{64}$"
+            )
             target_entries["OTA/android-info.txt"] = b"require product=fleur\n"
             fastboot_entries["android-info.txt"] = b"require product=fleur\n"
+            write_zip_entries(unsigned, target_entries)
             write_zip_entries(target, target_entries)
             write_zip_entries(fastboot, fastboot_entries)
-            module.verify_fastboot_against_target_files(target, fastboot)
+            module.verify_fastboot_against_target_files(unsigned, target, fastboot)
             target_entries["PREBUILT_IMAGES/tee.img"] = target_entries.pop(
                 "RADIO/tee.img"
             )
+            write_zip_entries(unsigned, target_entries)
             write_zip_entries(target, target_entries)
-            prebuilt = module.verify_fastboot_against_target_files(target, fastboot)
+            prebuilt = module.verify_fastboot_against_target_files(
+                unsigned, target, fastboot
+            )
             self.assertEqual(
                 "PREBUILT_IMAGES/tee.img", prebuilt["source_members"]["tee.img"]
             )
@@ -1109,11 +1120,13 @@ class SignedReleasePolicyTest(unittest.TestCase):
         module = load_verifier()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            target, fastboot = root / "target.zip", root / "fastboot.zip"
+            unsigned = root / "unsigned.zip"
+            target, fastboot = root / "signed.zip", root / "fastboot.zip"
             base_target, base_fastboot = fleur_fastboot_entries()
+            write_zip_entries(unsigned, base_target)
             write_zip_entries(target, base_target)
             write_zip_entries(fastboot, base_fastboot)
-            module.verify_fastboot_against_target_files(target, fastboot)
+            module.verify_fastboot_against_target_files(unsigned, target, fastboot)
 
             def reject(
                 label: str,
@@ -1145,7 +1158,9 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 with self.subTest(label=label), self.assertRaises(
                     module.VerificationError
                 ):
-                    module.verify_fastboot_against_target_files(target, fastboot)
+                    module.verify_fastboot_against_target_files(
+                        unsigned, target, fastboot
+                    )
 
             reject("omitted", fastboot_changes={"logo.img": None})
             reject("extra", fastboot_changes={"surprise.img": b"bad"})
@@ -1158,7 +1173,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         archive.writestr(name, value)
                     archive.writestr("boot.img", b"duplicate")
             with self.assertRaisesRegex(module.VerificationError, "duplicate"):
-                module.verify_fastboot_against_target_files(target, fastboot)
+                module.verify_fastboot_against_target_files(unsigned, target, fastboot)
             target_without_boot = dict(base_target)
             target_without_boot.pop("IMAGES/boot.img")
             with zipfile.ZipFile(target, "w") as archive:
@@ -1167,7 +1182,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 write_zip_symlink(archive, "IMAGES/boot.img", b"dtbo.img")
             write_zip_entries(fastboot, base_fastboot)
             with self.assertRaisesRegex(module.VerificationError, "not regular"):
-                module.verify_fastboot_against_target_files(target, fastboot)
+                module.verify_fastboot_against_target_files(unsigned, target, fastboot)
             target_without_ab = dict(base_target)
             ab_payload = target_without_ab.pop("META/ab_partitions.txt")
             with zipfile.ZipFile(target, "w") as archive:
@@ -1176,7 +1191,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 write_zip_symlink(archive, "META/ab_partitions.txt", ab_payload)
             write_zip_entries(fastboot, base_fastboot)
             with self.assertRaisesRegex(module.VerificationError, "not regular"):
-                module.verify_fastboot_against_target_files(target, fastboot)
+                module.verify_fastboot_against_target_files(unsigned, target, fastboot)
             reject(
                 "basename collision",
                 target_changes={"IMAGES/nested/boot.img": b"collision"},
@@ -1246,6 +1261,94 @@ class SignedReleasePolicyTest(unittest.TestCase):
             )
             reject("radio mismatch", fastboot_changes={"audio_dsp.img": b"wrong"})
             reject("IMAGES mismatch", fastboot_changes={"boot.img": b"wrong"})
+
+    def test_fastboot_rejects_signed_producer_control_drift(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsigned = root / "unsigned.zip"
+            signed = root / "signed.zip"
+            fastboot = root / "fastboot.zip"
+            baseline_target, baseline_fastboot = fleur_fastboot_entries()
+            write_zip_entries(unsigned, baseline_target)
+
+            dynamic_flash = {
+                "flash odm\n",
+                "flash product\n",
+                "flash system\n",
+                "flash system_ext\n",
+                "flash vendor\n",
+            }
+            weakened_info = "".join(
+                line
+                for line in FLEUR_FASTBOOT_INFO.splitlines(keepends=True)
+                if line not in dynamic_flash
+            ).encode()
+            attacks = {
+                "empty dynamic partition plan": (
+                    {
+                        "META/misc_info.txt": b"build_super_partition=true\n"
+                        b"dynamic_partition_list=\n",
+                        "META/fastboot-info.txt": weakened_info,
+                    },
+                    {"fastboot-info.txt": weakened_info},
+                ),
+                "AB partition removal": (
+                    {
+                        "META/ab_partitions.txt": baseline_target[
+                            "META/ab_partitions.txt"
+                        ].replace(b"audio_dsp\n", b""),
+                    },
+                    {"audio_dsp.img": None},
+                ),
+                "alternate valid product constraint": (
+                    {"OTA/android-info.txt": b"require product=fleur\n"},
+                    {"android-info.txt": b"require product=fleur\n"},
+                ),
+                "super build policy": (
+                    {
+                        "META/misc_info.txt": b"build_super_partition=false\n"
+                        b"dynamic_partition_list=odm product system system_ext vendor\n"
+                    },
+                    {},
+                ),
+            }
+            for property_name, value in (
+                ("super_image_in_update_package", "true"),
+                ("bootloader_in_update_package", "true"),
+                ("super_block_devices", "other_super"),
+                ("dynamic_partition_retrofit", "true"),
+                ("extfs_sparse_flag", "-s"),
+            ):
+                attacks[f"misc property {property_name}"] = (
+                    {
+                        "META/misc_info.txt": baseline_target[
+                            "META/misc_info.txt"
+                        ]
+                        + f"{property_name}={value}\n".encode()
+                    },
+                    {},
+                )
+            for label, (signed_changes, fastboot_changes) in attacks.items():
+                signed_entries = dict(baseline_target)
+                output_entries = dict(baseline_fastboot)
+                for entries, changes in (
+                    (signed_entries, signed_changes),
+                    (output_entries, fastboot_changes),
+                ):
+                    for name, value in changes.items():
+                        if value is None:
+                            entries.pop(name)
+                        else:
+                            entries[name] = value
+                write_zip_entries(signed, signed_entries)
+                write_zip_entries(fastboot, output_entries)
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    module.VerificationError, "producer control"
+                ):
+                    module.verify_fastboot_against_target_files(
+                        unsigned, signed, fastboot
+                    )
 
     def test_sku_files_require_exact_installed_paths(self):
         module = load_verifier()
