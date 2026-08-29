@@ -30,6 +30,38 @@ EXPECTED_SKUS = {
     "build_fleurp.prop": "POCO M4 Pro",
     "build_mielp.prop": "POCO M4 Pro",
 }
+FLEUR_AB_PARTITIONS = (
+    "audio_dsp", "boot", "dtbo", "gz", "lk", "logo", "md1img", "odm",
+    "pi_img", "preloader_raw", "product", "scp", "spmfw", "sspm", "system",
+    "system_ext", "tee", "vbmeta", "vbmeta_system", "vbmeta_vendor", "vendor",
+)
+FLEUR_IMAGE_PARTITIONS = (
+    "boot", "dtbo", "system", "vendor", "product", "system_ext", "odm",
+    "vbmeta_system", "vbmeta_vendor", "vbmeta", "super_empty",
+    "unsparse_super_empty",
+)
+FLEUR_RADIO_PARTITIONS = (
+    "audio_dsp", "gz", "lk", "logo", "md1img", "pi_img", "preloader_raw",
+    "scp", "spmfw", "sspm", "tee",
+)
+FLEUR_FASTBOOT_INFO = (
+    "# fastboot-info for lineage_fleur\n"
+    "version 1\n"
+    "flash boot\n"
+    "flash dtbo\n"
+    "flash --apply-vbmeta vbmeta\n"
+    "flash vbmeta_system\n"
+    "flash vbmeta_vendor\n"
+    "reboot fastboot\n"
+    "update-super\n"
+    "flash system\n"
+    "flash system_ext\n"
+    "flash product\n"
+    "flash vendor\n"
+    "flash odm\n"
+    "if-wipe erase userdata\n"
+    "if-wipe erase metadata\n"
+)
 
 
 def load_verifier():
@@ -108,6 +140,38 @@ def newc_record_bounds(data: bytes, offset: int = 0) -> dict[str, int]:
         "data_end": data_end,
         "record_end": (data_end + 3) & ~3,
     }
+
+
+def fleur_fastboot_entries() -> tuple[dict[str, bytes], dict[str, bytes]]:
+    target = {
+        "META/misc_info.txt": (
+            "build_super_partition=true\n"
+            "dynamic_partition_list=odm product system system_ext vendor\n"
+        ).encode(),
+        "META/ab_partitions.txt": (
+            "\n".join(FLEUR_AB_PARTITIONS) + "\n"
+        ).encode(),
+        "META/fastboot-info.txt": FLEUR_FASTBOOT_INFO.encode(),
+        "OTA/android-info.txt": b"board=fleur\n",
+    }
+    for partition in FLEUR_IMAGE_PARTITIONS:
+        target[f"IMAGES/{partition}.img"] = f"image-{partition}".encode()
+    for partition in FLEUR_RADIO_PARTITIONS:
+        target[f"RADIO/{partition}.img"] = f"radio-{partition}".encode()
+    fastboot = {
+        "android-info.txt": target["OTA/android-info.txt"],
+        "fastboot-info.txt": target["META/fastboot-info.txt"],
+    }
+    for source, value in target.items():
+        if source.startswith(("IMAGES/", "RADIO/")):
+            fastboot[Path(source).name] = value
+    return target, fastboot
+
+
+def write_zip_entries(path: Path, entries: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, value in entries.items():
+            archive.writestr(name, value)
 
 
 class SignedReleasePolicyTest(unittest.TestCase):
@@ -1003,59 +1067,185 @@ class SignedReleasePolicyTest(unittest.TestCase):
 
     def test_fastboot_images_and_android_info_must_match_signed_target_files(self):
         module = load_verifier()
-        images = {
-            "boot": b"boot",
-            "dtbo": b"dtbo",
-            "vbmeta": b"vbmeta",
-            "vbmeta_system": b"vbmeta-system",
-            "vbmeta_vendor": b"vbmeta-vendor",
-            "super": b"super",
-        }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / "target.zip"
             fastboot = root / "fastboot.zip"
-            with zipfile.ZipFile(target, "w") as archive:
-                archive.writestr("OTA/android-info.txt", "require product=fleur\n")
-                for partition, value in images.items():
-                    archive.writestr(f"IMAGES/{partition}.img", value)
-            with zipfile.ZipFile(fastboot, "w") as archive:
-                archive.writestr("android-info.txt", "require product=fleur\n")
-                for partition, value in images.items():
-                    archive.writestr(f"{partition}.img", value)
+            target_entries, fastboot_entries = fleur_fastboot_entries()
+            write_zip_entries(target, target_entries)
+            write_zip_entries(fastboot, fastboot_entries)
             evidence = module.verify_fastboot_against_target_files(target, fastboot)
-            self.assertEqual(sorted(images), evidence["images"])
-
-            with zipfile.ZipFile(fastboot, "w") as archive:
-                archive.writestr("android-info.txt", "require product=fleur\n")
-                for partition, value in images.items():
-                    archive.writestr(f"{partition}.img", b"wrong" if partition == "boot" else value)
-            with self.assertRaisesRegex(module.VerificationError, "boot"):
-                module.verify_fastboot_against_target_files(target, fastboot)
+            expected_images = sorted(
+                f"{partition}.img"
+                for partition in FLEUR_IMAGE_PARTITIONS + FLEUR_RADIO_PARTITIONS
+            )
+            self.assertEqual(expected_images, evidence["images"])
+            self.assertEqual(
+                "RADIO/audio_dsp.img",
+                evidence["source_members"]["audio_dsp.img"],
+            )
+            self.assertEqual(
+                "IMAGES/boot.img", evidence["source_members"]["boot.img"]
+            )
+            self.assertEqual(
+                hashlib.sha256(FLEUR_FASTBOOT_INFO.encode()).hexdigest(),
+                evidence["fastboot_info_sha256"],
+            )
+            target_entries["OTA/android-info.txt"] = b"require product=fleur\n"
+            fastboot_entries["android-info.txt"] = b"require product=fleur\n"
+            write_zip_entries(target, target_entries)
+            write_zip_entries(fastboot, fastboot_entries)
+            module.verify_fastboot_against_target_files(target, fastboot)
+            target_entries["PREBUILT_IMAGES/tee.img"] = target_entries.pop(
+                "RADIO/tee.img"
+            )
+            write_zip_entries(target, target_entries)
+            prebuilt = module.verify_fastboot_against_target_files(target, fastboot)
+            self.assertEqual(
+                "PREBUILT_IMAGES/tee.img", prebuilt["source_members"]["tee.img"]
+            )
 
     def test_fastboot_rejects_wrong_product_and_unexpected_or_destructive_members(self):
         module = load_verifier()
-        images = {name: name.encode() for name in module.REQUIRED_FASTBOOT_IMAGES}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target, fastboot = root / "target.zip", root / "fastboot.zip"
-            with zipfile.ZipFile(target, "w") as archive:
-                archive.writestr("OTA/android-info.txt", "require product=fleur\n")
-                for name, value in images.items():
-                    archive.writestr(f"IMAGES/{name}.img", value)
-            for info, extra in (
-                ("require product=wrong\n", None),
-                ("require product=fleur\n", "userdata.img"),
-                ("require product=fleur\n", "surprise.txt"),
-            ):
-                with zipfile.ZipFile(fastboot, "w") as archive:
-                    archive.writestr("android-info.txt", info)
-                    for name, value in images.items():
-                        archive.writestr(f"{name}.img", value)
-                    if extra:
-                        archive.writestr(extra, b"bad")
-                with self.assertRaises(module.VerificationError):
+            base_target, base_fastboot = fleur_fastboot_entries()
+            write_zip_entries(target, base_target)
+            write_zip_entries(fastboot, base_fastboot)
+            module.verify_fastboot_against_target_files(target, fastboot)
+
+            def reject(
+                label: str,
+                *,
+                target_changes: dict[str, bytes | None] | None = None,
+                fastboot_changes: dict[str, bytes | None] | None = None,
+                fastboot_symlink: str | None = None,
+            ) -> None:
+                target_entries = dict(base_target)
+                output_entries = dict(base_fastboot)
+                for entries, changes in (
+                    (target_entries, target_changes or {}),
+                    (output_entries, fastboot_changes or {}),
+                ):
+                    for name, value in changes.items():
+                        if value is None:
+                            entries.pop(name, None)
+                        else:
+                            entries[name] = value
+                write_zip_entries(target, target_entries)
+                if fastboot_symlink is None:
+                    write_zip_entries(fastboot, output_entries)
+                else:
+                    with zipfile.ZipFile(fastboot, "w") as archive:
+                        for name, value in output_entries.items():
+                            if name != fastboot_symlink:
+                                archive.writestr(name, value)
+                        write_zip_symlink(archive, fastboot_symlink, b"boot.img")
+                with self.subTest(label=label), self.assertRaises(
+                    module.VerificationError
+                ):
                     module.verify_fastboot_against_target_files(target, fastboot)
+
+            reject("omitted", fastboot_changes={"logo.img": None})
+            reject("extra", fastboot_changes={"surprise.img": b"bad"})
+            reject("symlink", fastboot_symlink="boot.img")
+            write_zip_entries(target, base_target)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(fastboot, "w") as archive:
+                    for name, value in base_fastboot.items():
+                        archive.writestr(name, value)
+                    archive.writestr("boot.img", b"duplicate")
+            with self.assertRaisesRegex(module.VerificationError, "duplicate"):
+                module.verify_fastboot_against_target_files(target, fastboot)
+            target_without_boot = dict(base_target)
+            target_without_boot.pop("IMAGES/boot.img")
+            with zipfile.ZipFile(target, "w") as archive:
+                for name, value in target_without_boot.items():
+                    archive.writestr(name, value)
+                write_zip_symlink(archive, "IMAGES/boot.img", b"dtbo.img")
+            write_zip_entries(fastboot, base_fastboot)
+            with self.assertRaisesRegex(module.VerificationError, "not regular"):
+                module.verify_fastboot_against_target_files(target, fastboot)
+            target_without_ab = dict(base_target)
+            ab_payload = target_without_ab.pop("META/ab_partitions.txt")
+            with zipfile.ZipFile(target, "w") as archive:
+                for name, value in target_without_ab.items():
+                    archive.writestr(name, value)
+                write_zip_symlink(archive, "META/ab_partitions.txt", ab_payload)
+            write_zip_entries(fastboot, base_fastboot)
+            with self.assertRaisesRegex(module.VerificationError, "not regular"):
+                module.verify_fastboot_against_target_files(target, fastboot)
+            reject(
+                "basename collision",
+                target_changes={"IMAGES/nested/boot.img": b"collision"},
+            )
+            reject(
+                "update-super missing source",
+                target_changes={"IMAGES/super_empty.img": None},
+                fastboot_changes={"super_empty.img": None},
+            )
+            for info in (
+                b"board=wrong\n",
+                b"board=fleur\nrequire product=fleur\n",
+                b"require product=fleur|wrong\n",
+                b"product=fleur\n",
+                b"board=fleur\nboard=fleur\n",
+            ):
+                reject(
+                    f"android-info {info!r}",
+                    target_changes={"OTA/android-info.txt": info},
+                    fastboot_changes={"android-info.txt": info},
+                )
+            reject(
+                "android-info byte mismatch",
+                fastboot_changes={"android-info.txt": b"require product=fleur\n"},
+            )
+            hostile_fastboot_info = {
+                "wrong version": FLEUR_FASTBOOT_INFO.replace("version 1", "version 2"),
+                "unconditional erase": FLEUR_FASTBOOT_INFO.replace(
+                    "if-wipe erase userdata", "erase userdata"
+                ),
+                "other conditional erase": FLEUR_FASTBOOT_INFO.replace(
+                    "if-wipe erase userdata", "if-wipe erase cache"
+                ),
+                "slot flag": FLEUR_FASTBOOT_INFO.replace(
+                    "flash boot", "flash --slot-other boot"
+                ),
+                "wrong apply-vbmeta": FLEUR_FASTBOOT_INFO.replace(
+                    "flash boot", "flash --apply-vbmeta boot"
+                ),
+                "missing image": FLEUR_FASTBOOT_INFO.replace(
+                    "flash boot", "flash missing"
+                ),
+                "alternate filename": FLEUR_FASTBOOT_INFO.replace(
+                    "flash boot", "flash boot other.img"
+                ),
+                "wrong reboot": FLEUR_FASTBOOT_INFO.replace(
+                    "reboot fastboot", "reboot bootloader"
+                ),
+                "update-super argument": FLEUR_FASTBOOT_INFO.replace(
+                    "update-super", "update-super super_empty"
+                ),
+                "duplicate flash": FLEUR_FASTBOOT_INFO.replace(
+                    "flash boot\n", "flash boot\nflash boot\n"
+                ),
+                "missing flash": FLEUR_FASTBOOT_INFO.replace("flash boot\n", ""),
+            }
+            for label, hostile_text in hostile_fastboot_info.items():
+                hostile = hostile_text.encode()
+                reject(
+                    f"hostile command {label}",
+                    target_changes={"META/fastboot-info.txt": hostile},
+                    fastboot_changes={"fastboot-info.txt": hostile},
+                )
+            reject(
+                "fastboot-info byte mismatch",
+                fastboot_changes={"fastboot-info.txt": b"version 1\nflash boot\n"},
+            )
+            reject("radio mismatch", fastboot_changes={"audio_dsp.img": b"wrong"})
+            reject("IMAGES mismatch", fastboot_changes={"boot.img": b"wrong"})
 
     def test_sku_files_require_exact_installed_paths(self):
         module = load_verifier()
@@ -1861,6 +2051,8 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 ),
                 "META/misc_info.txt": (
                     "ab_update=true\nvirtual_ab=true\n"
+                    "build_super_partition=true\n"
+                    "dynamic_partition_list=odm product system system_ext vendor\n"
                     "building_oem_image=\nmkbootimg_init_args=\n"
                     "tool_extensions=device/xiaomi/fleur/../common\n"
                     "default_system_dev_certificate=release/releasekey\n"
@@ -1874,7 +2066,8 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 "META/ab_partitions.txt": "\n".join(
                     sorted(set(module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | {"md1img"})
                 ) + "\n",
-                "OTA/android-info.txt": "require product=fleur\n",
+                "META/fastboot-info.txt": FLEUR_FASTBOOT_INFO,
+                "OTA/android-info.txt": "board=fleur\n",
                 "SYSTEM/app/Settings/Settings.apk": b"apk",
                 "SYSTEM/apex/com.android.art.apex": apex_buffer.getvalue(),
                 "RADIO/md1img.img": firmware,
@@ -1884,7 +2077,10 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     f"ro.product.marketname={market_name}\n"
                     f"ro.product.odm.model={market_name}\n"
                 )
-            for partition in set(module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | {"super"}:
+            for partition in set(module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | {
+                "super_empty",
+                "unsparse_super_empty",
+            }:
                 common[f"IMAGES/{partition}.img"] = (
                     fixed_boot if partition == "boot" else f"image-{partition}".encode()
                 )
@@ -1920,12 +2116,17 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 )
             fastboot = root / "lineage_fleur-SIGNED-img.zip"
             with zipfile.ZipFile(fastboot, "w") as archive:
-                archive.writestr("android-info.txt", "require product=fleur\n")
-                for partition in module.REQUIRED_FASTBOOT_IMAGES:
+                archive.writestr("android-info.txt", "board=fleur\n")
+                archive.writestr("fastboot-info.txt", FLEUR_FASTBOOT_INFO)
+                for partition in set(module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | {
+                    "super_empty",
+                    "unsparse_super_empty",
+                }:
                     archive.writestr(
                         f"{partition}.img",
                         fixed_boot if partition == "boot" else f"image-{partition}".encode(),
                     )
+                archive.writestr("md1img.img", firmware)
             manifest = root / "firmware.json"
             manifest.write_text(
                 json.dumps(

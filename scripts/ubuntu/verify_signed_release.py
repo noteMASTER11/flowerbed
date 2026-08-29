@@ -71,7 +71,6 @@ EXPECTED_AVB_CHAIN_PARTITIONS = (
     ("vbmeta_system", 2),
     ("vbmeta_vendor", 3),
 )
-REQUIRED_FASTBOOT_IMAGES = ("boot", "dtbo", "vbmeta", "vbmeta_system", "vbmeta_vendor", "super")
 REQUIRED_ANDROID_PAYLOAD_PARTITIONS = (
     "boot",
     "dtbo",
@@ -91,10 +90,6 @@ TEST_KEY_PREFIXES = (
 )
 MISC_KEY_LIST_PROPERTIES = ("extra_ota_keys", "extra_recovery_keys")
 AVB_KEY_PATH_PROPERTY = re.compile(r"avb_[A-Za-z0-9_]+_key_path\Z")
-FASTBOOT_ALLOWED_MEMBERS = {
-    "android-info.txt",
-    *(f"{partition}.img" for partition in REQUIRED_FASTBOOT_IMAGES),
-}
 ANDROID_TOOL_NAMES = (
     "apksigner", "deapexer", "avbtool", "debugfs_static", "fsck.erofs",
     "lz4", "ota_extractor", "unpack_bootimg",
@@ -1460,48 +1455,259 @@ def _read_unique_bytes(archive: zipfile.ZipFile, name: str) -> bytes:
     return archive.read(matches[0])
 
 
+def _require_regular_archive_member(
+    members: Mapping[str, zipfile.ZipInfo], name: str
+) -> None:
+    member = members.get(name)
+    if member is None:
+        raise VerificationError(f"signed target-files is missing {name}")
+    file_type = (member.external_attr >> 16) & 0o170000
+    if member.is_dir() or file_type not in (0, stat.S_IFREG):
+        raise VerificationError(f"signed target-files source member is not regular: {name}")
+
+
+def _parse_fastboot_partition_list(data: bytes) -> tuple[str, ...]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise VerificationError("fastboot AB partition inventory is not UTF-8") from error
+    partitions = tuple(text.split())
+    if (
+        not partitions
+        or len(set(partitions)) != len(partitions)
+        or any(re.fullmatch(r"[a-z0-9_]+", item) is None for item in partitions)
+    ):
+        raise VerificationError("fastboot AB partition inventory is invalid")
+    return partitions
+
+
+def _derive_fastboot_member_mapping(
+    target: zipfile.ZipFile,
+    members: Mapping[str, zipfile.ZipInfo],
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    for metadata_name in ("META/misc_info.txt", "META/ab_partitions.txt"):
+        _require_regular_archive_member(members, metadata_name)
+    misc = _parse_properties(
+        _read_unique_text(target, "META/misc_info.txt"), "META/misc_info.txt"
+    )
+    for property_name in (
+        "super_image_in_update_package",
+        "bootloader_in_update_package",
+    ):
+        if misc.get(property_name) not in (None, "false"):
+            raise VerificationError(
+                f"unsupported fastboot producer option: {property_name}"
+            )
+    dynamic_partitions = tuple(misc.get("dynamic_partition_list", "").split())
+    if (
+        len(set(dynamic_partitions)) != len(dynamic_partitions)
+        or any(
+            re.fullmatch(r"[a-z0-9_]+", item) is None
+            for item in dynamic_partitions
+        )
+    ):
+        raise VerificationError("fastboot dynamic partition inventory is invalid")
+    ab_partitions = _parse_fastboot_partition_list(
+        _read_unique_bytes(target, "META/ab_partitions.txt")
+    )
+
+    mapping: dict[str, str] = {}
+
+    def add(output_name: str, source_name: str) -> None:
+        if output_name in mapping:
+            if mapping[output_name] == source_name:
+                return
+            raise VerificationError(
+                f"fastboot output basename collision: {output_name}"
+            )
+        _require_regular_archive_member(members, source_name)
+        mapping[output_name] = source_name
+
+    add("android-info.txt", "OTA/android-info.txt")
+    add("fastboot-info.txt", "META/fastboot-info.txt")
+    if "PREBUILT_IMAGES/kernel_16k" in members:
+        add("kernel_16k", "PREBUILT_IMAGES/kernel_16k")
+    if "PREBUILT_IMAGES/ramdisk_16k.img" in members:
+        add("ramdisk_16k.img", "PREBUILT_IMAGES/ramdisk_16k.img")
+
+    visited = set(dynamic_partitions)
+    for source_name in members:
+        if not source_name.startswith("IMAGES/"):
+            continue
+        output_name = Path(source_name).name
+        if not output_name.endswith(".img"):
+            continue
+        if re.fullmatch(r"[a-z0-9_]+\.img", output_name) is None:
+            raise VerificationError("fastboot IMAGES member has unsafe basename")
+        add(output_name, source_name)
+        visited.add(output_name.rstrip(".img"))
+
+    for partition in ab_partitions:
+        if partition in visited:
+            continue
+        output_name = f"{partition}.img"
+        candidates = [
+            f"{prefix}/{output_name}"
+            for prefix in ("IMAGES", "PREBUILT_IMAGES", "RADIO")
+            if f"{prefix}/{output_name}" in members
+        ]
+        if len(candidates) != 1:
+            raise VerificationError(
+                f"fastboot source mapping is missing or ambiguous for {partition}"
+            )
+        add(output_name, candidates[0])
+    return mapping, dynamic_partitions
+
+
+def _validate_fastboot_android_info(data: bytes) -> None:
+    if data not in (b"board=fleur\n", b"require product=fleur\n"):
+        raise VerificationError(
+            "fastboot android-info.txt must canonically require fleur"
+        )
+
+
+def _validate_fastboot_info(
+    data: bytes,
+    mapping: Mapping[str, str],
+    dynamic_partitions: tuple[str, ...],
+) -> tuple[str, ...]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise VerificationError("fastboot-info.txt is not UTF-8") from error
+    if not text.endswith("\n") or "\r" in text or "\x00" in text:
+        raise VerificationError("fastboot-info.txt is not canonical text")
+    version_seen = False
+    flash_partitions: list[str] = []
+    erase_partitions: list[str] = []
+    reboot_index: int | None = None
+    update_super_index: int | None = None
+    commands: list[str] = []
+    for line in text[:-1].split("\n"):
+        if not line or line != line.strip() or "  " in line or "\t" in line:
+            raise VerificationError("fastboot-info.txt has noncanonical spacing")
+        if line.startswith("#"):
+            continue
+        parts = line.split(" ")
+        if parts == ["version", "1"]:
+            if version_seen or commands:
+                raise VerificationError("fastboot-info.txt has misplaced version")
+            version_seen = True
+            continue
+        if not version_seen:
+            raise VerificationError("fastboot-info.txt is missing version 1")
+        command_index = len(commands)
+        if len(parts) == 2 and parts[0] == "flash":
+            apply_vbmeta = False
+            partition = parts[1]
+        elif len(parts) == 3 and parts[:2] == ["flash", "--apply-vbmeta"]:
+            apply_vbmeta = True
+            partition = parts[2]
+        else:
+            apply_vbmeta = False
+            partition = ""
+        if partition:
+            if (
+                re.fullmatch(r"[a-z0-9_]+", partition) is None
+                or f"{partition}.img" not in mapping
+                or (partition == "vbmeta") != apply_vbmeta
+                or partition in flash_partitions
+            ):
+                raise VerificationError("fastboot-info.txt has unsafe flash command")
+            flash_partitions.append(partition)
+        elif parts == ["reboot", "fastboot"]:
+            if reboot_index is not None:
+                raise VerificationError("fastboot-info.txt has duplicate reboot")
+            reboot_index = command_index
+        elif parts == ["update-super"]:
+            if update_super_index is not None:
+                raise VerificationError("fastboot-info.txt has duplicate update-super")
+            if mapping.get("super_empty.img") != "IMAGES/super_empty.img":
+                raise VerificationError("fastboot update-super lacks super_empty.img")
+            update_super_index = command_index
+        elif (
+            len(parts) == 3
+            and parts[:2] == ["if-wipe", "erase"]
+            and parts[2] in {"userdata", "metadata"}
+            and parts[2] not in erase_partitions
+        ):
+            erase_partitions.append(parts[2])
+        else:
+            raise VerificationError("fastboot-info.txt has unsafe command")
+        commands.append(line)
+    required_flash = {
+        "boot", "dtbo", "vbmeta", "vbmeta_system", "vbmeta_vendor",
+        *dynamic_partitions,
+    }
+    if set(flash_partitions) != required_flash:
+        raise VerificationError("fastboot-info.txt flash partition set is incomplete")
+    if set(erase_partitions) != {"userdata", "metadata"}:
+        raise VerificationError("fastboot-info.txt wipe policy is incomplete")
+    if (
+        reboot_index is None
+        or update_super_index is None
+        or reboot_index >= update_super_index
+        or any(
+            commands.index(f"flash {partition}") <= update_super_index
+            for partition in dynamic_partitions
+        )
+    ):
+        raise VerificationError("fastboot-info.txt super update sequence is invalid")
+    return tuple(commands)
+
+
 def verify_fastboot_against_target_files(
     signed_target_files: Path, fastboot: Path
 ) -> dict[str, object]:
     with zipfile.ZipFile(signed_target_files) as target, zipfile.ZipFile(fastboot) as images:
         target_members = _archive_members(target, allow_symlinks=True)
         fastboot_members = _archive_members(images)
+        mapping, dynamic_partitions = _derive_fastboot_member_mapping(
+            target, target_members
+        )
         files = set(fastboot_members)
-        if files != FASTBOOT_ALLOWED_MEMBERS:
-            missing = sorted(FASTBOOT_ALLOWED_MEMBERS - files)
-            extra = sorted(files - FASTBOOT_ALLOWED_MEMBERS)
+        expected_files = set(mapping)
+        if files != expected_files:
+            missing = sorted(expected_files - files)
+            extra = sorted(files - expected_files)
             raise VerificationError(
-                "fastboot member inventory differs from policy "
+                "fastboot member inventory differs from producer mapping "
                 f"(missing={missing}, unexpected={extra})"
             )
         target_info = _read_unique_bytes(target, "OTA/android-info.txt")
         fastboot_info = _read_unique_bytes(images, "android-info.txt")
         if target_info != fastboot_info:
             raise VerificationError("fastboot android-info.txt differs from signed target-files")
-        try:
-            android_info = fastboot_info.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise VerificationError("fastboot android-info.txt is not UTF-8") from error
-        products = []
-        for line in android_info.splitlines():
-            line = line.strip()
-            if line.startswith("require product="):
-                products.append(line.split("=", 1)[1])
-        if products != ["fleur"]:
-            raise VerificationError("fastboot android-info.txt must require product=fleur")
+        _validate_fastboot_android_info(fastboot_info)
+        target_fastboot_info = _read_unique_bytes(target, "META/fastboot-info.txt")
+        packaged_fastboot_info = _read_unique_bytes(images, "fastboot-info.txt")
+        if target_fastboot_info != packaged_fastboot_info:
+            raise VerificationError("fastboot-info.txt differs from signed target-files")
+        commands = _validate_fastboot_info(
+            packaged_fastboot_info, mapping, dynamic_partitions
+        )
         hashes: dict[str, str] = {}
-        for partition in REQUIRED_FASTBOOT_IMAGES:
-            target_bytes = _read_unique_bytes(target, f"IMAGES/{partition}.img")
-            fastboot_bytes = _read_unique_bytes(images, f"{partition}.img")
+        source_members: dict[str, str] = {}
+        image_names: list[str] = []
+        for output_name, source_name in mapping.items():
+            target_bytes = _read_unique_bytes(target, source_name)
+            fastboot_bytes = _read_unique_bytes(images, output_name)
             if target_bytes != fastboot_bytes:
                 raise VerificationError(
-                    f"fastboot {partition}.img differs from signed target-files"
+                    f"fastboot {output_name} differs from signed target-files"
                 )
-            hashes[partition] = hashlib.sha256(fastboot_bytes).hexdigest()
+            source_members[output_name] = source_name
+            if output_name.endswith(".img"):
+                partition = output_name[:-4]
+                hashes[partition] = hashlib.sha256(fastboot_bytes).hexdigest()
+                image_names.append(output_name)
     return {
         "android_info_sha256": hashlib.sha256(fastboot_info).hexdigest(),
-        "images": sorted(hashes),
+        "fastboot_info_sha256": hashlib.sha256(packaged_fastboot_info).hexdigest(),
+        "commands": list(commands),
+        "images": sorted(image_names),
         "image_sha256": hashes,
+        "source_members": source_members,
     }
 
 
