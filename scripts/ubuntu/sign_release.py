@@ -22,6 +22,10 @@ from typing import Callable, Mapping, Sequence
 from zipfile import BadZipFile, ZipFile
 
 try:
+    from scripts.ubuntu.build_provenance import (
+        BuildProvenanceError,
+        validate_final_build_provenance,
+    )
     from scripts.ubuntu.avb_password_helper import (
         PasswordLookupError,
         lookup_password,
@@ -36,6 +40,7 @@ try:
     from scripts.ubuntu.generate_release_keys import KeyGenerationError, build_key_plan
     from scripts.ubuntu.signing_metadata import SigningInventory, load_signing_inventory
 except ModuleNotFoundError:  # Direct execution from scripts/ubuntu.
+    from build_provenance import BuildProvenanceError, validate_final_build_provenance
     from avb_password_helper import PasswordLookupError, lookup_password, parse_password_file
     from avb_signing_helper import AvbSigningError, OpenSslRunner, export_public_key, run_openssl
     from generate_release_keys import KeyGenerationError, build_key_plan
@@ -75,6 +80,7 @@ class SigningPaths:
     keys_dir: Path
     output_dir: Path
     build_id: str | None = None
+    build_provenance: Path | None = None
 
     def __post_init__(self) -> None:
         build_id = self.output_dir.name if self.build_id is None else self.build_id
@@ -101,6 +107,8 @@ class SigningPaths:
             )
         ):
             raise ReleaseSigningError("release signing paths must be absolute")
+        if self.build_provenance is not None and not self.build_provenance.is_absolute():
+            raise ReleaseSigningError("build provenance path must be absolute")
         object.__setattr__(self, "build_id", build_id)
 
     @property
@@ -386,14 +394,36 @@ def sign_release(
     config_path = runtime_dir / "avb-helper.json"
     runtime_password_path = runtime_dir / "android-passwords"
     published = False
+    provenance_pins: tuple[_PinnedFile, _PinnedFile, _InputEvidence] | None = None
     try:
         runtime_dir.mkdir(mode=0o700)
+        if paths.build_provenance is None:
+            raise ReleaseSigningError("finalized build provenance is required")
+        provenance_pins = _snapshot_regular_input(
+            paths.build_provenance, runtime_dir / "build-provenance.snapshot.json",
+            "build provenance",
+        )
+        provenance_source, provenance_snapshot, provenance_evidence = provenance_pins
         helper_source = (
             Path(__file__).resolve().with_name("avb_signing_helper.py")
             if signing_helper is None
             else signing_helper
         )
         with _snapshot_target_files(paths.target_files, runtime_dir) as target_snapshot:
+            repository = Path(__file__).resolve().parents[2]
+            kernel_record_path = repository / "sources/kernel-fix.json"
+            try:
+                kernel_record = json.loads(kernel_record_path.read_text(encoding="utf-8"))
+                build_record = validate_final_build_provenance(
+                    provenance_snapshot.source,
+                    target_snapshot.snapshot.source,
+                    kernel_record,
+                    repository / "patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch",
+                    repository / "scripts/ubuntu/apply_patches.sh",
+                    target_filename=target_snapshot.evidence.filename,
+                )
+            except (OSError, json.JSONDecodeError, BuildProvenanceError) as error:
+                raise ReleaseSigningError(f"build provenance validation failed: {error}") from error
             with _pin_executable(helper_source) as pinned_helper:
                 inventory = _validate_inputs(paths, archive=target_snapshot.proc_path)
                 try:
@@ -516,6 +546,8 @@ def sign_release(
                                 "runtime password file", verify_hash=True
                             )
                             input_evidence = target_snapshot.evidence
+        provenance_source.verify_named("build provenance", verify_hash=True)
+        provenance_snapshot.verify_named("build provenance snapshot", verify_hash=True)
         shutil.rmtree(runtime_dir)
         completed_at = now()
         _write_report(
@@ -528,6 +560,8 @@ def sign_release(
             input_evidence,
             input_metadata_sha256,
             plan,
+            provenance_evidence,
+            build_record,
         )
         _write_checksums(staging_paths)
         _fsync_directory(staging)
@@ -538,6 +572,10 @@ def sign_release(
         if not published and staging.exists():
             shutil.rmtree(staging)
         raise
+    finally:
+        if provenance_pins is not None:
+            os.close(provenance_pins[0].descriptor)
+            os.close(provenance_pins[1].descriptor)
     return paths.output_dir
 
 
@@ -622,6 +660,47 @@ def _snapshot_target_files(source: Path, runtime_dir: Path):
             os.close(snapshot_fd)
         if source_fd >= 0:
             os.close(source_fd)
+
+
+def _snapshot_regular_input(
+    source: Path, destination: Path, label: str
+) -> tuple[_PinnedFile, _PinnedFile, _InputEvidence]:
+    source_fd = destination_fd = -1
+    completed = False
+    try:
+        source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+        source_metadata = os.fstat(source_fd)
+        if not stat.S_ISREG(source_metadata.st_mode):
+            raise ReleaseSigningError(f"{label} is unavailable")
+        destination_fd = os.open(destination, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o400)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if not written:
+                    raise ReleaseSigningError(f"short write while snapshotting {label}")
+                view = view[written:]
+        os.fchmod(destination_fd, 0o400)
+        os.fsync(destination_fd)
+        source_pin = _PinnedFile(source, source_fd, _identity_from_stat(source_metadata), digest.hexdigest())
+        destination_pin = _PinnedFile(destination, destination_fd, _descriptor_identity(destination_fd), digest.hexdigest())
+        source_pin.verify_named(label, verify_hash=True)
+        destination_pin.verify_named(f"{label} snapshot", verify_hash=True)
+        completed = True
+        return source_pin, destination_pin, _InputEvidence(source.name, digest.hexdigest(), source_metadata.st_size, source_pin.identity)
+    except OSError as error:
+        raise ReleaseSigningError(f"{label} snapshot failed") from error
+    finally:
+        if not completed:
+            if destination_fd >= 0:
+                os.close(destination_fd)
+            if source_fd >= 0:
+                os.close(source_fd)
 
 
 @contextmanager
@@ -1210,6 +1289,8 @@ def _write_report(
     input_evidence: _InputEvidence,
     input_metadata_sha256: Mapping[str, str],
     plan,
+    provenance_evidence: _InputEvidence,
+    build_record: Mapping[str, object],
 ) -> None:
     artifacts = (
         staging_paths.signed_target_files,
@@ -1232,6 +1313,14 @@ def _write_report(
             "filename": input_evidence.filename,
             "sha256": input_evidence.sha256,
             "size": input_evidence.size,
+        },
+        "build_provenance": {
+            "filename": provenance_evidence.filename,
+            "sha256": provenance_evidence.sha256,
+            "size": provenance_evidence.size,
+            "session_nonce": build_record["session_nonce"],
+            "application_evidence_sha256": build_record["pre_build"]["application_evidence_sha256"],
+            "unsigned_target_files": build_record["unsigned_target_files"],
         },
         "outputs": {
             path.name: {"sha256": _sha256(path), "size": path.stat().st_size}
@@ -1413,6 +1502,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--android-root", required=True, type=Path)
     parser.add_argument("--keys-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--build-provenance", required=True, type=Path)
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args(argv)
     try:
@@ -1421,11 +1511,24 @@ def main(argv: list[str] | None = None) -> int:
             arguments.android_root,
             arguments.keys_dir,
             arguments.output_dir,
+            build_provenance=arguments.build_provenance,
         )
         if arguments.dry_run:
             if paths.output_dir.exists() or paths.output_dir.is_symlink():
                 raise ReleaseSigningError("output directory already exists")
             inventory = _validate_inputs(paths)
+            repository = Path(__file__).resolve().parents[2]
+            try:
+                policy = json.loads((repository / "sources/kernel-fix.json").read_text(encoding="utf-8"))
+                validate_final_build_provenance(
+                    paths.build_provenance,
+                    paths.target_files,
+                    policy,
+                    repository / "patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch",
+                    repository / "scripts/ubuntu/apply_patches.sh",
+                )
+            except (OSError, json.JSONDecodeError, BuildProvenanceError) as error:
+                raise ReleaseSigningError(f"build provenance validation failed: {error}") from error
             _validate_keyset(inventory, paths.keys_dir)
             build_signing_commands(
                 inventory,

@@ -198,7 +198,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
     def test_payload_properties_require_complete_hash_and_size_metadata(self):
         module = load_verifier()
         payload = self._payload()
-        metadata_size = 24 + len(b"manifest") + len(b"sig")
+        metadata_size = 24 + len(b"manifest")
         file_hash = base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
         metadata_hash = base64.b64encode(
             hashlib.sha256(payload[:metadata_size]).digest()
@@ -219,6 +219,15 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 complete.replace(metadata_hash, base64.b64encode(b"x" * 32).decode()),
                 payload,
             )
+        changed_signature = payload[:metadata_size] + b"NEW" + payload[metadata_size + 3:]
+        changed_complete = complete.replace(
+            file_hash,
+            base64.b64encode(hashlib.sha256(changed_signature).digest()).decode("ascii"),
+        )
+        self.assertEqual(
+            metadata_hash,
+            module.verify_payload_properties(changed_complete, changed_signature)["METADATA_HASH"],
+        )
         with self.assertRaisesRegex(module.VerificationError, "METADATA_SIZE"):
             module.verify_payload_properties(
                 complete.replace(f"METADATA_SIZE={metadata_size}", "METADATA_SIZE=24"),
@@ -271,6 +280,9 @@ class SignedReleasePolicyTest(unittest.TestCase):
         for value in (
             "/tmp/a/build/make/target/product/security/testkey.x509.pem",
             r"C:\android\build\make\target\product\security\platform.pk8",
+            "release/keys/testkey.pk8",
+            "release//keys/../testkey.pk8",
+            "x/./build//make/target/product/security/testkey.pem",
         ):
             with self.assertRaisesRegex(module.VerificationError, "test certificate"):
                 module._reject_test_key_path(value)
@@ -424,6 +436,12 @@ class SignedReleasePolicyTest(unittest.TestCase):
             }
             allowlist = {"apk": [], "apex": []}
             public_fingerprints = {"releasekey.x509.pem": "f" * 64}
+            build_provenance = {
+                "filename": "build-provenance.json", "sha256": "b" * 64,
+                "size": 123, "session_nonce": "c" * 64,
+                "application_evidence_sha256": "d" * 64,
+                "unsigned_target_files": {"sha256": "e" * 64},
+            }
             report = {
                 "schema_version": 2,
                 "device": "fleur",
@@ -439,9 +457,11 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 "key_plan": key_plan,
                 "presigned_allowlist": allowlist,
                 "public_fingerprints": public_fingerprints,
+                "build_provenance": json.loads(json.dumps(build_provenance)),
             }
             evidence = module.verify_signer_report(
-                report, paths, metadata, key_plan, allowlist, public_fingerprints
+                report, paths, metadata, key_plan, allowlist, public_fingerprints,
+                build_provenance,
             )
             self.assertEqual(
                 module._path_evidence(paths["ota"])["sha256"],
@@ -450,8 +470,51 @@ class SignedReleasePolicyTest(unittest.TestCase):
             report["outputs"][paths["ota"].name]["sha256"] = "0" * 64
             with self.assertRaisesRegex(module.VerificationError, "signer report"):
                 module.verify_signer_report(
-                    report, paths, metadata, key_plan, allowlist, public_fingerprints
+                    report, paths, metadata, key_plan, allowlist, public_fingerprints,
+                    build_provenance,
                 )
+            report["outputs"][paths["ota"].name]["sha256"] = module._path_evidence(paths["ota"])["sha256"]
+            report["build_provenance"]["session_nonce"] = "0" * 64
+            with self.assertRaisesRegex(module.VerificationError, "build provenance"):
+                module.verify_signer_report(
+                    report, paths, metadata, key_plan, allowlist, public_fingerprints,
+                    build_provenance,
+                )
+
+    def test_signed_apk_roles_follow_exact_unsigned_package_mapping(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsigned = root / "unsigned.zip"
+            signed = root / "signed.zip"
+            common = {
+                "META/apexkeys.txt": "",
+                "META/misc_info.txt": "ab_update=true\nvirtual_ab=true\n",
+                "SYSTEM/build.prop": (
+                    "ro.product.system.device=fleur\n"
+                    "ro.build.tags=test-keys\nro.system.build.tags=test-keys\n"
+                ),
+            }
+            for path, apkcerts in (
+                (
+                    unsigned,
+                    'name="Alpha.apk" certificate="source/platform.x509.pem" private_key="source/platform.pk8"\n'
+                    'name="Beta.apk" certificate="source/media.x509.pem" private_key="source/media.pk8"\n',
+                ),
+                (
+                    signed,
+                    'name="Alpha.apk" certificate="release/media.x509.pem" private_key="release/media.pk8"\n'
+                    'name="Beta.apk" certificate="release/platform.x509.pem" private_key="release/platform.pk8"\n',
+                ),
+            ):
+                with zipfile.ZipFile(path, "w") as archive:
+                    for name, value in common.items():
+                        archive.writestr(name, value)
+                    archive.writestr("META/apkcerts.txt", apkcerts)
+            inventory = module.load_signing_inventory(unsigned)
+            plan = module.build_key_plan(inventory)
+            with self.assertRaisesRegex(module.VerificationError, "Alpha.apk"):
+                module.verify_signed_key_plan(signed, inventory, plan)
 
     def test_fastboot_images_and_android_info_must_match_signed_target_files(self):
         module = load_verifier()
@@ -681,6 +744,9 @@ class SignedReleasePolicyTest(unittest.TestCase):
             module.verify_payload_partition_set(actual - {"system"}, actual)
         with self.assertRaisesRegex(module.VerificationError, "unexpected"):
             module.verify_payload_partition_set(actual | {"userdata"}, actual)
+        incomplete = actual - {"system"}
+        with self.assertRaisesRegex(module.VerificationError, "mandatory.*system"):
+            module.verify_payload_partition_set(incomplete, incomplete)
 
     def test_ota_partition_inventory_and_content_are_derived_from_target_files(self):
         module = load_verifier()
@@ -689,12 +755,18 @@ class SignedReleasePolicyTest(unittest.TestCase):
             target = root / "target.zip"
             extracted = root / "extracted"
             extracted.mkdir()
-            expected = {"boot": b"boot", "system": b"system", "md1img": b"radio"}
+            expected = {
+                name: f"image-{name}".encode()
+                for name in module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS
+            }
+            expected["md1img"] = b"radio"
             with zipfile.ZipFile(target, "w") as archive:
-                archive.writestr("META/ab_partitions.txt", "boot\nsystem\nmd1img\n")
-                archive.writestr("IMAGES/boot.img", expected["boot"])
-                archive.writestr("IMAGES/system.img", expected["system"])
-                archive.writestr("RADIO/md1img.img", expected["md1img"])
+                archive.writestr("META/ab_partitions.txt", "".join(f"{name}\n" for name in sorted(expected)))
+                for name, value in expected.items():
+                    archive.writestr(
+                        f"RADIO/{name}.img" if name == "md1img" else f"IMAGES/{name}.img",
+                        value,
+                    )
             for name, value in expected.items():
                 (extracted / f"{name}.img").write_bytes(value)
             evidence = module.verify_ota_partition_binding(
@@ -726,6 +798,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 "fsck.erofs",
             ):
                 (host_tools / tool).write_text("fixture\n", encoding="utf-8")
+                (host_tools / tool).chmod(0o755)
             payload_info = android_root / "system/update_engine/scripts/payload_info.py"
             payload_info.parent.mkdir(parents=True)
             payload_info.write_text("# fixture\n", encoding="utf-8")
@@ -812,7 +885,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
             with zipfile.ZipFile(ota, "w") as archive:
                 archive.writestr("META-INF/com/android/metadata", "pre-device=fleur\nota-type=AB\n")
                 payload = self._payload()
-                metadata_size = 24 + len(b"manifest") + len(b"sig")
+                metadata_size = 24 + len(b"manifest")
                 archive.writestr("payload.bin", payload)
                 archive.writestr(
                     "payload_properties.txt",
@@ -853,6 +926,32 @@ class SignedReleasePolicyTest(unittest.TestCase):
             )
             report = root / "verification-report.json"
             source_inventory = module.load_signing_inventory(unsigned)
+            kernel_policy = json.loads((ROOT / "sources/kernel-fix.json").read_text(encoding="utf-8"))
+            policy_fields = {
+                name: kernel_policy[name]
+                for name in ("project", "file", "base_commit", "patch_sha256", "application_script", "application_script_sha256")
+            }
+            application = {
+                **policy_fields, "post_fix_source_sha256": "1" * 64,
+                "forward_applicable": False, "reverse_applicable": True,
+            }
+            build_provenance = root / "build-provenance.json"
+            build_record = {
+                "schema_version": 1, "state": "finalized", "device": "fleur",
+                "session_nonce": "2" * 64,
+                "pre_build": {
+                    **application, "timestamp": "2026-08-29T00:00:00Z",
+                    "application_evidence_sha256": hashlib.sha256(
+                        json.dumps(application, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                },
+                "unsigned_target_files": {
+                    **module._path_evidence(unsigned),
+                    "boot_raw_sha256": hashlib.sha256(fixed_boot).hexdigest(),
+                    "boot_content_sha256": hashlib.sha256(fixed_boot).hexdigest(),
+                },
+            }
+            build_provenance.write_text(json.dumps(build_record), encoding="utf-8")
             signer_report = root / "signing-report.json"
             signer_report.write_text(
                 json.dumps(
@@ -871,6 +970,9 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         "key_plan": module.key_plan_evidence(module.build_key_plan(source_inventory)),
                         "presigned_allowlist": module.presigned_inventory(source_inventory),
                         "public_fingerprints": module.fingerprint_public_bundle(public),
+                        "build_provenance": module.build_provenance_evidence(
+                            build_provenance, build_record
+                        ),
                     }
                 ),
                 encoding="utf-8",
@@ -900,7 +1002,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     return "sha256 Fingerprint=" + ":".join(["AB"] * 32) + "\n"
                 if tool == "apksigner":
                     return f"Signer #1 certificate SHA-256 digest: {fingerprint}\n"
-                if len(command) > 1 and Path(command[1]).name == "payload_info.py":
+                if "-I" in command and "payload_info.py" in {Path(item).name for item in command}:
                     names = set(module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | {"md1img"}
                     return "\n".join(f'Number of "{name}" ops: 1' for name in sorted(names))
                 if tool == "ota_extractor":
@@ -937,6 +1039,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 android_root=android_root,
                 firmware_manifest=manifest,
                 signing_report=signer_report,
+                build_provenance=build_provenance,
                 report=report,
             )
             result = module.verify_release(
@@ -995,6 +1098,67 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 with self.assertRaisesRegex(module.VerificationError, "changed"):
                     snapshot.verify()
 
+    def test_android_toolchain_snapshot_rejects_symlink_and_source_replacement(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            android = root / "android"
+            tools = android / "out/host/linux-x86/bin"
+            scripts = android / "system/update_engine/scripts"
+            tools.mkdir(parents=True)
+            scripts.mkdir(parents=True)
+            for name in module.ANDROID_TOOL_NAMES:
+                path = tools / name
+                path.write_bytes((name + "-original").encode())
+                path.chmod(0o755)
+            (scripts / "payload_info.py").write_text("print('fixture')\n", encoding="utf-8")
+            (scripts / "helper.py").write_text("VALUE = 'clean'\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(module.VerificationError, "changed"):
+                with module.snapshot_android_toolchain(android) as snapshot:
+                    self.assertEqual(
+                        b"avbtool-original",
+                        (snapshot.host_tools / "avbtool").read_bytes(),
+                    )
+                    replacement = root / "replacement"
+                    replacement.write_bytes(b"changed")
+                    replacement.chmod(0o755)
+                    os.replace(replacement, tools / "avbtool")
+
+            (tools / "avbtool").write_bytes(b"avbtool-original")
+            (tools / "avbtool").chmod(0o755)
+            with self.assertRaisesRegex(module.VerificationError, "inventory changed"):
+                with module.snapshot_android_toolchain(android):
+                    (scripts / "shadow.py").write_text(
+                        "raise RuntimeError('late import shadow')\n", encoding="utf-8"
+                    )
+            (scripts / "shadow.py").unlink()
+
+            (tools / "avbtool").unlink()
+            os.symlink(tools / "apksigner", tools / "avbtool")
+            with self.assertRaisesRegex(module.VerificationError, "symlink"):
+                with module.snapshot_android_toolchain(android):
+                    self.fail("symlinked Android tool must not be consumed")
+
+    def test_isolated_python_tool_imports_only_from_snapshotted_root(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clean = root / "clean"
+            shadow = root / "shadow"
+            clean.mkdir()
+            shadow.mkdir()
+            (clean / "helper.py").write_text("VALUE='clean'\n", encoding="utf-8")
+            script = clean / "tool.py"
+            script.write_text("from helper import VALUE\nprint(VALUE)\n", encoding="utf-8")
+            (shadow / "helper.py").write_text(
+                "raise RuntimeError('shadowed import executed')\n", encoding="utf-8"
+            )
+            output = module.run_isolated_python_tool(
+                script, clean, [], cwd=shadow
+            )
+            self.assertEqual("clean", output.strip())
+
     def test_report_temporary_is_removed_on_fsync_failure(self):
         module = load_verifier()
         with tempfile.TemporaryDirectory() as directory:
@@ -1049,12 +1213,14 @@ class SignedReleasePolicyTest(unittest.TestCase):
             "--android-root", "android",
             "--firmware-manifest", "firmware.json",
             "--signing-report", "signing-report.json",
+            "--build-provenance", "build-provenance.json",
             "--report", "verification-report.json",
         ]
         with redirect_stdout(output):
             self.assertEqual(0, module.main(argv, verifier=verifier))
         self.assertEqual("unsigned.zip", str(captured[0].unsigned_target_files))
         self.assertEqual("verification-report.json", str(captured[0].report))
+        self.assertEqual("build-provenance.json", str(captured[0].build_provenance))
         self.assertEqual("pass", json.loads(output.getvalue())["status"])
 
 

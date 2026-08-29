@@ -54,6 +54,35 @@ def write_target_files(path: Path, *, system_build_prop: str = SYSTEM_BUILD_PROP
         archive.writestr("META/apexkeys.txt", APEX_KEYS)
         archive.writestr("META/misc_info.txt", MISC_INFO)
         archive.writestr("SYSTEM/build.prop", system_build_prop)
+        archive.writestr("IMAGES/boot.img", b"fixed-kernel-boot")
+
+
+def write_build_provenance(path: Path, target_files: Path) -> None:
+    policy = json.loads((ROOT / "sources/kernel-fix.json").read_text(encoding="utf-8"))
+    fields = {
+        name: policy[name]
+        for name in ("project", "file", "base_commit", "patch_sha256", "application_script", "application_script_sha256")
+    }
+    evidence = {**fields, "post_fix_source_sha256": "1" * 64, "forward_applicable": False, "reverse_applicable": True}
+    with zipfile.ZipFile(target_files) as archive:
+        boot = archive.read("IMAGES/boot.img")
+    target_record = {
+        "filename": target_files.name,
+        "size": target_files.stat().st_size,
+        "sha256": file_digest(target_files),
+        "boot_raw_sha256": hashlib.sha256(boot).hexdigest(),
+        "boot_content_sha256": hashlib.sha256(boot).hexdigest(),
+    }
+    record = {
+        "schema_version": 1, "state": "finalized", "device": "fleur", "session_nonce": "a" * 64,
+        "pre_build": {
+            **evidence,
+            "timestamp": "2026-08-29T12:30:00Z",
+            "application_evidence_sha256": hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        },
+        "unsigned_target_files": target_record,
+    }
+    path.write_text(json.dumps(record), encoding="utf-8")
 
 
 def digest(value: str) -> str:
@@ -267,9 +296,14 @@ class ReleaseOrchestrationTest(unittest.TestCase):
         output_dir = root / "20260829T123456Z"
         secret = uuid.uuid4().hex + uuid.uuid4().hex
         write_target_files(target_files)
+        build_provenance = root / "build-provenance.json"
+        write_build_provenance(build_provenance, target_files)
         write_fake_host_tools(android_root)
         write_fake_keyset(keys_dir, secret)
-        paths = self.SigningPaths(target_files, android_root, keys_dir, output_dir)
+        paths = self.SigningPaths(
+            target_files, android_root, keys_dir, output_dir,
+            build_provenance=build_provenance,
+        )
         return paths, secret
 
     def test_publishes_complete_release_atomically_with_sanitized_report(self):
@@ -333,6 +367,9 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             )
             self.assertTrue(report["key_plan"]["android_mappings"])
             self.assertIn("avb_boot", report["key_plan"]["avb_roles"])
+            self.assertEqual(paths.build_provenance.name, report["build_provenance"]["filename"])
+            self.assertEqual(file_digest(paths.build_provenance), report["build_provenance"]["sha256"])
+            self.assertEqual(file_digest(paths.target_files), report["build_provenance"]["unsigned_target_files"]["sha256"])
             sanitized = report["sanitized_options"]["sign_target_files_apks"]
             self.assertTrue(all(name.startswith("-") for name in sanitized))
             self.assertTrue(all("/" not in name for name in sanitized))
@@ -437,7 +474,7 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                 paths.target_files,
                 system_build_prop=SYSTEM_BUILD_PROP.replace("fleur", "other"),
             )
-            with self.assertRaisesRegex(self.ReleaseSigningError, "device"):
+            with self.assertRaisesRegex(self.ReleaseSigningError, "provenance|device"):
                 self.sign_release(
                     paths,
                     runner=lambda *_args, **_kwargs: self.fail("release tool must not run"),
@@ -632,6 +669,25 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             self.assertFalse(paths.output_dir.exists())
             self.assertEqual(list(root.glob(".20260829T123456Z.staging-*")), [])
 
+    def test_rejects_build_provenance_replacement_during_signing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, secret = self.make_fixture(root)
+            base = FakeReleaseRunner(paths.output_dir)
+
+            def runner(command, *, env):
+                if not base.calls:
+                    replacement = root / "replacement-provenance.json"
+                    replacement.write_text("{}", encoding="utf-8")
+                    os.replace(replacement, paths.build_provenance)
+                return base(command, env=env)
+
+            with self.assertRaisesRegex(self.ReleaseSigningError, "build provenance.*changed"):
+                self.sign_release(
+                    paths, runner=runner, openssl_runner=FakeCryptoRunner(secret)
+                )
+            self.assertFalse(paths.output_dir.exists())
+
     def test_dry_run_validates_keyset_without_creating_output(self):
         from scripts.ubuntu.sign_release import main
 
@@ -646,6 +702,8 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                 str(paths.keys_dir),
                 "--output-dir",
                 str(paths.output_dir),
+                "--build-provenance",
+                str(paths.build_provenance),
                 "--dry-run",
             ]
             stdout = io.StringIO()
