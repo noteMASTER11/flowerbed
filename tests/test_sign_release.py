@@ -191,6 +191,14 @@ class FakeReleaseRunner:
         self.legacy_ota = legacy_ota
         self.calls = []
         self.signing_input_bytes = None
+        self.container_material = {}
+        self.config_bytes = None
+        self.password_entry_paths = ()
+
+    def _record_container_stem(self, stem: Path) -> None:
+        for suffix in (".pk8", ".x509.pem"):
+            path = Path(f"{stem}{suffix}")
+            self.container_material[path.name] = path.read_bytes()
 
     def __call__(self, command, *, env):
         command = tuple(str(item) for item in command)
@@ -200,6 +208,28 @@ class FakeReleaseRunner:
         self.calls.append((command, dict(env)))
         if tool == "sign_target_files_apks":
             self.signing_input_bytes = Path(command[-2]).read_bytes()
+            self.config_bytes = Path(env["FLEUR_AVB_SIGNING_CONFIG"]).read_bytes()
+            password_lines = Path(env["ANDROID_PW_FILE"]).read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.password_entry_paths = tuple(
+                line.split("]]]", 1)[1].strip()
+                for line in password_lines
+                if line.strip()
+            )
+            default_directory = Path(command[command.index("-d") + 1])
+            self._record_container_stem(default_directory / "releasekey")
+            for index, value in enumerate(command):
+                if value == "-k":
+                    self._record_container_stem(
+                        Path(command[index + 1].split("=", 1)[1])
+                    )
+                elif value == "--extra_apks":
+                    self._record_container_stem(
+                        Path(command[index + 1].split("=", 1)[1])
+                    )
+        elif tool == "ota_from_target_files":
+            self._record_container_stem(Path(command[command.index("-k") + 1]))
         if tool == self.fail_tool:
             raise subprocess.CalledProcessError(7, command)
         output = Path(command[-1])
@@ -319,6 +349,40 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             )
             self.assertEqual(tool_runner.signing_input_bytes, paths.target_files.read_bytes())
             self.assertTrue(sign_command[-2].startswith(f"/proc/{os.getpid()}/fd/"))
+            runtime_key_dir = Path(sign_command[sign_command.index("-d") + 1])
+            self.assertTrue(
+                str(runtime_key_dir).startswith(f"/proc/{os.getpid()}/fd/")
+            )
+            self.assertNotEqual(runtime_key_dir, paths.keys_dir)
+            self.assertNotIn(str(paths.keys_dir), "\n".join(sign_command))
+            self.assertTrue(
+                sign_env["FLEUR_AVB_SIGNING_CONFIG"].startswith(
+                    f"/proc/{os.getpid()}/fd/"
+                )
+            )
+            self.assertTrue(
+                sign_env["ANDROID_PW_FILE"].startswith(
+                    f"/proc/{os.getpid()}/fd/"
+                )
+            )
+            expected_runtime_stems = {
+                str(runtime_key_dir / role)
+                for role in (
+                    "platform",
+                    "releasekey",
+                    "testkey-f88799ce31c1",
+                    "com.android.art",
+                )
+            }
+            self.assertEqual(set(tool_runner.password_entry_paths), expected_runtime_stems)
+            self.assertEqual(
+                (paths.public_keys_dir / "platform.x509.pem").read_bytes(),
+                tool_runner.container_material["platform.x509.pem"],
+            )
+            self.assertEqual(
+                (paths.public_keys_dir / "com.android.art.x509.pem").read_bytes(),
+                tool_runner.container_material["com.android.art.x509.pem"],
+            )
 
     def test_rejects_source_filename_device_and_concurrent_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -393,6 +457,92 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                     runner=replacing_runner,
                     openssl_runner=FakeCryptoRunner(secret),
                     signing_helper=helper,
+                )
+            self.assertFalse(paths.output_dir.exists())
+
+    def test_rejects_concurrent_helper_config_replacement_while_using_held_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, secret = self.make_fixture(root)
+            base_runner = FakeReleaseRunner(paths.output_dir)
+
+            def replacing_runner(command, *, env):
+                if Path(command[0]).name == "sign_target_files_apks":
+                    held_config = Path(env["FLEUR_AVB_SIGNING_CONFIG"])
+                    original_config = held_config.read_bytes()
+                    output = Path(command[-1])
+                    named_config = output.parent / ".signing-runtime/avb-helper.json"
+                    replacement = root / "replacement-helper.json"
+                    replacement.write_text('{"schema_version": 2}\n', encoding="utf-8")
+                    replacement.chmod(0o600)
+                    os.replace(replacement, named_config)
+                    self.assertEqual(held_config.read_bytes(), original_config)
+                base_runner(command, env=env)
+
+            with self.assertRaisesRegex(self.ReleaseSigningError, "config.*changed"):
+                self.sign_release(
+                    paths,
+                    runner=replacing_runner,
+                    openssl_runner=FakeCryptoRunner(secret),
+                )
+            self.assertFalse(paths.output_dir.exists())
+
+    def test_rejects_apk_and_apex_container_source_key_replacement(self):
+        cases = (("platform", ".pk8"), ("com.android.art", ".x509.pem"))
+        for role, suffix in cases:
+            with self.subTest(role=role, suffix=suffix), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                paths, secret = self.make_fixture(root)
+                base_runner = FakeReleaseRunner(paths.output_dir)
+                original_bytes = (paths.keys_dir / f"{role}{suffix}").read_bytes()
+
+                def replacing_runner(command, *, env):
+                    if Path(command[0]).name == "sign_target_files_apks":
+                        source = paths.keys_dir / f"{role}{suffix}"
+                        replacement = root / f"replacement-{role}{suffix}"
+                        replacement.write_bytes(b"replacement-container-key")
+                        replacement.chmod(0o600)
+                        os.replace(replacement, source)
+                    base_runner(command, env=env)
+
+                with self.assertRaisesRegex(
+                    self.ReleaseSigningError, "container key.*changed"
+                ):
+                    self.sign_release(
+                        paths,
+                        runner=replacing_runner,
+                        openssl_runner=FakeCryptoRunner(secret),
+                    )
+                self.assertEqual(
+                    base_runner.container_material[f"{role}{suffix}"],
+                    original_bytes,
+                )
+                self.assertFalse(paths.output_dir.exists())
+
+    def test_rejects_runtime_container_snapshot_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths, secret = self.make_fixture(root)
+            base_runner = FakeReleaseRunner(paths.output_dir)
+
+            def replacing_runner(command, *, env):
+                if Path(command[0]).name == "sign_target_files_apks":
+                    runtime_key_dir = Path(command[command.index("-d") + 1])
+                    snapshot = runtime_key_dir / "releasekey.pk8"
+                    runtime_key_dir.chmod(0o700)
+                    replacement = root / "replacement-releasekey.pk8"
+                    replacement.write_bytes(b"replacement-container-key")
+                    replacement.chmod(0o400)
+                    os.replace(replacement, snapshot)
+                base_runner(command, env=env)
+
+            with self.assertRaisesRegex(
+                self.ReleaseSigningError, "container key snapshot.*changed"
+            ):
+                self.sign_release(
+                    paths,
+                    runner=replacing_runner,
+                    openssl_runner=FakeCryptoRunner(secret),
                 )
             self.assertFalse(paths.output_dir.exists())
 

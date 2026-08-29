@@ -22,7 +22,11 @@ from typing import Callable, Mapping, Sequence
 from zipfile import BadZipFile, ZipFile
 
 try:
-    from scripts.ubuntu.avb_password_helper import PasswordLookupError, parse_password_file
+    from scripts.ubuntu.avb_password_helper import (
+        PasswordLookupError,
+        lookup_password,
+        parse_password_file,
+    )
     from scripts.ubuntu.avb_signing_helper import (
         AvbSigningError,
         OpenSslRunner,
@@ -32,7 +36,7 @@ try:
     from scripts.ubuntu.generate_release_keys import KeyGenerationError, build_key_plan
     from scripts.ubuntu.signing_metadata import SigningInventory, load_signing_inventory
 except ModuleNotFoundError:  # Direct execution from scripts/ubuntu.
-    from avb_password_helper import PasswordLookupError, parse_password_file
+    from avb_password_helper import PasswordLookupError, lookup_password, parse_password_file
     from avb_signing_helper import AvbSigningError, OpenSslRunner, export_public_key, run_openssl
     from generate_release_keys import KeyGenerationError, build_key_plan
     from signing_metadata import SigningInventory, load_signing_inventory
@@ -192,6 +196,36 @@ class _TargetSnapshot:
             raise ReleaseSigningError("target-files snapshot changed while signing")
 
 
+@dataclass(frozen=True)
+class _ContainerKeysetSnapshot:
+    directory: Path
+    directory_descriptor: int
+    directory_identity: _FileIdentity
+    source_files: tuple[_PinnedFile, ...]
+    snapshot_files: tuple[_PinnedFile, ...]
+    roles: tuple[str, ...]
+
+    @property
+    def command_directory(self) -> Path:
+        return Path(f"/proc/{os.getpid()}/fd/{self.directory_descriptor}")
+
+    def verify(self) -> None:
+        if _descriptor_identity(self.directory_descriptor) != self.directory_identity:
+            raise ReleaseSigningError("container key snapshot directory changed")
+        try:
+            named_directory = self.directory.stat(follow_symlinks=False)
+        except OSError as error:
+            raise ReleaseSigningError(
+                "container key snapshot directory changed"
+            ) from error
+        if _identity_from_stat(named_directory) != self.directory_identity:
+            raise ReleaseSigningError("container key snapshot directory changed")
+        for pinned in self.source_files:
+            pinned.verify_named("container key source", verify_hash=True)
+        for pinned in self.snapshot_files:
+            pinned.verify_named("container key snapshot", verify_hash=True)
+
+
 CommandRunner = Callable[..., None]
 Timestamp = Callable[[], str]
 
@@ -281,13 +315,20 @@ def build_signing_commands(
     return SigningCommands(tuple(command), ota, images)
 
 
-def build_child_environment(paths: SigningPaths, config_path: Path) -> dict[str, str]:
+def build_child_environment(
+    paths: SigningPaths,
+    config_path: Path,
+    *,
+    password_file: Path | None = None,
+) -> dict[str, str]:
     """Build a narrow child environment containing only nonsecret path state."""
     environment: dict[str, str] = {
         "PATH": os.pathsep.join(
             (str(paths.host_tools), os.environ.get("PATH", "/usr/bin:/bin"))
         ),
-        "ANDROID_PW_FILE": str(paths.keys_dir / "passwords"),
+        "ANDROID_PW_FILE": str(
+            paths.keys_dir / "passwords" if password_file is None else password_file
+        ),
         "FLEUR_AVB_SIGNING_CONFIG": str(config_path),
         "LC_ALL": "C.UTF-8",
         "LANG": "C.UTF-8",
@@ -343,6 +384,7 @@ def sign_release(
     runtime_dir = staging / ".signing-runtime"
     public_pem_dir = runtime_dir / "public-pem"
     config_path = runtime_dir / "avb-helper.json"
+    runtime_password_path = runtime_dir / "android-passwords"
     published = False
     try:
         runtime_dir.mkdir(mode=0o700)
@@ -354,59 +396,123 @@ def sign_release(
         with _snapshot_target_files(paths.target_files, runtime_dir) as target_snapshot:
             with _pin_executable(helper_source) as pinned_helper:
                 inventory = _validate_inputs(paths, archive=target_snapshot.proc_path)
-                plan = _validate_keyset(inventory, paths.keys_dir)
-                staging_paths = SigningPaths(
-                    target_snapshot.proc_path,
-                    paths.android_root,
-                    paths.keys_dir,
-                    staging,
-                    build_id=paths.build_id,
-                )
-                public_pem_dir.mkdir(parents=True, mode=0o700)
                 try:
-                    mappings = _export_runtime_public_pems(
-                        plan,
+                    plan = build_key_plan(inventory)
+                except KeyGenerationError as error:
+                    raise ReleaseSigningError(
+                        "signing metadata has colliding generated key roles"
+                    ) from error
+                with _snapshot_container_keyset(
+                    plan, paths.keys_dir, runtime_dir
+                ) as container_snapshot:
+                    _validate_keyset(
+                        inventory,
                         paths.keys_dir,
-                        public_pem_dir,
-                        openssl_runner,
+                        plan=plan,
+                        container_keys_dir=container_snapshot.command_directory,
                     )
-                except AvbSigningError as error:
-                    raise ReleaseSigningError("public key preparation failed") from error
-                _write_private_json(
-                    config_path,
-                    {
-                        "schema_version": 2,
-                        "password_file": str(paths.keys_dir / "passwords"),
-                        "keys": mappings,
-                    },
-                )
-                commands = build_signing_commands(
-                    inventory,
-                    staging_paths,
-                    signing_helper=pinned_helper.proc_path,
-                    public_key_dir=public_pem_dir,
-                )
-                private_environment = build_child_environment(staging_paths, config_path)
-                public_environment = build_public_environment(staging_paths)
+                    staging_paths = SigningPaths(
+                        target_snapshot.proc_path,
+                        paths.android_root,
+                        container_snapshot.command_directory,
+                        staging,
+                        build_id=paths.build_id,
+                    )
+                    public_pem_dir.mkdir(parents=True, mode=0o700)
+                    try:
+                        mappings = _export_runtime_public_pems(
+                            plan,
+                            paths.keys_dir,
+                            public_pem_dir,
+                            openssl_runner,
+                        )
+                    except AvbSigningError as error:
+                        raise ReleaseSigningError("public key preparation failed") from error
+                    _write_private_json(
+                        config_path,
+                        {
+                            "schema_version": 2,
+                            "password_file": str(paths.keys_dir / "passwords"),
+                            "keys": mappings,
+                        },
+                    )
+                    _write_runtime_password_file(
+                        runtime_password_path,
+                        paths.keys_dir,
+                        container_snapshot,
+                    )
+                    with _pin_private_runtime_file(
+                        config_path, "AVB helper config"
+                    ) as pinned_config:
+                        with _pin_private_runtime_file(
+                            runtime_password_path, "runtime password file"
+                        ) as pinned_passwords:
+                            commands = build_signing_commands(
+                                inventory,
+                                staging_paths,
+                                signing_helper=pinned_helper.proc_path,
+                                public_key_dir=public_pem_dir,
+                            )
+                            private_environment = build_child_environment(
+                                staging_paths,
+                                pinned_config.proc_path,
+                                password_file=pinned_passwords.proc_path,
+                            )
+                            public_environment = build_public_environment(staging_paths)
 
-                _run_release_tool(commands.sign_target_files, private_environment, runner)
-                target_snapshot.verify()
-                pinned_helper.verify_named("signing helper", verify_hash=True)
-                _validate_zip(staging_paths.signed_target_files)
-                _run_release_tool(commands.ota_from_target_files, private_environment, runner)
-                _validate_payload_ota(staging_paths.ota_zip)
-                _run_release_tool(commands.img_from_target_files, public_environment, runner)
-                _validate_zip(staging_paths.fastboot_zip)
+                            _run_release_tool(
+                                commands.sign_target_files,
+                                private_environment,
+                                runner,
+                            )
+                            target_snapshot.verify()
+                            container_snapshot.verify()
+                            pinned_helper.verify_named(
+                                "signing helper", verify_hash=True
+                            )
+                            pinned_config.verify_named(
+                                "AVB helper config", verify_hash=True
+                            )
+                            pinned_passwords.verify_named(
+                                "runtime password file", verify_hash=True
+                            )
+                            _validate_zip(staging_paths.signed_target_files)
+                            _run_release_tool(
+                                commands.ota_from_target_files,
+                                private_environment,
+                                runner,
+                            )
+                            container_snapshot.verify()
+                            pinned_passwords.verify_named(
+                                "runtime password file", verify_hash=True
+                            )
+                            _validate_payload_ota(staging_paths.ota_zip)
+                            _run_release_tool(
+                                commands.img_from_target_files,
+                                public_environment,
+                                runner,
+                            )
+                            _validate_zip(staging_paths.fastboot_zip)
 
-                _export_public_bundle(
-                    plan,
-                    paths.keys_dir,
-                    public_pem_dir,
-                    staging_paths.public_keys_dir,
-                )
-                target_snapshot.verify()
-                pinned_helper.verify_named("signing helper", verify_hash=True)
-                input_evidence = target_snapshot.evidence
+                            _export_public_bundle(
+                                plan,
+                                container_snapshot.command_directory,
+                                paths.keys_dir,
+                                public_pem_dir,
+                                staging_paths.public_keys_dir,
+                            )
+                            target_snapshot.verify()
+                            container_snapshot.verify()
+                            pinned_helper.verify_named(
+                                "signing helper", verify_hash=True
+                            )
+                            pinned_config.verify_named(
+                                "AVB helper config", verify_hash=True
+                            )
+                            pinned_passwords.verify_named(
+                                "runtime password file", verify_hash=True
+                            )
+                            input_evidence = target_snapshot.evidence
         shutil.rmtree(runtime_dir)
         completed_at = now()
         _write_report(
@@ -549,6 +655,158 @@ def _pin_executable(path: Path):
         os.close(descriptor)
 
 
+@contextmanager
+def _pin_private_runtime_file(path: Path, label: str):
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise ReleaseSigningError(f"{label} is unavailable") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        os.close(descriptor)
+        raise ReleaseSigningError(f"{label} is not an owned mode-0600 file")
+    pinned = _PinnedFile(
+        path,
+        descriptor,
+        _identity_from_stat(metadata),
+        _sha256_descriptor(descriptor),
+    )
+    try:
+        yield pinned
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _snapshot_container_keyset(plan, keys_dir: Path, runtime_dir: Path):
+    _validate_key_directory(keys_dir)
+    directory = runtime_dir / "container-keys"
+    directory.mkdir(mode=0o700)
+    roles = tuple(sorted({*plan.android_roles, *plan.apex_names}))
+    source_files: list[_PinnedFile] = []
+    snapshot_files: list[_PinnedFile] = []
+    directory_fd = -1
+    try:
+        for role in roles:
+            for suffix in (".pk8", ".x509.pem"):
+                source_pin, snapshot_pin = _snapshot_container_key_file(
+                    keys_dir / f"{role}{suffix}",
+                    directory / f"{role}{suffix}",
+                )
+                source_files.append(source_pin)
+                snapshot_files.append(snapshot_pin)
+        _fsync_directory(directory)
+        os.chmod(directory, 0o500)
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        snapshot = _ContainerKeysetSnapshot(
+            directory,
+            directory_fd,
+            _descriptor_identity(directory_fd),
+            tuple(source_files),
+            tuple(snapshot_files),
+            roles,
+        )
+        snapshot.verify()
+        yield snapshot
+    finally:
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        for pinned in (*snapshot_files, *source_files):
+            os.close(pinned.descriptor)
+
+
+def _snapshot_container_key_file(
+    source: Path,
+    destination: Path,
+) -> tuple[_PinnedFile, _PinnedFile]:
+    source_fd = -1
+    destination_fd = -1
+    completed = False
+    try:
+        source_fd = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        source_metadata = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(source_metadata.st_mode)
+            or source_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(source_metadata.st_mode) != 0o600
+        ):
+            raise ReleaseSigningError("container key source is unsafe")
+        destination_fd = os.open(
+            destination,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o400,
+        )
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written == 0:
+                    raise ReleaseSigningError("short write while snapshotting container key")
+                view = view[written:]
+        os.fchmod(destination_fd, 0o400)
+        os.fsync(destination_fd)
+        source_pin = _PinnedFile(
+            source,
+            source_fd,
+            _identity_from_stat(source_metadata),
+            digest.hexdigest(),
+        )
+        destination_pin = _PinnedFile(
+            destination,
+            destination_fd,
+            _descriptor_identity(destination_fd),
+            digest.hexdigest(),
+        )
+        source_pin.verify_named("container key source", verify_hash=True)
+        destination_pin.verify_named("container key snapshot", verify_hash=True)
+        completed = True
+        return source_pin, destination_pin
+    except OSError as error:
+        raise ReleaseSigningError("container key snapshot failed") from error
+    finally:
+        if not completed:
+            if destination_fd >= 0:
+                os.close(destination_fd)
+            if source_fd >= 0:
+                os.close(source_fd)
+
+
 def _validate_inputs(paths: SigningPaths, *, archive: Path | None = None) -> SigningInventory:
     if paths.output_dir.name != paths.build_id:
         raise ReleaseSigningError("final output directory must use the UTC build identifier")
@@ -572,7 +830,7 @@ def _validate_inputs(paths: SigningPaths, *, archive: Path | None = None) -> Sig
     return inventory
 
 
-def _validate_keyset(inventory: SigningInventory, keys_dir: Path):
+def _validate_key_directory(keys_dir: Path) -> None:
     if keys_dir.is_symlink() or not keys_dir.is_dir():
         raise ReleaseSigningError("release key directory is unavailable")
     directory_metadata = keys_dir.lstat()
@@ -581,19 +839,38 @@ def _validate_keyset(inventory: SigningInventory, keys_dir: Path):
         or stat.S_IMODE(directory_metadata.st_mode) != 0o700
     ):
         raise ReleaseSigningError("release key directory must be owned and mode 0700")
-    try:
-        plan = build_key_plan(inventory)
-    except KeyGenerationError as error:
-        raise ReleaseSigningError("signing metadata has colliding generated key roles") from error
+
+
+def _validate_keyset(
+    inventory: SigningInventory,
+    keys_dir: Path,
+    *,
+    plan=None,
+    container_keys_dir: Path | None = None,
+):
+    _validate_key_directory(keys_dir)
+    if plan is None:
+        try:
+            plan = build_key_plan(inventory)
+        except KeyGenerationError as error:
+            raise ReleaseSigningError(
+                "signing metadata has colliding generated key roles"
+            ) from error
 
     expected_password_entries: set[str] = set()
+    container_source = keys_dir if container_keys_dir is None else container_keys_dir
     for role in plan.android_roles:
-        _validate_private_file(keys_dir / f"{role}.pk8")
-        _validate_private_file(keys_dir / f"{role}.x509.pem")
+        _validate_container_file(container_source / f"{role}.pk8", container_keys_dir)
+        _validate_container_file(
+            container_source / f"{role}.x509.pem", container_keys_dir
+        )
         expected_password_entries.add(str(keys_dir / role))
     for role in plan.apex_names:
-        for suffix in (".pem", ".pk8", ".x509.pem"):
-            _validate_private_file(keys_dir / f"{role}{suffix}")
+        _validate_private_file(keys_dir / f"{role}.pem")
+        _validate_container_file(container_source / f"{role}.pk8", container_keys_dir)
+        _validate_container_file(
+            container_source / f"{role}.x509.pem", container_keys_dir
+        )
         _validate_private_file(keys_dir / "public" / f"{role}.avbpubkey")
         expected_password_entries.update((str(keys_dir / role), str(keys_dir / f"{role}.pem")))
     for partition in plan.avb_roles:
@@ -618,25 +895,35 @@ def _validate_keyset(inventory: SigningInventory, keys_dir: Path):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ReleaseSigningError("release key manifest is invalid") from error
-    if manifest != _expected_key_manifest(plan, keys_dir):
+    if manifest != _expected_key_manifest(
+        plan,
+        keys_dir,
+        certificate_dir=container_source,
+    ):
         raise ReleaseSigningError("release key manifest does not match public material")
     return plan
 
 
-def _expected_key_manifest(plan, keys_dir: Path) -> dict[str, object]:
+def _expected_key_manifest(
+    plan,
+    keys_dir: Path,
+    *,
+    certificate_dir: Path | None = None,
+) -> dict[str, object]:
+    certificates = keys_dir if certificate_dir is None else certificate_dir
     return {
         "schema_version": 1,
         "android": [
             {
                 "name": role,
-                "certificate_sha256": _sha256(keys_dir / f"{role}.x509.pem"),
+                "certificate_sha256": _sha256(certificates / f"{role}.x509.pem"),
             }
             for role in plan.android_roles
         ],
         "apex": [
             {
                 "name": role,
-                "certificate_sha256": _sha256(keys_dir / f"{role}.x509.pem"),
+                "certificate_sha256": _sha256(certificates / f"{role}.x509.pem"),
                 "avb_public_key_sha256": _sha256(
                     keys_dir / "public" / f"{role}.avbpubkey"
                 ),
@@ -669,6 +956,20 @@ def _validate_private_file(path: Path) -> None:
         raise ReleaseSigningError("release keyset contains an unsafe file")
 
 
+def _validate_container_file(path: Path, snapshot_dir: Path | None) -> None:
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ReleaseSigningError("release keyset is incomplete") from error
+    expected_mode = 0o600 if snapshot_dir is None else 0o400
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != expected_mode
+    ):
+        raise ReleaseSigningError("release keyset contains an unsafe container key")
+
+
 def _export_runtime_public_pems(
     plan,
     keys_dir: Path,
@@ -692,6 +993,34 @@ def _export_runtime_public_pems(
 
 def _write_private_json(path: Path, value: object) -> None:
     payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    _write_private_bytes(path, payload, "AVB helper config")
+
+
+def _write_runtime_password_file(
+    path: Path,
+    persistent_keys_dir: Path,
+    snapshot: _ContainerKeysetSnapshot,
+) -> None:
+    lines: list[str] = []
+    password = ""
+    try:
+        for role in snapshot.roles:
+            password = lookup_password(
+                persistent_keys_dir / "passwords",
+                str(persistent_keys_dir / role),
+            )
+            lines.append(f"[[[ {password} ]]] {snapshot.command_directory / role}\n")
+            password = ""
+        payload = "".join(lines).encode("utf-8")
+        _write_private_bytes(path, payload, "runtime password file")
+    except PasswordLookupError as error:
+        raise ReleaseSigningError("release password lookup failed") from error
+    finally:
+        password = ""
+        lines.clear()
+
+
+def _write_private_bytes(path: Path, payload: bytes, label: str) -> None:
     descriptor = os.open(
         path,
         os.O_WRONLY
@@ -706,7 +1035,7 @@ def _write_private_json(path: Path, value: object) -> None:
         while view:
             written = os.write(descriptor, view)
             if written == 0:
-                raise ReleaseSigningError("short write while preparing AVB helper config")
+                raise ReleaseSigningError(f"short write while preparing {label}")
             view = view[written:]
         os.fchmod(descriptor, 0o600)
         os.fsync(descriptor)
@@ -748,16 +1077,30 @@ def _validate_payload_ota(path: Path) -> None:
             raise ReleaseSigningError("signed A/B OTA must contain exactly one payload.bin")
 
 
-def _export_public_bundle(plan, keys_dir: Path, public_pem_dir: Path, destination: Path) -> None:
+def _export_public_bundle(
+    plan,
+    container_keys_dir: Path,
+    persistent_keys_dir: Path,
+    public_pem_dir: Path,
+    destination: Path,
+) -> None:
     destination.mkdir(mode=0o755)
     sources: list[tuple[Path, str]] = []
     for role in plan.android_roles:
-        sources.append((keys_dir / f"{role}.x509.pem", f"{role}.x509.pem"))
+        sources.append(
+            (container_keys_dir / f"{role}.x509.pem", f"{role}.x509.pem")
+        )
     for role in plan.apex_names:
         sources.extend(
             (
-                (keys_dir / f"{role}.x509.pem", f"{role}.x509.pem"),
-                (keys_dir / "public" / f"{role}.avbpubkey", f"{role}.avbpubkey"),
+                (
+                    container_keys_dir / f"{role}.x509.pem",
+                    f"{role}.x509.pem",
+                ),
+                (
+                    persistent_keys_dir / "public" / f"{role}.avbpubkey",
+                    f"{role}.avbpubkey",
+                ),
                 (public_pem_dir / f"{role}.public.pem", f"{role}.public.pem"),
             )
         )
@@ -765,7 +1108,10 @@ def _export_public_bundle(plan, keys_dir: Path, public_pem_dir: Path, destinatio
         role = f"avb_{partition}"
         sources.extend(
             (
-                (keys_dir / "public" / f"{role}.avbpubkey", f"{role}.avbpubkey"),
+                (
+                    persistent_keys_dir / "public" / f"{role}.avbpubkey",
+                    f"{role}.avbpubkey",
+                ),
                 (public_pem_dir / f"{role}.public.pem", f"{role}.public.pem"),
             )
         )
