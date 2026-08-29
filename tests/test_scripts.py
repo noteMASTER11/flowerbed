@@ -1,6 +1,5 @@
 from pathlib import Path
 import os
-import json
 import shutil
 import subprocess
 import tempfile
@@ -148,7 +147,7 @@ class ScriptTest(unittest.TestCase):
             "  case \"${FIXTURE_MODE:-}\" in\n"
             "    stale) printf 'Packaging target files: out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip\\n' ;;\n"
             "    touch) touch \"$target_files\"; printf 'Packaging target files: out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip\\n' ;;\n"
-            "    copy) cp \"$(find \"$(dirname \"$target_files\")\" -maxdepth 1 -name \"lineage_fleur-target_files.zip.pre-run-*\" -print -quit)\" \"$target_files\" ;;\n"
+            "    copy) cp \"$(find \"$(dirname \"$target_files\")\" -maxdepth 1 -name \"lineage_fleur-target_files.zip.pre-run-*\" -print -quit)\" \"$target_files\"; printf 'Packaging target files: out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip\\n' ;;\n"
             "    *) make_target \"$target_files\"; printf 'Packaging target files: out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip\\n' ;;\n"
             "  esac\n"
             "}\n",
@@ -157,7 +156,45 @@ class ScriptTest(unittest.TestCase):
         (fake_bin / "ccache").write_text(
             "#!/usr/bin/env bash\n"
             "printf 'ccache:%s\\n' \"$*\" >>\"$TRACE\"\n"
+            "if [[ \"${FIXTURE_MODE:-}\" == ccache-resource && \"$*\" == -s ]]; then exit 75; fi\n"
             "[[ \"${FIXTURE_MODE:-}\" != ccache ]] || exit 60\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "tee").write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"${FIXTURE_MODE:-}\" == tee-delay ]]; then sleep 0.2; fi\n"
+            "if [[ \"${FIXTURE_MODE:-}\" == tee-failure ]]; then /bin/cat >\"$1\"; exit 70; fi\n"
+            "exec /usr/bin/tee \"$@\"\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "free").write_text(
+            "#!/usr/bin/env bash\n"
+            "printf 'free\\n' >>\"$TRACE\"\n"
+            "[[ \"${FIXTURE_MODE:-}\" != free ]] || exit 73\n"
+            "exec /usr/bin/free \"$@\"\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "df").write_text(
+            "#!/usr/bin/env bash\n"
+            "printf 'df\\n' >>\"$TRACE\"\n"
+            "[[ \"${FIXTURE_MODE:-}\" != df ]] || exit 74\n"
+            "exec /usr/bin/df \"$@\"\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "cat").write_text(
+            "#!/usr/bin/env bash\n"
+            "printf 'cat\\n' >>\"$TRACE\"\n"
+            "[[ \"${FIXTURE_MODE:-}\" != resource-write ]] || exit 77\n"
+            "exec /bin/cat \"$@\"\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "python3").write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"$1\" == - && \"$#\" -eq 16 ]]; then\n"
+            "  printf 'metadata\\n' >>\"$TRACE\"\n"
+            "  [[ \"${FIXTURE_MODE:-}\" != metadata ]] || exit 76\n"
+            "fi\n"
+            "exec /usr/bin/python3 \"$@\"\n",
             encoding="utf-8",
         )
         (fake_bin / "repo").write_text(
@@ -183,6 +220,8 @@ class ScriptTest(unittest.TestCase):
             repo / "scripts/ubuntu/build_provenance.py",
             repo / "scripts/ubuntu/apply_patches.sh",
             fake_bin / "ccache", fake_bin / "repo", fake_bin / "make_target",
+            fake_bin / "tee", fake_bin / "free", fake_bin / "df", fake_bin / "cat",
+            fake_bin / "python3",
         ):
             executable.chmod(0o755)
         target = workspace / "out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip"
@@ -191,21 +230,24 @@ class ScriptTest(unittest.TestCase):
             archive.writestr("IMAGES/boot.img", b"previous-boot")
         return repo, workspace
 
-    def test_target_files_runner_fail_fast_freshness_and_finalization_order(self):
+    def test_target_files_runner_waits_for_logger_and_finalizes_after_all_evidence(self):
         cache_root = Path.home() / ".cache/flowerbed-tests"
         cache_root.mkdir(parents=True, exist_ok=True)
         expected_exit_codes = {
             "ccache": 60, "envsetup": 61, "breakfast": 62,
-            "prebuild": 71, "m": 63, "finalize": 1,
+            "prebuild": 71, "m": 63, "tee-failure": 70, "finalize": 72,
         }
         expected_failures = {
             "stale": "target-files output is missing",
-            "touch": "target-files output is not a valid ZIP", "copy": "target-files packaging proof is missing",
+            "touch": "target-files output is not a valid ZIP",
+            "copy": "target-files output matches preserved pre-run artifact",
             "manifest": "Unable to create resolved manifest snapshot",
         }
         no_m = {"ccache", "envsetup", "breakfast", "prebuild"}
-        no_finalize = set(expected_failures)
-        for mode in (*expected_exit_codes, *expected_failures):
+        resource_failures = {"free": 73, "df": 74, "ccache-resource": 75, "resource-write": 77, "metadata": 76}
+        no_finalize = (set(expected_exit_codes) - {"finalize"}) | set(expected_failures) | set(resource_failures)
+        preserved_failed_output = {"tee-failure", "touch", "copy", "manifest", "free", "df", "ccache-resource", "resource-write", "metadata"}
+        for mode in (*expected_exit_codes, *expected_failures, *resource_failures):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory(
                 dir=cache_root
             ) as directory:
@@ -222,46 +264,53 @@ class ScriptTest(unittest.TestCase):
                     + f" bash '{shell_path(repo / 'scripts/ubuntu/build_target_files.sh')}' '{shell_path(workspace)}'",
                 )
                 self.assertNotEqual(0, result.returncode, result.stdout)
-                if mode in expected_exit_codes:
+                if mode == "finalize":
+                    self.assertEqual(expected_exit_codes[mode], result.returncode)
+                elif mode in expected_exit_codes:
                     self.assertIn(
                         f"Target-files build exit code: {expected_exit_codes[mode]}",
                         result.stdout,
                     )
-                else:
+                elif mode in expected_failures:
                     self.assertIn(expected_failures[mode], result.stdout)
                 trace = (root / "trace.txt").read_text(encoding="utf-8")
                 if mode in no_m:
                     self.assertNotIn("m:", trace)
                 if mode in no_finalize:
                     self.assertNotIn("finalize", trace)
-                if mode == "finalize":
-                    metadata = next(
-                        path for path in (repo / "logs").glob("target-files-*.json")
-                        if "provenance" not in path.name
+                self.assertEqual([], list((repo / "logs").glob("*.build-provenance.json")))
+                target = workspace / "out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip"
+                if mode != "finalize":
+                    with zipfile.ZipFile(target) as archive:
+                        self.assertEqual(b"previous-boot", archive.read("IMAGES/boot.img"))
+                if mode in preserved_failed_output:
+                    self.assertEqual(
+                        1,
+                        len(list(target.parent.glob("lineage_fleur-target_files.zip.pre-final-failed-*"))),
                     )
-                    self.assertEqual(1, json.loads(metadata.read_text(encoding="utf-8"))["exitCode"])
-                    self.assertEqual([], list((repo / "logs").glob("*.build-provenance.json")))
 
-        with tempfile.TemporaryDirectory(dir=cache_root) as directory:
-            root = Path(directory)
-            repo, workspace = self._target_files_runner_fixture(root, "success")
-            result = run_bash(
-                "-c",
-                f"PATH='{shell_path(root / 'bin')}:/usr/bin:/bin' "
-                f"TRACE='{shell_path(root / 'trace.txt')}' FIXTURE_MODE=success "
-                f"bash '{shell_path(repo / 'scripts/ubuntu/build_target_files.sh')}' '{shell_path(workspace)}'",
-            )
-            self.assertEqual(0, result.returncode, result.stdout)
-            trace = (root / "trace.txt").read_text(encoding="utf-8").splitlines()
-            self.assertEqual(
-                ["ccache:-M 100G", "ccache:-z", "breakfast", "pre-build", "m:target-files-package otatools -j8", "manifest", "ccache:-s", "finalize"],
-                trace,
-            )
-            target_dir = workspace / "out/target/product/fleur/obj/PACKAGING/target_files_intermediates"
-            backups = list(target_dir.glob("lineage_fleur-target_files.zip.pre-run-*"))
-            self.assertEqual(1, len(backups))
-            with zipfile.ZipFile(backups[0]) as archive:
-                self.assertEqual(b"previous-boot", archive.read("IMAGES/boot.img"))
+        for mode in ("success", "tee-delay"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(dir=cache_root) as directory:
+                root = Path(directory)
+                repo, workspace = self._target_files_runner_fixture(root, mode)
+                result = run_bash(
+                    "-c",
+                    f"PATH='{shell_path(root / 'bin')}:/usr/bin:/bin' "
+                    f"TRACE='{shell_path(root / 'trace.txt')}' FIXTURE_MODE={mode} "
+                    f"bash '{shell_path(repo / 'scripts/ubuntu/build_target_files.sh')}' '{shell_path(workspace)}'",
+                )
+                self.assertEqual(0, result.returncode, result.stdout)
+                trace = (root / "trace.txt").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(
+                    ["ccache:-M 100G", "ccache:-z", "breakfast", "pre-build", "m:target-files-package otatools -j8", "manifest", "free", "df", "ccache:-s", "cat", "metadata", "finalize"],
+                    trace,
+                )
+                target_dir = workspace / "out/target/product/fleur/obj/PACKAGING/target_files_intermediates"
+                backups = list(target_dir.glob("lineage_fleur-target_files.zip.pre-run-*"))
+                self.assertEqual(1, len(backups))
+                with zipfile.ZipFile(backups[0]) as archive:
+                    self.assertEqual(b"previous-boot", archive.read("IMAGES/boot.img"))
+                self.assertEqual(1, len(list((repo / "logs").glob("*.build-provenance.json"))))
     def test_bootstrap_uses_current_ubuntu_package_names(self):
         result = run_script("scripts/ubuntu/bootstrap.sh", "--print-packages")
         self.assertEqual(0, result.returncode, result.stdout)

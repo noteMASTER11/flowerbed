@@ -87,14 +87,19 @@ scripts/ubuntu/apply_patches.sh ~/android/lineage-23.2
 scripts/ubuntu/build_target_files.sh --verbose --jobs 8 ~/android/lineage-23.2
 ```
 
-The runner writes a timestamped log, JSON metadata, resolved manifest, and final
-build-provenance JSON under the repository's ignored `logs/` and
-`manifests/snapshots/` paths. Its output identifies the refreshed unsigned
-target-files archive and provenance file; use those exact two paths below.
+The runner synchronously records a timestamped log, JSON metadata, resolved
+manifest, and target-files SHA-256 before its last operation: immutable
+build-provenance finalization. A successful final provenance JSON under the
+repository's ignored `logs/` path is therefore the acceptance marker; if it is
+absent, do not sign the target-files archive. Its output identifies the
+refreshed unsigned target-files archive and provenance file; use those exact
+two paths below.
 If the expected target-files archive existed when the runner began, it is
 atomically preserved beside the new archive with a `.pre-run-<run-id>` suffix.
 That preserved archive is evidence only: never pass it to key generation or
-signing.
+signing. If an earlier pre-finalization check fails, the old archive is restored
+and the newly produced archive is retained separately with a
+`.pre-final-failed-<run-id>` suffix for diagnosis.
 
 Generate the keyset once. It is private WSL-ext4 material outside both the Android
 tree and this repository. The passphrase is entered directly in Ubuntu and must

@@ -27,10 +27,11 @@ and memory limits have been checked.
 ## Incremental target-files runner rejects the output as stale
 
 `build_target_files.sh` deliberately fails when `m target-files-package` leaves
-the expected target-files ZIP unchanged. Do not point the signer at an older ZIP
-or copy a prior provenance JSON. First confirm the SKU and MDPM CFI patches are
-applied, then rerun the incremental target-files command. It retains compiler
-outputs and ccache; it never performs a source or output cleanup.
+the expected target-files ZIP unchanged, even if a copied older ZIP has a newer
+timestamp and a forged packaging-log line. Do not point the signer at an older
+ZIP or copy a prior provenance JSON. First confirm the SKU and MDPM CFI patches
+are applied, then rerun the incremental target-files command. It retains
+compiler outputs and ccache; it never performs a source or output cleanup.
 
 ## Release signing or verification rejects the keyset
 
