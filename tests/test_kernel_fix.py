@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PATCH = ROOT / "patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch"
 APPLIER = ROOT / "scripts/ubuntu/apply_patches.sh"
 RECORD = ROOT / "sources/kernel-fix.json"
+GIT_ATTRIBUTES = ROOT / ".gitattributes"
 KERNEL_HEADER = Path(
     "drivers/misc/mediatek/base/power/include/mdpm_v2/mt6781/mtk_mdpm_platform.h"
 )
@@ -61,10 +62,37 @@ class KernelFixTest(unittest.TestCase):
             self.assertNotIn("unsigned int rat", text)
             self.assertNotIn("unsigned int power_type", text)
 
-    def test_patch_keeps_cfi_enabled(self):
-        text = PATCH.read_text(encoding="utf-8")
-        forbidden = ("CONFIG_CFI_CLANG=n", "-fno-sanitize=cfi", "__nocfi")
-        self.assertFalse(any(token in text for token in forbidden))
+    def test_patch_changes_only_the_expected_callback_hunk(self):
+        lines = PATCH.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(1, sum(line.startswith("diff --git ") for line in lines))
+        self.assertEqual(1, sum(line.startswith("@@ ") for line in lines))
+        changes = [
+            line
+            for line in lines
+            if line.startswith(("+", "-"))
+            and not line.startswith(("+++ ", "--- "))
+        ]
+        self.assertEqual(
+            [
+                "-\tint (*tx_power_func)(u32 *dbm_mem, u32 *old_dbm_mem, unsigned int rat,",
+                "-\t\tunsigned int power_type, struct md_power_status *md_power_s);",
+                "+\tint (*tx_power_func)(u32 *dbm_mem, u32 *old_dbm_mem,",
+                "+\t\tenum tx_rat_type rat, enum mdpm_power_type power_type,",
+                "+\t\tstruct md_power_status *md_power_s);",
+            ],
+            changes,
+        )
+
+    def test_patch_whitespace_exception_is_limited_to_this_one_patch(self):
+        text = GIT_ATTRIBUTES.read_text(encoding="utf-8")
+        self.assertNotIn(
+            "patches/android_kernel_xiaomi_mt6781/*.patch whitespace=",
+            text,
+        )
+        self.assertIn(
+            "patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch whitespace=",
+            text,
+        )
 
     def test_patch_is_applied_after_fleur_identity_patch(self):
         text = APPLIER.read_text(encoding="utf-8")
