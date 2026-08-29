@@ -141,7 +141,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
     def test_allows_preserved_source_paths_but_rejects_test_keys_in_misc(self):
         module = load_verifier()
         avb_metadata = "".join(
-            f"avb_{partition}_key_path=release/avb_{partition}.pem\n"
+            f"avb_{partition}_key_path=/release/.signing-runtime/public-pem/avb_{partition}.public.pem\n"
             f"avb_{partition}_algorithm=SHA256_RSA4096\n"
             for partition in module.REQUIRED_AVB_PARTITIONS
         )
@@ -182,7 +182,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 'name="com.android.tzdata.apex" public_key="PRESIGNED" private_key="PRESIGNED" container_certificate="PRESIGNED" container_private_key="PRESIGNED" partition="system"\n',
                 "default_system_dev_certificate=release/releasekey\n"
                 + avb_metadata.replace(
-                    "avb_vbmeta_vendor_key_path=release/avb_vbmeta_vendor.pem\n",
+                    "avb_vbmeta_vendor_key_path=/release/.signing-runtime/public-pem/avb_vbmeta_vendor.public.pem\n",
                     "",
                 ),
             )
@@ -193,7 +193,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 "default_system_dev_certificate=release/releasekey\n"
                 + optional_nonsecurity_misc
                 + avb_metadata.replace(
-                    "avb_vbmeta_vendor_key_path=release/avb_vbmeta_vendor.pem",
+                    "avb_vbmeta_vendor_key_path=/release/.signing-runtime/public-pem/avb_vbmeta_vendor.public.pem",
                     "avb_vbmeta_vendor_key_path=",
                 ),
             )
@@ -218,7 +218,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 "AVB test key",
                 "default_system_dev_certificate=release/releasekey\n"
                 + avb_metadata.replace(
-                    "avb_boot_key_path=release/avb_boot.pem",
+                    "avb_boot_key_path=/release/.signing-runtime/public-pem/avb_boot.public.pem",
                     "avb_boot_key_path=build/make/target/product/security/testkey.pem",
                 ),
                 "test certificate",
@@ -253,6 +253,39 @@ class SignedReleasePolicyTest(unittest.TestCase):
             with self.assertRaises(module.VerificationError):
                 module.verify_signing_metadata_paths(
                     "", "", malformed + avb_metadata
+                )
+
+    def test_avb_role_normalization_accepts_exact_public_pem_convention(self):
+        module = load_verifier()
+        self.assertEqual(
+            "avb_boot",
+            module._key_role(
+                "/release/.signing-runtime/public-pem/avb_boot.public.pem"
+            ),
+        )
+        for suffix in (".pem", ".x509.pem", ".pk8", ".avbpubkey"):
+            self.assertEqual("avb_boot", module._key_role("keys/avb_boot" + suffix))
+        valid_misc = "default_system_dev_certificate=release/releasekey\n" + "".join(
+            f"avb_{partition}_key_path=keys/avb_{partition}.public.pem\n"
+            f"avb_{partition}_algorithm=SHA256_RSA4096\n"
+            for partition in module.REQUIRED_AVB_PARTITIONS
+        )
+        for deceptive in (
+            "keys/avb_boot.public.pem.bak",
+            "keys/avb_boot.fake.public.pem",
+            "keys/avb_boot.public.public.pem",
+            "keys/avb_boot.public.pem/wrong.pem",
+            "keys/avb_vbmeta.public.pem",
+        ):
+            self.assertNotEqual("avb_boot", module._key_role(deceptive))
+            with self.assertRaisesRegex(module.VerificationError, "boot"):
+                module.verify_signing_metadata_paths(
+                    "",
+                    "",
+                    valid_misc.replace(
+                        "avb_boot_key_path=keys/avb_boot.public.pem",
+                        f"avb_boot_key_path={deceptive}",
+                    ),
                 )
 
     def test_kernel_provenance_rejects_pre_fix_and_requires_content_match(self):
@@ -1200,7 +1233,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     "tool_extensions=device/xiaomi/fleur/../common\n"
                     "default_system_dev_certificate=release/releasekey\n"
                     + "".join(
-                        f"avb_{partition}_key_path=release/avb_{partition}.pem\n"
+                        f"avb_{partition}_key_path=/release/.signing-runtime/public-pem/avb_{partition}.public.pem\n"
                         f"avb_{partition}_algorithm=SHA256_RSA4096\n"
                         for partition in module.REQUIRED_AVB_PARTITIONS
                     )

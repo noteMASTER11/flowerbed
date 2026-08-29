@@ -1232,7 +1232,7 @@ def extract_boot_evidence(
 
 def _key_role(value: str) -> str:
     name = value.replace("\\", "/").rsplit("/", 1)[-1]
-    for suffix in (".x509.pem", ".pk8", ".avbpubkey", ".pem"):
+    for suffix in (".public.pem", ".x509.pem", ".pk8", ".avbpubkey", ".pem"):
         if name.endswith(suffix):
             return name[: -len(suffix)]
     return name
