@@ -402,6 +402,9 @@ def sign_release(
                     raise ReleaseSigningError(
                         "signing metadata has colliding generated key roles"
                     ) from error
+                input_metadata_sha256 = _target_metadata_hashes(
+                    target_snapshot.proc_path
+                )
                 with _snapshot_container_keyset(
                     plan, paths.keys_dir, runtime_dir
                 ) as container_snapshot:
@@ -523,6 +526,8 @@ def sign_release(
             started_at,
             completed_at,
             input_evidence,
+            input_metadata_sha256,
+            plan,
         )
         _write_checksums(staging_paths)
         _fsync_directory(staging)
@@ -1059,6 +1064,26 @@ def _validate_zip(path: Path) -> None:
         raise ReleaseSigningError(f"{path.name} was not produced")
     try:
         with ZipFile(path) as archive:
+            names: set[str] = set()
+            for member in archive.infolist():
+                name = member.filename
+                parts = name.split("/")
+                mode = (member.external_attr >> 16) & 0o170000
+                if (
+                    not name
+                    or "\x00" in name
+                    or "\\" in name
+                    or name.startswith("/")
+                    or (len(name) > 1 and name[1] == ":" and name[0].isalpha())
+                    or ".." in parts
+                    or any(part in {"", "."} for part in parts[:-1])
+                ):
+                    raise ReleaseSigningError(f"{path.name} has unsafe member {name!r}")
+                if mode == stat.S_IFLNK:
+                    raise ReleaseSigningError(f"{path.name} has symlink member {name}")
+                if name in names:
+                    raise ReleaseSigningError(f"{path.name} has duplicate member {name}")
+                names.add(name)
             if archive.testzip() is not None:
                 raise ReleaseSigningError(f"{path.name} is corrupt")
     except BadZipFile as error:
@@ -1161,6 +1186,20 @@ def _copy_public_file(source: Path, destination: Path) -> None:
         os.close(source_fd)
 
 
+def _target_metadata_hashes(target_files: Path) -> dict[str, str]:
+    members = (
+        "META/apkcerts.txt",
+        "META/apexkeys.txt",
+        "META/misc_info.txt",
+        "SYSTEM/build.prop",
+    )
+    with ZipFile(target_files) as archive:
+        return {
+            name: hashlib.sha256(archive.read(name)).hexdigest()
+            for name in members
+        }
+
+
 def _write_report(
     inventory: SigningInventory,
     final_paths: SigningPaths,
@@ -1169,6 +1208,8 @@ def _write_report(
     started_at: str,
     completed_at: str,
     input_evidence: _InputEvidence,
+    input_metadata_sha256: Mapping[str, str],
+    plan,
 ) -> None:
     artifacts = (
         staging_paths.signed_target_files,
@@ -1179,7 +1220,7 @@ def _write_report(
         path for path in staging_paths.public_keys_dir.iterdir() if path.is_file()
     )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "build_id": final_paths.build_id,
         "device": inventory.device,
         "build_properties": {
@@ -1195,6 +1236,27 @@ def _write_report(
         "outputs": {
             path.name: {"sha256": _sha256(path), "size": path.stat().st_size}
             for path in artifacts
+        },
+        "input_metadata_sha256": input_metadata_sha256,
+        "key_plan": {
+            "android_mappings": [
+                {
+                    "source_stem": item.source_stem,
+                    "destination_role": item.destination_role,
+                }
+                for item in plan.android_mappings
+            ],
+            "android_roles": list(plan.android_roles),
+            "apex_roles": list(plan.apex_names),
+            "avb_roles": [f"avb_{name}" for name in plan.avb_roles],
+        },
+        "presigned_allowlist": {
+            "apk": sorted(
+                item.name
+                for item in inventory.apk_certificates
+                if item.certificate == "PRESIGNED"
+            ),
+            "apex": sorted(item.name for item in inventory.apexes if item.presigned),
         },
         "public_fingerprints": {
             path.name: _sha256(path) for path in public_files

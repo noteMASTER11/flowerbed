@@ -307,6 +307,7 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             self.assertNotIn(secret, report_text)
             self.assertNotIn(str(paths.keys_dir), report_text)
             self.assertEqual(report["build_id"], "20260829T123456Z")
+            self.assertEqual(2, report["schema_version"])
             self.assertEqual(report["build_properties"], {"ab_update": True, "virtual_ab": True})
             self.assertEqual(report["timestamps"]["started_at"], "2026-08-29T12:34:56Z")
             self.assertEqual(report["timestamps"]["completed_at"], "2026-08-29T12:35:56Z")
@@ -316,6 +317,22 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             )
             self.assertEqual(set(report["outputs"]), {paths.signed_target_files.name, paths.ota_zip.name, paths.fastboot_zip.name})
             self.assertTrue(report["public_fingerprints"])
+            self.assertEqual(
+                {"com.android.tzdata.apex"},
+                set(report["presigned_allowlist"]["apex"]),
+            )
+            self.assertEqual([], report["presigned_allowlist"]["apk"])
+            self.assertEqual(
+                {
+                    "META/apkcerts.txt",
+                    "META/apexkeys.txt",
+                    "META/misc_info.txt",
+                    "SYSTEM/build.prop",
+                },
+                set(report["input_metadata_sha256"]),
+            )
+            self.assertTrue(report["key_plan"]["android_mappings"])
+            self.assertIn("avb_boot", report["key_plan"]["avb_roles"])
             sanitized = report["sanitized_options"]["sign_target_files_apks"]
             self.assertTrue(all(name.startswith("-") for name in sanitized))
             self.assertTrue(all("/" not in name for name in sanitized))
@@ -365,6 +382,7 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                     f"/proc/{os.getpid()}/fd/"
                 )
             )
+
             expected_runtime_stems = {
                 str(runtime_key_dir / role)
                 for role in (
@@ -383,6 +401,16 @@ class ReleaseOrchestrationTest(unittest.TestCase):
                 (paths.public_keys_dir / "com.android.art.x509.pem").read_bytes(),
                 tool_runner.container_material["com.android.art.x509.pem"],
             )
+
+    def test_generated_zip_validation_rejects_unsafe_members(self):
+        from scripts.ubuntu.sign_release import _validate_zip
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "signed.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("../escape", b"bad")
+            with self.assertRaisesRegex(self.ReleaseSigningError, "unsafe"):
+                _validate_zip(archive_path)
 
     def test_rejects_source_filename_device_and_concurrent_replacement(self):
         with tempfile.TemporaryDirectory() as directory:

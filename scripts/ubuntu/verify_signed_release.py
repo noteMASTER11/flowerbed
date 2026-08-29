@@ -5,16 +5,28 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
+import stat
+import struct
 import subprocess
+import tarfile
 import tempfile
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 import zipfile
+
+try:
+    from scripts.ubuntu.generate_release_keys import build_key_plan
+    from scripts.ubuntu.signing_metadata import load_signing_inventory
+except ModuleNotFoundError:
+    from generate_release_keys import build_key_plan
+    from signing_metadata import load_signing_inventory
 
 try:
     from scripts.ubuntu.verify_artifacts import (
@@ -44,6 +56,9 @@ EXPECTED_SKUS = {
     "build_fleurp.prop": "POCO M4 Pro",
     "build_mielp.prop": "POCO M4 Pro",
 }
+EXPECTED_SKU_PATHS = {
+    name: f"ODM/etc/{name}" for name in EXPECTED_SKUS
+}
 REQUIRED_AVB_PARTITIONS = ("boot", "vbmeta", "vbmeta_system", "vbmeta_vendor")
 REQUIRED_FASTBOOT_IMAGES = ("boot", "dtbo", "vbmeta", "vbmeta_system", "vbmeta_vendor", "super")
 REQUIRED_ANDROID_PAYLOAD_PARTITIONS = (
@@ -63,7 +78,102 @@ TEST_KEY_PREFIXES = (
     "build/make/target/product/security/",
     "external/avb/test/",
 )
+FASTBOOT_ALLOWED_MEMBERS = {
+    "android-info.txt",
+    *(f"{partition}.img" for partition in REQUIRED_FASTBOOT_IMAGES),
+}
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+        offset += len(chunk)
+
+
+def _path_evidence(path: Path) -> dict[str, object]:
+    path = Path(path)
+    return {
+        "filename": path.name,
+        "sha256": sha256_file(path),
+        "size": path.stat().st_size,
+    }
+
+
+class _FileSnapshot:
+    def __init__(self, paths, sources, descriptors, identities, hashes):
+        self.paths = paths
+        self.sources = sources
+        self.descriptors = descriptors
+        self.identities = identities
+        self.hashes = hashes
+
+    def verify(self) -> None:
+        for label, source in self.sources.items():
+            try:
+                named = source.lstat()
+                descriptor = os.fstat(self.descriptors[label])
+            except OSError as error:
+                raise VerificationError(f"verification input changed: {label}") from error
+            identity = (descriptor.st_dev, descriptor.st_ino, descriptor.st_size)
+            named_identity = (named.st_dev, named.st_ino, named.st_size)
+            if stat.S_ISLNK(named.st_mode) or identity != self.identities[label] or named_identity != identity:
+                raise VerificationError(f"verification input changed: {label}")
+            if _sha256_descriptor(self.descriptors[label]) != self.hashes[label]:
+                raise VerificationError(f"verification input changed: {label}")
+
+
+@contextmanager
+def snapshot_regular_files(paths: Mapping[str, Path]) -> Iterator[_FileSnapshot]:
+    descriptors: dict[str, int] = {}
+    sources = {label: Path(path) for label, path in paths.items()}
+    identities: dict[str, tuple[int, int, int]] = {}
+    hashes: dict[str, str] = {}
+    with tempfile.TemporaryDirectory(prefix="flowerbed-verify-inputs-") as directory:
+        snapshots: dict[str, Path] = {}
+        try:
+            for index, (label, source) in enumerate(sorted(sources.items())):
+                if source.is_symlink():
+                    raise VerificationError(f"verification input is a symlink: {label}")
+                try:
+                    descriptor = os.open(
+                        source,
+                        os.O_RDONLY
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                except OSError as error:
+                    raise VerificationError(f"verification input is unavailable: {label}") from error
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    os.close(descriptor)
+                    raise VerificationError(f"verification input is not regular: {label}")
+                descriptors[label] = descriptor
+                identities[label] = (metadata.st_dev, metadata.st_ino, metadata.st_size)
+                hashes[label] = _sha256_descriptor(descriptor)
+                destination = Path(directory) / f"{index:02d}" / source.name
+                destination.parent.mkdir()
+                with destination.open("wb") as output:
+                    offset = 0
+                    while True:
+                        chunk = os.pread(descriptor, 1024 * 1024, offset)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        offset += len(chunk)
+                if sha256_file(destination) != hashes[label]:
+                    raise VerificationError(f"verification input snapshot failed: {label}")
+                snapshots[label] = destination
+            snapshot = _FileSnapshot(snapshots, sources, descriptors, identities, hashes)
+            yield snapshot
+        finally:
+            for descriptor in descriptors.values():
+                os.close(descriptor)
 
 
 def _parse_properties(text: str, label: str) -> dict[str, str]:
@@ -161,9 +271,20 @@ def _metadata_records(text: str, label: str):
 
 
 def _reject_test_key_path(value: str) -> None:
-    normalized = value.removesuffix(".x509.pem").removesuffix(".pk8").removesuffix(".pem")
-    if value != "PRESIGNED" and normalized.startswith(TEST_KEY_PREFIXES):
+    if value == "PRESIGNED":
+        return
+    normalized = value.replace("\\", "/").lower()
+    normalized = "/" + normalized.lstrip("/")
+    if any(f"/{prefix}" in normalized for prefix in TEST_KEY_PREFIXES):
         raise VerificationError(f"standard Android test certificate path remains: {value}")
+
+
+def _normalized_key_stem(value: str) -> str:
+    normalized = value.replace("\\", "/")
+    for suffix in (".x509.pem", ".avbpubkey", ".pk8", ".pem"):
+        if normalized.endswith(suffix):
+            return normalized[: -len(suffix)]
+    return normalized
 
 
 def verify_signing_metadata_paths(apkcerts: str, apexkeys: str, misc_info: str) -> list[str]:
@@ -173,6 +294,10 @@ def verify_signing_metadata_paths(apkcerts: str, apexkeys: str, misc_info: str) 
             if name not in fields:
                 raise VerificationError(f"apkcerts.txt is missing {name}")
             _reject_test_key_path(fields[name])
+        if _normalized_key_stem(fields["certificate"]) != _normalized_key_stem(
+            fields["private_key"]
+        ):
+            raise VerificationError("apkcerts.txt has mismatched certificate/private key stems")
 
     presigned: list[str] = []
     for fields in _metadata_records(apexkeys, "apexkeys.txt"):
@@ -194,6 +319,10 @@ def verify_signing_metadata_paths(apkcerts: str, apexkeys: str, misc_info: str) 
         else:
             for value in values:
                 _reject_test_key_path(value)
+            if _normalized_key_stem(values[0]) != _normalized_key_stem(values[1]):
+                raise VerificationError("apexkeys.txt has mismatched payload key stems")
+            if _normalized_key_stem(values[2]) != _normalized_key_stem(values[3]):
+                raise VerificationError("apexkeys.txt has mismatched container key stems")
 
     misc = _parse_properties(misc_info, "misc_info.txt")
     for value in misc.values():
@@ -209,6 +338,25 @@ def verify_signing_metadata_paths(apkcerts: str, apexkeys: str, misc_info: str) 
                 f"misc_info.txt has invalid AVB algorithm for {partition}"
             )
     return sorted(presigned)
+
+
+def verify_presigned_allowlist(
+    actual_apk: Sequence[str],
+    actual_apex: Sequence[str],
+    approved: Mapping[str, object],
+) -> dict[str, list[str]]:
+    expected = {
+        kind: sorted(value)
+        for kind, value in approved.items()
+        if kind in {"apk", "apex"} and isinstance(value, list)
+        and all(isinstance(item, str) for item in value)
+    }
+    if set(expected) != {"apk", "apex"}:
+        raise VerificationError("approved PRESIGNED allowlist is invalid")
+    actual = {"apk": sorted(actual_apk), "apex": sorted(actual_apex)}
+    if actual != expected:
+        raise VerificationError("PRESIGNED inventory differs from approved allowlist")
+    return actual
 
 
 def verify_kernel_boot_provenance(
@@ -234,8 +382,13 @@ def verify_kernel_boot_provenance(
         ):
             raise VerificationError(f"kernel provenance {field.replace('_', ' ')} is invalid")
     rejected = record.get("rejected_pre_fix_boot_sha256")
+    rejected_content = record.get("rejected_pre_fix_boot_content_sha256")
     if not isinstance(rejected, str) or not HEX_SHA256.fullmatch(rejected):
         raise VerificationError("kernel provenance has no valid rejected pre-fix boot SHA-256")
+    if not isinstance(rejected_content, str) or not HEX_SHA256.fullmatch(rejected_content):
+        raise VerificationError(
+            "kernel provenance has no valid rejected normalized pre-fix boot SHA-256"
+        )
     for label, evidence in (("unsigned", unsigned_boot), ("signed", signed_boot)):
         raw = evidence.get("raw_sha256")
         content = evidence.get("content_sha256")
@@ -243,6 +396,10 @@ def verify_kernel_boot_provenance(
             raise VerificationError(f"cannot associate {label} boot with kernel provenance")
         if raw == rejected:
             raise VerificationError(f"{label} boot matches the rejected pre-fix boot SHA-256")
+        if content == rejected_content:
+            raise VerificationError(
+                f"{label} boot matches the rejected normalized pre-fix boot content"
+            )
     if unsigned_boot["content_sha256"] != signed_boot["content_sha256"]:
         raise VerificationError("signed boot content does not match refreshed unsigned target-files")
     if record.get("cfi_remains_enabled") is not True:
@@ -253,6 +410,7 @@ def verify_kernel_boot_provenance(
         "base_commit": record.get("base_commit"),
         "patch_sha256": record.get("patch_sha256"),
         "rejected_pre_fix_boot_sha256": rejected,
+        "rejected_pre_fix_boot_content_sha256": rejected_content,
         "hardware_tested_reference_sha256": record.get("hardware_tested_fixed_boot_sha256"),
         "boot_content_sha256": signed_boot["content_sha256"],
         "unsigned_boot_sha256": unsigned_boot["raw_sha256"],
@@ -261,13 +419,59 @@ def verify_kernel_boot_provenance(
     }
 
 
+def verify_kernel_source_provenance(
+    record: Mapping[str, object], patch: Path, application_script: Path
+) -> dict[str, object]:
+    if sha256_file(patch) != record.get("patch_sha256"):
+        raise VerificationError("kernel-fix patch does not match its provenance record")
+    if record.get("application_script") != "scripts/ubuntu/apply_patches.sh":
+        raise VerificationError("kernel-fix application script provenance is invalid")
+    if sha256_file(application_script) != record.get("application_script_sha256"):
+        raise VerificationError("kernel-fix application script does not match provenance")
+    registration = (
+        '"kernel/xiaomi/mt6781|patches/android_kernel_xiaomi_mt6781/'
+        '0001-mdpm-cfi-function-pointer-signature.patch"'
+    )
+    text = application_script.read_text(encoding="utf-8")
+    if text.count(registration) != 1:
+        raise VerificationError("kernel-fix application registration is missing or ambiguous")
+    return {
+        "patch_sha256": record.get("patch_sha256"),
+        "application_script_sha256": record.get("application_script_sha256"),
+        "application_registered": True,
+    }
+
+
 def _archive_members(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
     members: dict[str, zipfile.ZipInfo] = {}
     for member in archive.infolist():
+        name = member.filename
+        parts = name.split("/")
+        mode = (member.external_attr >> 16) & 0o170000
+        if (
+            not name
+            or "\x00" in name
+            or "\\" in name
+            or name.startswith("/")
+            or re.match(r"^[A-Za-z]:", name)
+            or any(part in {"", ".", ".."} for part in parts[:-1])
+            or ".." in parts
+        ):
+            raise VerificationError(f"archive has unsafe member {name!r}")
+        if mode == stat.S_IFLNK:
+            raise VerificationError(f"archive has symlink member {name}")
         if member.filename in members:
             raise VerificationError(f"archive has duplicate member {member.filename}")
         members[member.filename] = member
     return members
+
+
+def validate_zip_members(path: Path) -> list[str]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return sorted(_archive_members(archive))
+    except zipfile.BadZipFile as error:
+        raise VerificationError(f"invalid ZIP: {Path(path).name}") from error
 
 
 def _partition_members(members: Mapping[str, zipfile.ZipInfo], prefix: str) -> dict[str, str]:
@@ -319,6 +523,123 @@ def compare_target_files(
     }
 
 
+def target_metadata_hashes(target_files: Path) -> dict[str, str]:
+    required = (
+        "META/apkcerts.txt",
+        "META/apexkeys.txt",
+        "META/misc_info.txt",
+        "SYSTEM/build.prop",
+    )
+    with zipfile.ZipFile(target_files) as archive:
+        _archive_members(archive)
+        return {
+            name: hashlib.sha256(_read_unique_bytes(archive, name)).hexdigest()
+            for name in required
+        }
+
+
+def key_plan_evidence(plan) -> dict[str, object]:
+    return {
+        "android_mappings": [
+            {
+                "source_stem": item.source_stem,
+                "destination_role": item.destination_role,
+            }
+            for item in plan.android_mappings
+        ],
+        "android_roles": list(plan.android_roles),
+        "apex_roles": list(plan.apex_names),
+        "avb_roles": [f"avb_{name}" for name in plan.avb_roles],
+    }
+
+
+def presigned_inventory(inventory) -> dict[str, list[str]]:
+    return {
+        "apk": sorted(
+            item.name
+            for item in inventory.apk_certificates
+            if item.certificate == "PRESIGNED"
+        ),
+        "apex": sorted(item.name for item in inventory.apexes if item.presigned),
+    }
+
+
+def verify_signer_report(
+    report: Mapping[str, object],
+    paths: Mapping[str, Path],
+    expected_metadata: Mapping[str, str],
+    expected_key_plan: Mapping[str, object],
+    expected_presigned: Mapping[str, object],
+    expected_public_fingerprints: Mapping[str, str],
+) -> dict[str, object]:
+    if report.get("schema_version") != 2 or report.get("device") != "fleur":
+        raise VerificationError("signer report schema/device is invalid")
+    input_record = report.get("input")
+    if not isinstance(input_record, dict):
+        raise VerificationError("signer report input binding is missing")
+    if set(input_record) != {"filename", "sha256", "size"}:
+        raise VerificationError("signer report input binding is not exact")
+    actual_input = _path_evidence(paths["unsigned_target_files"])
+    if any(input_record.get(name) != actual_input[name] for name in ("filename", "sha256", "size")):
+        raise VerificationError("signer report does not bind unsigned target-files")
+    outputs = report.get("outputs")
+    if not isinstance(outputs, dict):
+        raise VerificationError("signer report output bindings are missing")
+    output_labels = ("signed_target_files", "ota", "fastboot")
+    expected_names = {paths[label].name for label in output_labels}
+    if set(outputs) != expected_names:
+        raise VerificationError("signer report output inventory is invalid")
+    bound_outputs: dict[str, str] = {}
+    for label in output_labels:
+        evidence = _path_evidence(paths[label])
+        record = outputs.get(paths[label].name)
+        if not isinstance(record, dict) or set(record) != {"sha256", "size"} or any(
+            record.get(name) != evidence[name] for name in ("sha256", "size")
+        ):
+            raise VerificationError(f"signer report does not bind {label}")
+        bound_outputs[label] = str(evidence["sha256"])
+    if report.get("input_metadata_sha256") != dict(expected_metadata):
+        raise VerificationError("signer report input metadata binding is invalid")
+    if report.get("key_plan") != dict(expected_key_plan):
+        raise VerificationError("signer report key plan is invalid")
+    if report.get("presigned_allowlist") != dict(expected_presigned):
+        raise VerificationError("signer report PRESIGNED allowlist is invalid")
+    if report.get("public_fingerprints") != dict(expected_public_fingerprints):
+        raise VerificationError("signer report public-key fingerprints are invalid")
+    return {
+        "input_sha256": actual_input["sha256"],
+        "report_bound_outputs": bound_outputs,
+        "input_metadata_sha256": dict(expected_metadata),
+        "key_plan": dict(expected_key_plan),
+        "presigned_allowlist": dict(expected_presigned),
+        "public_fingerprints": dict(expected_public_fingerprints),
+    }
+
+
+def verify_signed_key_plan(signed_target_files: Path, plan) -> None:
+    inventory = load_signing_inventory(signed_target_files)
+    android_roles = set(plan.android_roles)
+    apex_roles = set(plan.apex_names)
+    avb_roles = {f"avb_{name}" for name in plan.avb_roles}
+    for item in inventory.apk_certificates:
+        if item.certificate == "PRESIGNED":
+            continue
+        if Path(item.certificate.replace("\\", "/")).name not in android_roles:
+            raise VerificationError(f"signed APK key role is outside key plan: {item.name}")
+    for item in inventory.apexes:
+        if item.presigned:
+            continue
+        expected = item.name.removesuffix(".apex")
+        if expected not in apex_roles:
+            raise VerificationError(f"signed APEX is outside key plan: {item.name}")
+        if Path(item.public_key.replace("\\", "/")).name != expected:
+            raise VerificationError(f"signed APEX payload key role mismatch: {item.name}")
+        if Path(item.container_certificate.replace("\\", "/")).name != expected:
+            raise VerificationError(f"signed APEX container key role mismatch: {item.name}")
+    if {f"avb_{item.partition}" for item in inventory.avb_keys} != avb_roles:
+        raise VerificationError("signed AVB key roles differ from key plan")
+
+
 def verify_payload_properties(
     text: str, payload: bytes | None = None
 ) -> dict[str, object]:
@@ -347,6 +668,28 @@ def verify_payload_properties(
             raise VerificationError("payload_properties.txt FILE_HASH does not match payload.bin")
         if result["FILE_SIZE"] != len(payload):
             raise VerificationError("payload_properties.txt FILE_SIZE does not match payload.bin")
+        if len(payload) < 24 or payload[:4] != b"CrAU":
+            raise VerificationError("payload.bin has an invalid update payload header")
+        try:
+            _, version, manifest_size, signature_size = struct.unpack(
+                ">4sQQI", payload[:24]
+            )
+        except struct.error as error:
+            raise VerificationError("payload.bin has an invalid update payload header") from error
+        if version != 2:
+            raise VerificationError("payload.bin uses an unsupported payload version")
+        metadata_size = 24 + manifest_size + signature_size
+        if metadata_size > len(payload) or result["METADATA_SIZE"] != metadata_size:
+            raise VerificationError(
+                "payload_properties.txt METADATA_SIZE does not match payload.bin"
+            )
+        metadata_hash = base64.b64encode(
+            hashlib.sha256(payload[:metadata_size]).digest()
+        ).decode("ascii")
+        if result["METADATA_HASH"] != metadata_hash:
+            raise VerificationError(
+                "payload_properties.txt METADATA_HASH does not match payload.bin"
+            )
     return result
 
 
@@ -379,8 +722,7 @@ def verify_ota_whole_file_signature(
     runner=_default_runner,
 ) -> dict[str, str]:
     repository = Path(repository)
-    script = repository / "update_verifier.py"
-    if not repository.is_dir() or not script.is_file():
+    if not repository.is_dir() or not (repository / "update_verifier.py").is_file():
         raise VerificationError("pinned LineageOS update_verifier checkout is unavailable")
     revision = runner(["git", "rev-parse", "HEAD"], cwd=repository).strip()
     if revision != PINNED_UPDATE_VERIFIER_COMMIT:
@@ -394,10 +736,76 @@ def verify_ota_whole_file_signature(
         raise VerificationError(
             "LineageOS update_verifier main branch is not at the pinned revision"
         )
-    output = runner([os.sys.executable, script, public_key, ota], cwd=repository)
-    if "verified successfully" not in output:
-        raise VerificationError("OTA whole-file signature was not verified successfully")
-    return {"revision": revision, "status": "verified"}
+    status = runner(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=repository,
+    )
+    if status.strip():
+        raise VerificationError("LineageOS update_verifier checkout is not completely clean")
+    with tempfile.TemporaryDirectory(prefix="flowerbed-update-verifier-") as directory:
+        root = Path(directory)
+        archive_path = root / "source.tar"
+        runner(
+            [
+                "git",
+                "archive",
+                "--format=tar",
+                f"--output={archive_path}",
+                revision,
+            ],
+            cwd=repository,
+        )
+        export_sha256 = sha256_file(archive_path)
+        try:
+            with tarfile.open(archive_path) as archive:
+                for member in archive.getmembers():
+                    parts = Path(member.name).parts
+                    if member.issym() or member.islnk() or Path(member.name).is_absolute() or ".." in parts:
+                        raise VerificationError("update_verifier export contains unsafe members")
+                export = root / "export"
+                export.mkdir()
+                archive.extractall(export, filter="data")
+        except (OSError, tarfile.TarError) as error:
+            raise VerificationError("cannot create isolated update_verifier export") from error
+        script = export / "update_verifier.py"
+        if not script.is_file():
+            raise VerificationError("isolated update_verifier export is incomplete")
+        isolated_loader = (
+            "import runpy,sys; sys.argv.pop(0); root=sys.argv.pop(0); "
+            "sys.path.insert(0,root); runpy.run_path(sys.argv[0],run_name='__main__')"
+        )
+        output = runner(
+            [
+                os.sys.executable,
+                "-I",
+                "-c",
+                isolated_loader,
+                export,
+                script,
+                public_key,
+                ota,
+            ],
+            cwd=export,
+        )
+        if "verified successfully" not in output:
+            raise VerificationError("OTA whole-file signature was not verified successfully")
+    if runner(["git", "rev-parse", "HEAD"], cwd=repository).strip() != revision:
+        raise VerificationError("update_verifier checkout changed during verification")
+    if runner(
+        ["git", "rev-parse", "refs/heads/main"], cwd=repository
+    ).strip() != revision:
+        raise VerificationError("update_verifier main branch changed during verification")
+    if runner(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=repository,
+    ).strip():
+        raise VerificationError("update_verifier checkout changed during verification")
+    return {
+        "revision": revision,
+        "status": "verified",
+        "execution": "isolated-clean-export",
+        "export_sha256": export_sha256,
+    }
 
 
 def _read_unique_bytes(archive: zipfile.ZipFile, name: str) -> bytes:
@@ -411,10 +819,31 @@ def verify_fastboot_against_target_files(
     signed_target_files: Path, fastboot: Path
 ) -> dict[str, object]:
     with zipfile.ZipFile(signed_target_files) as target, zipfile.ZipFile(fastboot) as images:
+        target_members = _archive_members(target)
+        fastboot_members = _archive_members(images)
+        files = set(fastboot_members)
+        if files != FASTBOOT_ALLOWED_MEMBERS:
+            missing = sorted(FASTBOOT_ALLOWED_MEMBERS - files)
+            extra = sorted(files - FASTBOOT_ALLOWED_MEMBERS)
+            raise VerificationError(
+                "fastboot member inventory differs from policy "
+                f"(missing={missing}, unexpected={extra})"
+            )
         target_info = _read_unique_bytes(target, "OTA/android-info.txt")
         fastboot_info = _read_unique_bytes(images, "android-info.txt")
         if target_info != fastboot_info:
             raise VerificationError("fastboot android-info.txt differs from signed target-files")
+        try:
+            android_info = fastboot_info.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise VerificationError("fastboot android-info.txt is not UTF-8") from error
+        products = []
+        for line in android_info.splitlines():
+            line = line.strip()
+            if line.startswith("require product="):
+                products.append(line.split("=", 1)[1])
+        if products != ["fleur"]:
+            raise VerificationError("fastboot android-info.txt must require product=fleur")
         hashes: dict[str, str] = {}
         for partition in REQUIRED_FASTBOOT_IMAGES:
             target_bytes = _read_unique_bytes(target, f"IMAGES/{partition}.img")
@@ -460,7 +889,7 @@ def extract_boot_evidence(
 
 
 def _key_role(value: str) -> str:
-    name = Path(value).name
+    name = value.replace("\\", "/").rsplit("/", 1)[-1]
     for suffix in (".x509.pem", ".pk8", ".avbpubkey", ".pem"):
         if name.endswith(suffix):
             return name[: -len(suffix)]
@@ -694,15 +1123,95 @@ def verify_avb_images(
 
 
 def verify_payload_partition_set(
-    actual: set[str], expected_firmware: set[str]
+    actual: set[str], expected: set[str]
 ) -> list[str]:
-    expected = set(REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | set(expected_firmware)
     missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
     if missing:
         raise VerificationError(
             "OTA payload is missing required partitions: " + ", ".join(missing)
         )
+    if extra:
+        raise VerificationError(
+            "OTA payload has unexpected partitions: " + ", ".join(extra)
+        )
     return sorted(actual)
+
+
+def _target_ota_partitions(archive: zipfile.ZipFile) -> set[str]:
+    text = _read_unique_text(archive, "META/ab_partitions.txt")
+    partitions: list[str] = []
+    for line in text.splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        if not re.fullmatch(r"[a-z0-9_]+", name) or name in partitions:
+            raise VerificationError("signed target-files has invalid AB partition inventory")
+        partitions.append(name)
+    if not partitions:
+        raise VerificationError("signed target-files has no AB partition inventory")
+    return set(partitions)
+
+
+def verify_ota_partition_binding(
+    signed_target_files: Path,
+    extracted_dir: Path,
+    actual_partitions: set[str],
+    *,
+    sparse_converter: Path | None,
+    runner=_default_runner,
+) -> dict[str, object]:
+    with zipfile.ZipFile(signed_target_files) as target, tempfile.TemporaryDirectory(
+        prefix="flowerbed-ota-partitions-"
+    ) as directory:
+        _archive_members(target)
+        expected = _target_ota_partitions(target)
+        verify_payload_partition_set(actual_partitions, expected)
+        extracted_files = {
+            path.stem: path
+            for path in Path(extracted_dir).iterdir()
+            if path.is_file() and path.suffix == ".img"
+        }
+        if set(extracted_files) != expected:
+            raise VerificationError("ota_extractor output inventory differs from payload")
+        hashes: dict[str, str] = {}
+        temp_root = Path(directory)
+        for partition in sorted(expected):
+            candidates = [
+                name
+                for name in (f"IMAGES/{partition}.img", f"RADIO/{partition}.img")
+                if name in {member.filename for member in target.infolist()}
+            ]
+            if len(candidates) != 1:
+                raise VerificationError(
+                    f"signed target-files cannot bind OTA partition {partition}"
+                )
+            expected_bytes = _read_unique_bytes(target, candidates[0])
+            expected_path = temp_root / f"expected-{partition}.img"
+            expected_path.write_bytes(expected_bytes)
+            if expected_bytes[:4] == b"\x3a\xff\x26\xed":
+                if sparse_converter is None:
+                    raise VerificationError(
+                        f"sparse converter is required for OTA partition {partition}"
+                    )
+                raw_path = temp_root / f"expected-{partition}.raw.img"
+                runner([sparse_converter, expected_path, raw_path], cwd=temp_root)
+                expected_path = raw_path
+            actual_path = extracted_files[partition]
+            actual_bytes = actual_path.read_bytes()
+            expected_content = expected_path.read_bytes()
+            if candidates[0].startswith("RADIO/"):
+                matches = actual_bytes.startswith(expected_content) and not any(
+                    actual_bytes[len(expected_content):]
+                )
+            else:
+                matches = actual_bytes == expected_content
+            if not matches:
+                raise VerificationError(
+                    f"OTA partition {partition} differs from signed target-files"
+                )
+            hashes[partition] = hashlib.sha256(expected_content).hexdigest()
+    return {"partitions": sorted(expected), "sha256": hashes}
 
 
 def _required_tool(path: Path, label: str) -> Path:
@@ -722,7 +1231,16 @@ def _read_unique_text(archive: zipfile.ZipFile, name: str) -> str:
 def _read_sku_files(archive: zipfile.ZipFile) -> dict[str, str]:
     result: dict[str, str] = {}
     for basename in EXPECTED_SKUS:
-        member = _find_unique_by_basename(archive, basename)
+        expected_path = EXPECTED_SKU_PATHS[basename]
+        matches = [
+            member for member in archive.infolist()
+            if member.filename == expected_path and not member.is_dir()
+        ]
+        if len(matches) != 1:
+            raise VerificationError(
+                f"signed target-files must contain exact SKU path {expected_path}"
+            )
+        member = matches[0]
         try:
             result[basename] = archive.read(member).decode("utf-8")
         except UnicodeDecodeError as error:
@@ -748,9 +1266,11 @@ def _manifest_firmware_hashes(manifest: Mapping[str, object]) -> dict[str, str]:
 def _extract_ota_boot_and_partitions(
     archive: zipfile.ZipFile,
     android_root: Path,
+    signed_target_files: Path,
+    sparse_converter: Path | None,
     *,
     runner=_default_runner,
-) -> tuple[bytes, set[str]]:
+) -> tuple[bytes, set[str], dict[str, object]]:
     payload_info = _required_tool(
         Path(android_root) / "system/update_engine/scripts/payload_info.py",
         "payload_info.py",
@@ -774,14 +1294,21 @@ def _extract_ota_boot_and_partitions(
                 extractor,
                 f"--payload={payload}",
                 f"--output_dir={images}",
-                "--partitions=boot",
+                "--partitions=" + ",".join(sorted(partitions)),
             ],
             cwd=Path(android_root),
         )
         boot = images / "boot.img"
         if not boot.is_file() or boot.stat().st_size == 0:
             raise VerificationError("ota_extractor did not produce boot.img")
-        return boot.read_bytes(), partitions
+        binding = verify_ota_partition_binding(
+            signed_target_files,
+            images,
+            partitions,
+            sparse_converter=sparse_converter,
+            runner=runner,
+        )
+        return boot.read_bytes(), partitions, binding
 
 
 def _find_update_verifier(android_root: Path) -> Path:
@@ -811,13 +1338,47 @@ def _ota_public_key(
 
 
 def _zip_evidence(path: Path) -> dict[str, object]:
+    validate_zip_members(path)
     try:
         return verify_zip_with_unzip(path)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise VerificationError(f"ZIP integrity check failed for {Path(path).name}: {error}") from error
 
 
-def verify_release(
+def fingerprint_public_bundle(directory: Path) -> dict[str, str]:
+    directory = Path(directory)
+    if not directory.is_dir() or directory.is_symlink():
+        raise VerificationError("public key bundle is unavailable")
+    fingerprints: dict[str, str] = {}
+    for path in sorted(directory.iterdir()):
+        if path.is_symlink():
+            raise VerificationError(f"public key bundle contains symlink: {path.name}")
+        if not path.is_file():
+            raise VerificationError(f"public key bundle contains non-file: {path.name}")
+        fingerprints[path.name] = sha256_file(path)
+    if not fingerprints:
+        raise VerificationError("public key bundle is empty")
+    return fingerprints
+
+
+@contextmanager
+def snapshot_public_bundle(directory: Path):
+    source = Path(directory)
+    initial = fingerprint_public_bundle(source)
+    file_map = {f"public:{name}": source / name for name in initial}
+    with snapshot_regular_files(file_map) as snapshot, tempfile.TemporaryDirectory(
+        prefix="flowerbed-public-keys-"
+    ) as temporary:
+        copied = Path(temporary)
+        for name in initial:
+            shutil.copyfile(snapshot.paths[f"public:{name}"], copied / name)
+        yield copied, initial
+        snapshot.verify()
+        if fingerprint_public_bundle(source) != initial:
+            raise VerificationError("public key bundle changed during verification")
+
+
+def _verify_release_snapshotted(
     args: argparse.Namespace,
     *,
     runner=_default_runner,
@@ -833,9 +1394,6 @@ def verify_release(
     public_keys = Path(args.public_keys)
     android_root = Path(args.android_root)
     manifest_path = Path(args.firmware_manifest)
-    report_path = Path(args.report)
-    if report_path.exists() or report_path.is_symlink():
-        raise VerificationError("verification report already exists")
     for label, path in paths.items():
         if not path.is_file() or path.is_symlink():
             raise VerificationError(f"{label} is unavailable")
@@ -848,6 +1406,27 @@ def verify_release(
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise VerificationError(f"firmware manifest is invalid: {error}") from error
     expected_firmware_hashes = _manifest_firmware_hashes(manifest)
+    try:
+        unsigned_inventory = load_signing_inventory(paths["unsigned_target_files"])
+        unsigned_plan = build_key_plan(unsigned_inventory)
+    except Exception as error:
+        raise VerificationError("unsigned target-files signing inventory is invalid") from error
+    metadata_hashes = target_metadata_hashes(paths["unsigned_target_files"])
+    expected_key_plan = key_plan_evidence(unsigned_plan)
+    approved_presigned = presigned_inventory(unsigned_inventory)
+    try:
+        signer_report = json.loads(Path(args.signing_report).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise VerificationError("signer report is invalid") from error
+    signing_evidence = verify_signer_report(
+        signer_report,
+        paths,
+        metadata_hashes,
+        expected_key_plan,
+        approved_presigned,
+        fingerprint_public_bundle(public_keys),
+    )
+    verify_signed_key_plan(paths["signed_target_files"], unsigned_plan)
     target_relationship = compare_target_files(
         paths["unsigned_target_files"],
         paths["signed_target_files"],
@@ -879,6 +1458,11 @@ def verify_release(
     )
     if package_evidence["presigned_apex"] != presigned:
         raise VerificationError("PRESIGNED APEX inventory changed during verification")
+    verify_presigned_allowlist(
+        package_evidence["presigned_apk"],
+        package_evidence["presigned_apex"],
+        approved_presigned,
+    )
     avbtool = _required_tool(host_tools / "avbtool", "avbtool")
     avb_fingerprints = verify_avb_images(
         paths["signed_target_files"], public_keys, avbtool, runner=runner
@@ -890,23 +1474,20 @@ def verify_release(
     signed_boot = extract_boot_evidence(
         paths["signed_target_files"], avbtool, runner=runner
     )
-    kernel_record_path = Path(__file__).resolve().parents[2] / "sources/kernel-fix.json"
-    kernel_patch_path = (
-        Path(__file__).resolve().parents[2]
-        / "patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch"
-    )
+    kernel_record_path = Path(args.kernel_record)
+    kernel_patch_path = Path(args.kernel_patch)
+    kernel_application_path = Path(args.kernel_application)
     try:
         kernel_record = json.loads(kernel_record_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise VerificationError("kernel-fix provenance record is unavailable") from error
-    if (
-        not kernel_patch_path.is_file()
-        or sha256_file(kernel_patch_path) != kernel_record.get("patch_sha256")
-    ):
-        raise VerificationError("kernel-fix patch does not match its provenance record")
+    source_provenance = verify_kernel_source_provenance(
+        kernel_record, kernel_patch_path, kernel_application_path
+    )
     kernel_evidence = verify_kernel_boot_provenance(
         unsigned_boot, signed_boot, kernel_record
     )
+    kernel_evidence["source_application"] = source_provenance
 
     with zipfile.ZipFile(paths["ota"]) as ota_archive:
         ota_metadata = verify_ota_metadata(
@@ -917,11 +1498,17 @@ def verify_release(
             _read_unique_text(ota_archive, "payload_properties.txt"),
             payload_bytes,
         )
-        ota_boot, payload_partitions = _extract_ota_boot_and_partitions(
-            ota_archive, android_root, runner=runner
+        ota_boot, payload_partitions, partition_binding = _extract_ota_boot_and_partitions(
+            ota_archive,
+            android_root,
+            paths["signed_target_files"],
+            host_tools / "simg2img" if (host_tools / "simg2img").is_file() else None,
+            runner=runner,
         )
+        with zipfile.ZipFile(paths["signed_target_files"]) as signed_target:
+            expected_payload_partitions = _target_ota_partitions(signed_target)
         verified_partitions = verify_payload_partition_set(
-            payload_partitions, set(expected_firmware_hashes)
+            payload_partitions, expected_payload_partitions
         )
         try:
             firmware_evidence = firmware_verifier(
@@ -952,11 +1539,7 @@ def verify_release(
             runner=runner,
         )
 
-    public_fingerprints = {
-        path.name: sha256_file(path)
-        for path in sorted(public_keys.iterdir())
-        if path.is_file() and not path.is_symlink()
-    }
+    public_fingerprints = fingerprint_public_bundle(public_keys)
     findings = [
         {"name": name, "status": "pass"}
         for name in (
@@ -988,6 +1571,7 @@ def verify_release(
         "build_tags": build_tags,
         "sku_mapping": sku_mapping,
         "target_files": target_relationship,
+        "signing_provenance": signing_evidence,
         "packages": package_evidence,
         "avb_public_fingerprints": avb_fingerprints,
         "public_bundle_fingerprints": public_fingerprints,
@@ -997,6 +1581,7 @@ def verify_release(
             "ota_type": ota_metadata["ota-type"],
             "payload_properties": payload_properties,
             "partitions": verified_partitions,
+            "partition_binding": partition_binding,
             "boot_sha256": ota_boot_hash,
             "firmware": firmware_evidence,
             "whole_file_signature": whole_file,
@@ -1004,6 +1589,45 @@ def verify_release(
         "fastboot": fastboot_evidence,
         "findings": findings,
     }
+    return result
+
+
+def verify_release(
+    args: argparse.Namespace,
+    *,
+    runner=_default_runner,
+    firmware_verifier=verify_payload_firmware,
+) -> dict[str, object]:
+    report_path = Path(args.report)
+    if report_path.exists() or report_path.is_symlink():
+        raise VerificationError("verification report already exists")
+    repository = Path(__file__).resolve().parents[2]
+    original_paths = {
+        "unsigned_target_files": Path(args.unsigned_target_files),
+        "signed_target_files": Path(args.signed_target_files),
+        "ota": Path(args.ota),
+        "fastboot": Path(args.fastboot),
+        "firmware_manifest": Path(args.firmware_manifest),
+        "signing_report": Path(args.signing_report),
+        "kernel_record": repository / "sources/kernel-fix.json",
+        "kernel_patch": repository
+        / "patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch",
+        "kernel_application": repository / "scripts/ubuntu/apply_patches.sh",
+    }
+    with snapshot_regular_files(original_paths) as snapshot, snapshot_public_bundle(
+        Path(args.public_keys)
+    ) as (public_snapshot, public_fingerprints):
+        snapshot_args = argparse.Namespace(**vars(args))
+        for label, path in snapshot.paths.items():
+            setattr(snapshot_args, label, path)
+        snapshot_args.public_keys = public_snapshot
+        result = _verify_release_snapshotted(
+            snapshot_args,
+            runner=runner,
+            firmware_verifier=firmware_verifier,
+        )
+        result["public_bundle_fingerprints"] = public_fingerprints
+        snapshot.verify()
     write_sanitized_report(report_path, result)
     return result
 
@@ -1031,8 +1655,17 @@ def write_sanitized_report(path: Path, report: Mapping[str, object]) -> None:
     temporary = path.parent / f".{path.name}.tmp"
     if temporary.exists() or temporary.is_symlink():
         raise VerificationError("temporary verification report already exists")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    descriptor = None
     try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o644,
+        )
         view = memoryview(payload)
         while view:
             written = os.write(descriptor, view)
@@ -1040,11 +1673,12 @@ def write_sanitized_report(path: Path, report: Mapping[str, object]) -> None:
                 raise VerificationError("short write while publishing verification report")
             view = view[written:]
         os.fsync(descriptor)
-    finally:
         os.close(descriptor)
-    try:
+        descriptor = None
         os.replace(temporary, path)
     except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
         temporary.unlink(missing_ok=True)
         raise
 
@@ -1058,6 +1692,7 @@ def main(argv: Sequence[str] | None = None, *, verifier=verify_release) -> int:
     parser.add_argument("--public-keys", required=True, type=Path)
     parser.add_argument("--android-root", required=True, type=Path)
     parser.add_argument("--firmware-manifest", required=True, type=Path)
+    parser.add_argument("--signing-report", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
     args = parser.parse_args(argv)
     report = verifier(args)

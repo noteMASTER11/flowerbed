@@ -166,6 +166,15 @@ class ArtifactTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unzip -t"):
                 module.verify_zip_with_unzip(corrupt)
 
+    def test_zip_integrity_rejects_unsafe_members_before_unzip(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "unsafe.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("../escape", b"bad")
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                module.verify_zip_with_unzip(archive_path)
+
 
 if __name__ == "__main__":
     unittest.main()

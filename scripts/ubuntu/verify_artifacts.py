@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import stat
 import sys
 import tempfile
 import zipfile
@@ -144,6 +145,26 @@ def verify_zip_with_unzip(path: Path) -> dict:
         raise ValueError(f"ZIP does not exist as a regular file: {path}")
     try:
         with zipfile.ZipFile(path) as archive:
+            names: set[str] = set()
+            for member in archive.infolist():
+                name = member.filename
+                parts = name.split("/")
+                mode = (member.external_attr >> 16) & 0o170000
+                if (
+                    not name
+                    or "\x00" in name
+                    or "\\" in name
+                    or name.startswith("/")
+                    or (len(name) > 1 and name[1] == ":" and name[0].isalpha())
+                    or ".." in parts
+                    or any(part in {"", "."} for part in parts[:-1])
+                ):
+                    raise ValueError(f"ZIP has unsafe member: {name!r}")
+                if mode == stat.S_IFLNK:
+                    raise ValueError(f"ZIP has symlink member: {name}")
+                if name in names:
+                    raise ValueError(f"ZIP has duplicate member: {name}")
+                names.add(name)
             if archive.testzip() is not None:
                 raise ValueError(f"ZIP member CRC failed: {path.name}")
     except zipfile.BadZipFile as error:

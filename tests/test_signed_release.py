@@ -5,11 +5,15 @@ import hashlib
 import io
 import importlib.util
 import json
+import os
+import struct
+import tarfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest import mock
 import warnings
 import zipfile
 
@@ -35,6 +39,10 @@ def load_verifier():
 
 
 class SignedReleasePolicyTest(unittest.TestCase):
+    def _payload(self, manifest: bytes = b"manifest", signatures: bytes = b"sig"):
+        header = struct.pack(">4sQQI", b"CrAU", 2, len(manifest), len(signatures))
+        return header + manifest + signatures + b"partition-data"
+
     def test_rejects_test_build_tags(self):
         module = load_verifier()
         with self.assertRaisesRegex(module.VerificationError, "test-keys"):
@@ -110,6 +118,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
             "base_commit": "9" * 40,
             "patch_sha256": "a" * 64,
             "rejected_pre_fix_boot_sha256": PRE_FIX_BOOT_SHA256,
+            "rejected_pre_fix_boot_content_sha256": "1" * 64,
             "hardware_tested_fixed_boot_sha256": "b" * 64,
             "cfi_remains_enabled": True,
         }
@@ -188,19 +197,105 @@ class SignedReleasePolicyTest(unittest.TestCase):
 
     def test_payload_properties_require_complete_hash_and_size_metadata(self):
         module = load_verifier()
-        payload = b"payload"
+        payload = self._payload()
+        metadata_size = 24 + len(b"manifest") + len(b"sig")
         file_hash = base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
+        metadata_hash = base64.b64encode(
+            hashlib.sha256(payload[:metadata_size]).digest()
+        ).decode("ascii")
         complete = (
             "FILE_HASH=" + file_hash + "\n"
             f"FILE_SIZE={len(payload)}\n"
-            "METADATA_HASH=" + "B" * 43 + "=\n"
-            "METADATA_SIZE=45\n"
+            "METADATA_HASH=" + metadata_hash + "\n"
+            f"METADATA_SIZE={metadata_size}\n"
         )
         self.assertEqual(len(payload), module.verify_payload_properties(complete, payload)["FILE_SIZE"])
         with self.assertRaisesRegex(module.VerificationError, "METADATA_SIZE"):
-            module.verify_payload_properties(complete.replace("METADATA_SIZE=45\n", ""))
+            module.verify_payload_properties(complete.replace(f"METADATA_SIZE={metadata_size}\n", ""))
         with self.assertRaisesRegex(module.VerificationError, "FILE_HASH"):
             module.verify_payload_properties(complete, b"different")
+        with self.assertRaisesRegex(module.VerificationError, "METADATA_HASH"):
+            module.verify_payload_properties(
+                complete.replace(metadata_hash, base64.b64encode(b"x" * 32).decode()),
+                payload,
+            )
+        with self.assertRaisesRegex(module.VerificationError, "METADATA_SIZE"):
+            module.verify_payload_properties(
+                complete.replace(f"METADATA_SIZE={metadata_size}", "METADATA_SIZE=24"),
+                payload,
+            )
+
+    def test_rejects_normalized_pre_fix_boot_even_after_resigning(self):
+        module = load_verifier()
+        rejected_content = "6" * 64
+        record = {
+            "project": "kernel/xiaomi/mt6781",
+            "file": "drivers/example.h",
+            "base_commit": "9" * 40,
+            "patch_sha256": "a" * 64,
+            "rejected_pre_fix_boot_sha256": PRE_FIX_BOOT_SHA256,
+            "rejected_pre_fix_boot_content_sha256": rejected_content,
+            "hardware_tested_fixed_boot_sha256": "b" * 64,
+            "cfi_remains_enabled": True,
+        }
+        with self.assertRaisesRegex(module.VerificationError, "normalized pre-fix"):
+            module.verify_kernel_boot_provenance(
+                {"raw_sha256": "e" * 64, "content_sha256": rejected_content},
+                {"raw_sha256": "d" * 64, "content_sha256": rejected_content},
+                record,
+            )
+
+    def test_kernel_source_provenance_binds_patch_and_application_script(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            patch = root / "fix.patch"
+            script = root / "apply_patches.sh"
+            patch.write_bytes(b"patch")
+            script.write_text(
+                '"kernel/xiaomi/mt6781|patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch"\n',
+                encoding="utf-8",
+            )
+            record = {
+                "patch_sha256": hashlib.sha256(b"patch").hexdigest(),
+                "application_script": "scripts/ubuntu/apply_patches.sh",
+                "application_script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+            }
+            module.verify_kernel_source_provenance(record, patch, script)
+            script.write_text("# removed\n", encoding="utf-8")
+            with self.assertRaisesRegex(module.VerificationError, "application"):
+                module.verify_kernel_source_provenance(record, patch, script)
+
+    def test_rejects_nested_and_windows_test_key_paths_and_mismatched_pairs(self):
+        module = load_verifier()
+        for value in (
+            "/tmp/a/build/make/target/product/security/testkey.x509.pem",
+            r"C:\android\build\make\target\product\security\platform.pk8",
+        ):
+            with self.assertRaisesRegex(module.VerificationError, "test certificate"):
+                module._reject_test_key_path(value)
+        avb_metadata = "".join(
+            f"avb_{partition}_key_path=release/avb_{partition}.pem\n"
+            f"avb_{partition}_algorithm=SHA256_RSA4096\n"
+            for partition in module.REQUIRED_AVB_PARTITIONS
+        )
+        with self.assertRaisesRegex(module.VerificationError, "mismatched"):
+            module.verify_signing_metadata_paths(
+                'name="Settings.apk" certificate="release/platform.x509.pem" private_key="release/other.pk8"\n',
+                'name="com.android.art.apex" public_key="release/art.avbpubkey" private_key="release/art.pem" container_certificate="release/platform.x509.pem" container_private_key="release/platform.pk8" partition="system"\n',
+                "default_system_dev_certificate=release/releasekey\n" + avb_metadata,
+            )
+
+    def test_presigned_inventory_must_equal_approved_allowlist(self):
+        module = load_verifier()
+        module.verify_presigned_allowlist(
+            ["WebView.apk"], ["com.android.tzdata.apex"],
+            {"apk": ["WebView.apk"], "apex": ["com.android.tzdata.apex"]},
+        )
+        with self.assertRaisesRegex(module.VerificationError, "PRESIGNED"):
+            module.verify_presigned_allowlist(
+                ["Injected.apk"], [], {"apk": [], "apex": []}
+            )
 
     def test_update_verifier_checkout_is_pinned_and_success_is_required(self):
         module = load_verifier()
@@ -220,6 +315,17 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 commands.append(tuple(str(item) for item in command))
                 if command[:2] == ["git", "rev-parse"]:
                     return module.PINNED_UPDATE_VERIFIER_COMMIT + "\n"
+                if command[:2] == ["git", "status"]:
+                    return ""
+                if command[:2] == ["git", "archive"]:
+                    output = Path(
+                        next(str(item).split("=", 1)[1] for item in command if str(item).startswith("--output="))
+                    )
+                    with tarfile.open(output, "w") as archive:
+                        fixture = root / "fixture-update_verifier.py"
+                        fixture.write_text("# fixture\n", encoding="utf-8")
+                        archive.add(fixture, arcname="update_verifier.py")
+                    return ""
                 return "verified successfully\n"
 
             evidence = module.verify_ota_whole_file_signature(
@@ -227,8 +333,9 @@ class SignedReleasePolicyTest(unittest.TestCase):
             )
             self.assertEqual(module.PINNED_UPDATE_VERIFIER_COMMIT, evidence["revision"])
             self.assertIn(("git", "rev-parse", "refs/heads/main"), commands)
-            self.assertEqual("update_verifier.py", Path(commands[-1][1]).name)
-            self.assertEqual(ota, Path(commands[-1][-1]))
+            execute = next(command for command in commands if "-I" in command)
+            self.assertIn("update_verifier.py", {Path(item).name for item in execute})
+            self.assertEqual(ota, Path(execute[-1]))
 
             def wrong_revision(command, **_kwargs):
                 if command[:3] == ["git", "rev-parse", "HEAD"]:
@@ -250,6 +357,100 @@ class SignedReleasePolicyTest(unittest.TestCase):
             with self.assertRaisesRegex(module.VerificationError, "main"):
                 module.verify_ota_whole_file_signature(
                     repository, ota, public_key, runner=wrong_main
+                )
+
+    def test_update_verifier_rejects_untracked_and_executes_clean_export(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "verifier"
+            repository.mkdir()
+            (repository / "helper.py").write_text(
+                "MESSAGE = 'verified successfully'\n", encoding="utf-8"
+            )
+            (repository / "update_verifier.py").write_text(
+                "from helper import MESSAGE\nprint(MESSAGE)\n", encoding="utf-8"
+            )
+            for command in (
+                ["git", "init", "-q", "-b", "main"],
+                ["git", "config", "user.email", "test@example.invalid"],
+                ["git", "config", "user.name", "Test"],
+                ["git", "add", "update_verifier.py", "helper.py"],
+                ["git", "commit", "-qm", "fixture"],
+            ):
+                module._default_runner(command, cwd=repository)
+            revision = module._default_runner(
+                ["git", "rev-parse", "HEAD"], cwd=repository
+            ).strip()
+            original = module.PINNED_UPDATE_VERIFIER_COMMIT
+            module.PINNED_UPDATE_VERIFIER_COMMIT = revision
+            try:
+                ota = root / "ota.zip"
+                public_key = root / "key.pem"
+                ota.write_bytes(b"ota")
+                public_key.write_bytes(b"key")
+                evidence = module.verify_ota_whole_file_signature(
+                    repository, ota, public_key
+                )
+                self.assertEqual("isolated-clean-export", evidence["execution"])
+                (repository / "untracked.py").write_text(
+                    "raise SystemExit(9)\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(module.VerificationError, "clean"):
+                    module.verify_ota_whole_file_signature(
+                        repository, ota, public_key
+                    )
+            finally:
+                module.PINNED_UPDATE_VERIFIER_COMMIT = original
+
+    def test_signer_report_binds_exact_input_outputs_metadata_and_key_plan(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {}
+            for label, content in (
+                ("unsigned_target_files", b"unsigned"),
+                ("signed_target_files", b"signed"),
+                ("ota", b"ota"),
+                ("fastboot", b"fastboot"),
+            ):
+                paths[label] = root / f"{label}.zip"
+                paths[label].write_bytes(content)
+            metadata = {"META/apkcerts.txt": "a" * 64}
+            key_plan = {
+                "android_mappings": [
+                    {"source_stem": "source", "destination_role": "releasekey"}
+                ]
+            }
+            allowlist = {"apk": [], "apex": []}
+            public_fingerprints = {"releasekey.x509.pem": "f" * 64}
+            report = {
+                "schema_version": 2,
+                "device": "fleur",
+                "input": module._path_evidence(paths["unsigned_target_files"]),
+                "outputs": {
+                    paths[label].name: {
+                        "sha256": module._path_evidence(paths[label])["sha256"],
+                        "size": module._path_evidence(paths[label])["size"],
+                    }
+                    for label in ("signed_target_files", "ota", "fastboot")
+                },
+                "input_metadata_sha256": metadata,
+                "key_plan": key_plan,
+                "presigned_allowlist": allowlist,
+                "public_fingerprints": public_fingerprints,
+            }
+            evidence = module.verify_signer_report(
+                report, paths, metadata, key_plan, allowlist, public_fingerprints
+            )
+            self.assertEqual(
+                module._path_evidence(paths["ota"])["sha256"],
+                evidence["report_bound_outputs"]["ota"],
+            )
+            report["outputs"][paths["ota"].name]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(module.VerificationError, "signer report"):
+                module.verify_signer_report(
+                    report, paths, metadata, key_plan, allowlist, public_fingerprints
                 )
 
     def test_fastboot_images_and_android_info_must_match_signed_target_files(self):
@@ -283,6 +484,41 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     archive.writestr(f"{partition}.img", b"wrong" if partition == "boot" else value)
             with self.assertRaisesRegex(module.VerificationError, "boot"):
                 module.verify_fastboot_against_target_files(target, fastboot)
+
+    def test_fastboot_rejects_wrong_product_and_unexpected_or_destructive_members(self):
+        module = load_verifier()
+        images = {name: name.encode() for name in module.REQUIRED_FASTBOOT_IMAGES}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target, fastboot = root / "target.zip", root / "fastboot.zip"
+            with zipfile.ZipFile(target, "w") as archive:
+                archive.writestr("OTA/android-info.txt", "require product=fleur\n")
+                for name, value in images.items():
+                    archive.writestr(f"IMAGES/{name}.img", value)
+            for info, extra in (
+                ("require product=wrong\n", None),
+                ("require product=fleur\n", "userdata.img"),
+                ("require product=fleur\n", "surprise.txt"),
+            ):
+                with zipfile.ZipFile(fastboot, "w") as archive:
+                    archive.writestr("android-info.txt", info)
+                    for name, value in images.items():
+                        archive.writestr(f"{name}.img", value)
+                    if extra:
+                        archive.writestr(extra, b"bad")
+                with self.assertRaises(module.VerificationError):
+                    module.verify_fastboot_against_target_files(target, fastboot)
+
+    def test_sku_files_require_exact_installed_paths(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "target.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for name in EXPECTED_SKUS:
+                    archive.writestr(f"WRONG/etc/{name}", b"x")
+            with zipfile.ZipFile(archive_path) as archive:
+                with self.assertRaisesRegex(module.VerificationError, "SKU"):
+                    module._read_sku_files(archive)
 
     def test_boot_extraction_fails_closed_and_normalizes_avb_footer(self):
         module = load_verifier()
@@ -439,10 +675,37 @@ class SignedReleasePolicyTest(unittest.TestCase):
         module = load_verifier()
         firmware = {"audio_dsp", "md1img"}
         actual = set(module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | firmware
-        evidence = module.verify_payload_partition_set(actual, firmware)
+        evidence = module.verify_payload_partition_set(actual, actual)
         self.assertEqual(sorted(actual), evidence)
         with self.assertRaisesRegex(module.VerificationError, "system"):
-            module.verify_payload_partition_set(actual - {"system"}, firmware)
+            module.verify_payload_partition_set(actual - {"system"}, actual)
+        with self.assertRaisesRegex(module.VerificationError, "unexpected"):
+            module.verify_payload_partition_set(actual | {"userdata"}, actual)
+
+    def test_ota_partition_inventory_and_content_are_derived_from_target_files(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.zip"
+            extracted = root / "extracted"
+            extracted.mkdir()
+            expected = {"boot": b"boot", "system": b"system", "md1img": b"radio"}
+            with zipfile.ZipFile(target, "w") as archive:
+                archive.writestr("META/ab_partitions.txt", "boot\nsystem\nmd1img\n")
+                archive.writestr("IMAGES/boot.img", expected["boot"])
+                archive.writestr("IMAGES/system.img", expected["system"])
+                archive.writestr("RADIO/md1img.img", expected["md1img"])
+            for name, value in expected.items():
+                (extracted / f"{name}.img").write_bytes(value)
+            evidence = module.verify_ota_partition_binding(
+                target, extracted, set(expected), sparse_converter=None
+            )
+            self.assertEqual(sorted(expected), evidence["partitions"])
+            (extracted / "system.img").write_bytes(b"tampered")
+            with self.assertRaisesRegex(module.VerificationError, "system"):
+                module.verify_ota_partition_binding(
+                    target, extracted, set(expected), sparse_converter=None
+                )
 
     def test_full_verification_writes_sanitized_report_and_binds_ota_boot(self):
         module = load_verifier()
@@ -475,6 +738,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 (public / f"{role}.x509.pem").write_text("certificate", encoding="utf-8")
             (public / "com.android.art.avbpubkey").write_bytes(b"apex-key")
             (public / "com.android.art.public.pem").write_text("apex pem", encoding="utf-8")
+            (public / "com.android.art.x509.pem").write_text("apex certificate", encoding="utf-8")
             for partition in module.REQUIRED_AVB_PARTITIONS:
                 (public / f"avb_{partition}.avbpubkey").write_bytes(partition.encode())
                 (public / f"avb_{partition}.public.pem").write_text(
@@ -507,6 +771,9 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         for partition in module.REQUIRED_AVB_PARTITIONS
                     )
                 ),
+                "META/ab_partitions.txt": "\n".join(
+                    sorted(set(module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | {"md1img"})
+                ) + "\n",
                 "OTA/android-info.txt": "require product=fleur\n",
                 "SYSTEM/app/Settings/Settings.apk": b"apk",
                 "SYSTEM/apex/com.android.art.apex": apex_buffer.getvalue(),
@@ -524,7 +791,18 @@ class SignedReleasePolicyTest(unittest.TestCase):
             for path, tags in ((unsigned, "test-keys"), (signed, "release-keys")):
                 with zipfile.ZipFile(path, "w") as archive:
                     for name, value in common.items():
+                        if name == "META/apexkeys.txt":
+                            continue
                         archive.writestr(name, value)
+                    archive.writestr(
+                        "META/apexkeys.txt",
+                        common["META/apexkeys.txt"]
+                        if path == unsigned
+                        else common["META/apexkeys.txt"].replace(
+                            'container_certificate="release/platform.x509.pem" container_private_key="release/platform.pk8"',
+                            'container_certificate="release/com.android.art.x509.pem" container_private_key="release/com.android.art.pk8"',
+                        ),
+                    )
                     archive.writestr(
                         "SYSTEM/build.prop",
                         f"ro.product.system.device=fleur\nro.build.tags={tags}\nro.system.build.tags={tags}\n",
@@ -533,14 +811,17 @@ class SignedReleasePolicyTest(unittest.TestCase):
             ota = root / "lineage-SIGNED-fleur.zip"
             with zipfile.ZipFile(ota, "w") as archive:
                 archive.writestr("META-INF/com/android/metadata", "pre-device=fleur\nota-type=AB\n")
-                payload = b"payload"
+                payload = self._payload()
+                metadata_size = 24 + len(b"manifest") + len(b"sig")
                 archive.writestr("payload.bin", payload)
                 archive.writestr(
                     "payload_properties.txt",
                     "FILE_HASH="
                     + base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
-                    + "\nFILE_SIZE=7\n"
-                    "METADATA_HASH=" + "B" * 43 + "=\nMETADATA_SIZE=2\n",
+                    + f"\nFILE_SIZE={len(payload)}\n"
+                    "METADATA_HASH="
+                    + base64.b64encode(hashlib.sha256(payload[:metadata_size]).digest()).decode("ascii")
+                    + f"\nMETADATA_SIZE={metadata_size}\n",
                 )
             fastboot = root / "lineage_fleur-SIGNED-img.zip"
             with zipfile.ZipFile(fastboot, "w") as archive:
@@ -571,15 +852,47 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 encoding="utf-8",
             )
             report = root / "verification-report.json"
+            source_inventory = module.load_signing_inventory(unsigned)
+            signer_report = root / "signing-report.json"
+            signer_report.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "device": "fleur",
+                        "input": module._path_evidence(unsigned),
+                        "outputs": {
+                            path.name: {
+                                "sha256": module._path_evidence(path)["sha256"],
+                                "size": module._path_evidence(path)["size"],
+                            }
+                            for path in (signed, ota, fastboot)
+                        },
+                        "input_metadata_sha256": module.target_metadata_hashes(unsigned),
+                        "key_plan": module.key_plan_evidence(module.build_key_plan(source_inventory)),
+                        "presigned_allowlist": module.presigned_inventory(source_inventory),
+                        "public_fingerprints": module.fingerprint_public_bundle(public),
+                    }
+                ),
+                encoding="utf-8",
+            )
             commands = []
 
             def runner(command, **_kwargs):
                 command = tuple(str(item) for item in command)
                 commands.append(command)
                 tool = Path(command[0]).name
+                if tool == "git" and command[1] == "archive":
+                    output = Path(next(value.split("=", 1)[1] for value in command if value.startswith("--output=")))
+                    with tarfile.open(output, "w") as archive:
+                        archive.add(verifier_repo / "update_verifier.py", arcname="update_verifier.py")
+                    return ""
+                if tool == "git" and command[1] == "status":
+                    return ""
                 if tool == "git":
                     return module.PINNED_UPDATE_VERIFIER_COMMIT + "\n"
-                if len(command) > 1 and Path(command[1]).name == "update_verifier.py":
+                if "-I" in command and "update_verifier.py" in {
+                    Path(item).name for item in command
+                }:
                     return "verified successfully\n"
                 if tool == "openssl" and "-pubkey" in command:
                     return "-----BEGIN PUBLIC KEY-----\nfixture\n-----END PUBLIC KEY-----\n"
@@ -593,7 +906,14 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 if tool == "ota_extractor":
                     output = Path(next(value.split("=", 1)[1] for value in command if value.startswith("--output_dir=")))
                     output.mkdir(exist_ok=True)
-                    (output / "boot.img").write_bytes(fixed_boot)
+                    for partition in set(module.REQUIRED_ANDROID_PAYLOAD_PARTITIONS) | {"md1img"}:
+                        if partition == "boot":
+                            value = fixed_boot
+                        elif partition == "md1img":
+                            value = firmware
+                        else:
+                            value = f"image-{partition}".encode()
+                        (output / f"{partition}.img").write_bytes(value)
                     return ""
                 if tool == "deapexer":
                     Path(command[-1]).mkdir()
@@ -616,6 +936,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 public_keys=public,
                 android_root=android_root,
                 firmware_manifest=manifest,
+                signing_report=signer_report,
                 report=report,
             )
             result = module.verify_release(
@@ -647,6 +968,69 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 )
             self.assertFalse(report.exists())
 
+    def test_public_bundle_rejects_symlinks_and_fingerprints_every_file(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "public"
+            bundle.mkdir()
+            (bundle / "releasekey.x509.pem").write_bytes(b"cert")
+            fingerprints = module.fingerprint_public_bundle(bundle)
+            self.assertEqual({"releasekey.x509.pem"}, set(fingerprints))
+            os.symlink(bundle / "releasekey.x509.pem", bundle / "alias.x509.pem")
+            with self.assertRaisesRegex(module.VerificationError, "symlink"):
+                module.fingerprint_public_bundle(bundle)
+
+    def test_snapshotted_input_detects_post_use_replacement(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "artifact.zip"
+            source.write_bytes(b"original")
+            with module.snapshot_regular_files({"artifact": source}) as snapshot:
+                self.assertEqual(b"original", snapshot.paths["artifact"].read_bytes())
+                replacement = root / "replacement"
+                replacement.write_bytes(b"changed")
+                os.replace(replacement, source)
+                with self.assertRaisesRegex(module.VerificationError, "changed"):
+                    snapshot.verify()
+
+    def test_report_temporary_is_removed_on_fsync_failure(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "verification.json"
+            with mock.patch.object(module.os, "fsync", side_effect=OSError("disk")):
+                with self.assertRaises(OSError):
+                    module.write_sanitized_report(report, {"status": "pass"})
+            self.assertFalse((root / ".verification.json.tmp").exists())
+
+    def test_zip_member_policy_rejects_traversal_symlink_and_duplicates(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for suffix, writer in (
+                ("traversal", lambda z: z.writestr("../evil", b"x")),
+                (
+                    "duplicate",
+                    lambda z: (z.writestr("same", b"x"), z.writestr("same", b"y")),
+                ),
+            ):
+                path = root / f"{suffix}.zip"
+                with warnings.catch_warnings(), zipfile.ZipFile(path, "w") as archive:
+                    warnings.simplefilter("ignore", UserWarning)
+                    writer(archive)
+                with self.assertRaises(module.VerificationError):
+                    module.validate_zip_members(path)
+            symlink_zip = root / "symlink.zip"
+            info = zipfile.ZipInfo("link")
+            info.create_system = 3
+            info.external_attr = 0o120777 << 16
+            with zipfile.ZipFile(symlink_zip, "w") as archive:
+                archive.writestr(info, "target")
+            with self.assertRaisesRegex(module.VerificationError, "symlink"):
+                module.validate_zip_members(symlink_zip)
+
     def test_cli_passes_all_required_release_paths_to_verifier(self):
         module = load_verifier()
         captured = []
@@ -664,6 +1048,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
             "--public-keys", "public",
             "--android-root", "android",
             "--firmware-manifest", "firmware.json",
+            "--signing-report", "signing-report.json",
             "--report", "verification-report.json",
         ]
         with redirect_stdout(output):
