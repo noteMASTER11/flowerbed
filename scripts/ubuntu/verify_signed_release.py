@@ -7,6 +7,7 @@ import argparse
 import base64
 from contextlib import contextmanager
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -96,8 +97,14 @@ FASTBOOT_ALLOWED_MEMBERS = {
 }
 ANDROID_TOOL_NAMES = (
     "apksigner", "deapexer", "avbtool", "debugfs_static", "fsck.erofs",
-    "ota_extractor",
+    "lz4", "ota_extractor", "unpack_bootimg",
 )
+BOOT_PROPERTY_REWRITE_PATHS = {
+    "first_stage_ramdisk/system/etc/ramdisk/build.prop",
+    "prop.default",
+    "system/etc/ramdisk/build.prop",
+}
+BOOT_OTACERTS_PATH = "system/etc/security/otacerts.zip"
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -703,10 +710,157 @@ def verify_presigned_allowlist(
     return actual
 
 
+def _edit_release_tags(value: str) -> str:
+    tags = set(value.split(","))
+    tags.discard("test-keys")
+    tags.discard("dev-keys")
+    tags.add("release-keys")
+    return ",".join(sorted(tags))
+
+
+def _rewrite_release_properties(data: bytes) -> bytes:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise VerificationError("boot property file is not UTF-8") from error
+    output: list[str] = []
+    for source_line in text.split("\n"):
+        line = source_line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            if key.startswith("ro.") and key.endswith(
+                (".build.fingerprint", ".build.thumbprint")
+            ):
+                pieces = value.split("/")
+                pieces[-1] = _edit_release_tags(pieces[-1])
+                value = "/".join(pieces)
+            elif key == "ro.build.description":
+                pieces = value.split()
+                for index in range(len(pieces) - 1, -1, -1):
+                    if pieces[index].endswith("-keys"):
+                        pieces[index] = _edit_release_tags(pieces[index])
+                        break
+                value = " ".join(pieces)
+            elif key.startswith("ro.") and key.endswith(".build.tags"):
+                value = _edit_release_tags(value)
+            elif key == "ro.build.display.id":
+                pieces = value.split()
+                if len(pieces) > 1 and pieces[-1].endswith("-keys"):
+                    pieces.pop()
+                value = " ".join(pieces)
+            line = f"{key}={value}"
+        output.append(line)
+    return ("\n".join(output) + "\n").encode("utf-8")
+
+
+def _validate_signed_boot_otacerts(
+    unsigned_data: bytes,
+    signed_data: bytes,
+    release_certificate: bytes,
+) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(unsigned_data)) as unsigned_archive:
+            unsigned_members = unsigned_archive.infolist()
+            for member in unsigned_members:
+                unsigned_archive.read(member)
+        with zipfile.ZipFile(io.BytesIO(signed_data)) as signed_archive:
+            signed_members = signed_archive.infolist()
+            signed_payloads = [signed_archive.read(member) for member in signed_members]
+    except (zipfile.BadZipFile, OSError, RuntimeError) as error:
+        raise VerificationError("boot OTA certificate archive is invalid") from error
+    if not unsigned_members or len(signed_members) != len(unsigned_members):
+        raise VerificationError("boot OTA certificate inventory changed unexpectedly")
+    for member, payload in zip(signed_members, signed_payloads):
+        name = member.filename
+        parts = name.split("/")
+        file_type = (member.external_attr >> 16) & 0o170000
+        if (
+            not name
+            or "\x00" in name
+            or "\\" in name
+            or name.startswith("/")
+            or ".." in parts
+            or any(part in {"", "."} for part in parts)
+            or Path(name).name != "releasekey.x509.pem"
+            or file_type not in (0, stat.S_IFREG)
+        ):
+            raise VerificationError("boot OTA certificate member is unsafe")
+        if payload != release_certificate:
+            raise VerificationError("boot OTA certificate does not match releasekey")
+
+
+def _verify_boot_component_transform(
+    unsigned_boot: Mapping[str, object],
+    signed_boot: Mapping[str, object],
+    release_certificate: bytes,
+) -> dict[str, object]:
+    unsigned_kernel = unsigned_boot.get("kernel_sha256")
+    signed_kernel = signed_boot.get("kernel_sha256")
+    if not isinstance(unsigned_kernel, str) or unsigned_kernel != signed_kernel:
+        raise VerificationError("signed boot kernel differs from refreshed unsigned kernel")
+    unsigned_dtb = unsigned_boot.get("dtb_sha256")
+    signed_dtb = signed_boot.get("dtb_sha256")
+    if not isinstance(unsigned_dtb, str) or unsigned_dtb != signed_dtb:
+        raise VerificationError("signed boot dtb differs from refreshed unsigned dtb")
+
+    unsigned_header = unsigned_boot.get("boot_header")
+    signed_header = signed_boot.get("boot_header")
+    if not isinstance(unsigned_header, Mapping) or not isinstance(signed_header, Mapping):
+        raise VerificationError("boot header evidence is missing")
+    unsigned_fixed = {
+        key: value for key, value in unsigned_header.items() if key != "ramdisk size"
+    }
+    signed_fixed = {
+        key: value for key, value in signed_header.items() if key != "ramdisk size"
+    }
+    if unsigned_fixed != signed_fixed or set(unsigned_header) != set(signed_header):
+        raise VerificationError("signed boot header differs outside ramdisk size")
+
+    unsigned_entries = unsigned_boot.get("ramdisk_entries")
+    signed_entries = signed_boot.get("ramdisk_entries")
+    if not isinstance(unsigned_entries, Mapping) or not isinstance(signed_entries, Mapping):
+        raise VerificationError("boot ramdisk evidence is missing")
+    if set(unsigned_entries) != set(signed_entries):
+        raise VerificationError("signed boot ramdisk member inventory differs")
+    changed: list[str] = []
+    for name in sorted(unsigned_entries):
+        unsigned_entry = unsigned_entries[name]
+        signed_entry = signed_entries[name]
+        if not isinstance(unsigned_entry, Mapping) or not isinstance(signed_entry, Mapping):
+            raise VerificationError("boot ramdisk entry evidence is invalid")
+        if unsigned_entry.get("metadata") != signed_entry.get("metadata"):
+            raise VerificationError(f"signed boot ramdisk metadata differs for {name}")
+        unsigned_data = unsigned_entry.get("data")
+        signed_data = signed_entry.get("data")
+        if not isinstance(unsigned_data, bytes) or not isinstance(signed_data, bytes):
+            raise VerificationError("boot ramdisk payload evidence is invalid")
+        if unsigned_data == signed_data:
+            continue
+        changed.append(name)
+        if name in BOOT_PROPERTY_REWRITE_PATHS:
+            if signed_data != _rewrite_release_properties(unsigned_data):
+                raise VerificationError(f"boot property rewrite is invalid for {name}")
+        elif name == BOOT_OTACERTS_PATH:
+            _validate_signed_boot_otacerts(
+                unsigned_data, signed_data, release_certificate
+            )
+        else:
+            raise VerificationError(f"signed boot ramdisk changed unexpectedly: {name}")
+    required_changes = BOOT_PROPERTY_REWRITE_PATHS | {BOOT_OTACERTS_PATH}
+    if set(changed) != required_changes:
+        raise VerificationError("signed boot ramdisk signing changes are incomplete")
+    return {
+        "kernel_sha256": unsigned_kernel,
+        "dtb_sha256": unsigned_dtb,
+        "ramdisk_changed_members": sorted(changed),
+    }
+
+
 def verify_kernel_boot_provenance(
-    unsigned_boot: Mapping[str, str],
-    signed_boot: Mapping[str, str],
+    unsigned_boot: Mapping[str, object],
+    signed_boot: Mapping[str, object],
     record: Mapping[str, object],
+    release_certificate: bytes,
 ) -> dict[str, object]:
     if record.get("project") != "kernel/xiaomi/mt6781":
         raise VerificationError("kernel provenance project is not mt6781")
@@ -744,8 +898,9 @@ def verify_kernel_boot_provenance(
             raise VerificationError(
                 f"{label} boot matches the rejected normalized pre-fix boot content"
             )
-    if unsigned_boot["content_sha256"] != signed_boot["content_sha256"]:
-        raise VerificationError("signed boot content does not match refreshed unsigned target-files")
+    component_evidence = _verify_boot_component_transform(
+        unsigned_boot, signed_boot, release_certificate
+    )
     if record.get("cfi_remains_enabled") is not True:
         raise VerificationError("kernel provenance does not preserve CFI")
     return {
@@ -757,6 +912,9 @@ def verify_kernel_boot_provenance(
         "rejected_pre_fix_boot_content_sha256": rejected_content,
         "hardware_tested_reference_sha256": record.get("hardware_tested_fixed_boot_sha256"),
         "boot_content_sha256": signed_boot["content_sha256"],
+        "kernel_sha256": component_evidence["kernel_sha256"],
+        "dtb_sha256": component_evidence["dtb_sha256"],
+        "ramdisk_changed_members": component_evidence["ramdisk_changed_members"],
         "unsigned_boot_sha256": unsigned_boot["raw_sha256"],
         "signed_boot_sha256": signed_boot["raw_sha256"],
         "cfi_remains_enabled": True,
@@ -1313,13 +1471,102 @@ def verify_fastboot_against_target_files(
     }
 
 
+def _parse_boot_header_info(text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            raise VerificationError("unpack_bootimg returned malformed header evidence")
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if not key or key in fields:
+            raise VerificationError("unpack_bootimg returned ambiguous header evidence")
+        fields[key] = value.strip()
+    required = {
+        "kernel size",
+        "ramdisk size",
+        "boot image header version",
+        "command line args",
+        "dtb size",
+    }
+    if not required.issubset(fields):
+        raise VerificationError("unpack_bootimg header evidence is incomplete")
+    return fields
+
+
+def _parse_newc_ramdisk(data: bytes) -> dict[str, dict[str, object]]:
+    entries: dict[str, dict[str, object]] = {}
+    offset = 0
+    trailer_seen = False
+    while offset + 110 <= len(data):
+        header = data[offset : offset + 110]
+        if header[:6] not in (b"070701", b"070702"):
+            raise VerificationError("boot ramdisk is not a valid newc archive")
+        try:
+            values = tuple(
+                int(header[6 + index * 8 : 14 + index * 8], 16)
+                for index in range(13)
+            )
+        except ValueError as error:
+            raise VerificationError("boot ramdisk has malformed newc metadata") from error
+        offset += 110
+        size = values[6]
+        name_size = values[11]
+        if name_size < 2 or offset + name_size > len(data):
+            raise VerificationError("boot ramdisk has invalid newc member name")
+        encoded_name = data[offset : offset + name_size]
+        if encoded_name[-1:] != b"\0":
+            raise VerificationError("boot ramdisk newc member is not terminated")
+        try:
+            name = encoded_name[:-1].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise VerificationError("boot ramdisk member name is not UTF-8") from error
+        offset = (offset + name_size + 3) & ~3
+        if offset + size > len(data):
+            raise VerificationError("boot ramdisk member is truncated")
+        payload = data[offset : offset + size]
+        offset = (offset + size + 3) & ~3
+        if name == "TRAILER!!!":
+            trailer_seen = True
+            break
+        parts = name.split("/")
+        if (
+            not name
+            or "\x00" in name
+            or "\\" in name
+            or name.startswith("/")
+            or name in entries
+            or ".." in parts
+            or any(part in {"", "."} for part in parts)
+        ):
+            raise VerificationError(f"boot ramdisk has unsafe member {name!r}")
+        metadata = (
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5],
+            values[7],
+            values[8],
+            values[9],
+            values[10],
+            values[12],
+        )
+        entries[name] = {"metadata": metadata, "data": payload}
+    if not trailer_seen or any(data[offset:]):
+        raise VerificationError("boot ramdisk newc archive has invalid trailer")
+    if not entries:
+        raise VerificationError("boot ramdisk is empty")
+    return entries
+
+
 def extract_boot_evidence(
     target_files: Path,
     avbtool: Path,
     *,
     runner=_default_runner,
-) -> dict[str, str]:
-    """Hash raw boot and its content after removal of its AVB signature footer."""
+) -> dict[str, object]:
+    """Hash boot and independently inventory its unpacked kernel/DTB/ramdisk."""
     try:
         with zipfile.ZipFile(target_files) as archive:
             boot = _read_unique_bytes(archive, "IMAGES/boot.img")
@@ -1335,9 +1582,67 @@ def extract_boot_evidence(
         if not image.is_file() or image.stat().st_size == 0:
             raise VerificationError("cannot associate normalized boot content")
         content_hash = sha256_file(image)
+        unpacked = Path(directory) / "unpacked"
+        unpacked.mkdir()
+        unpack_bootimg = Path(avbtool).parent / "unpack_bootimg"
+        lz4 = Path(avbtool).parent / "lz4"
+        try:
+            header_text = runner(
+                [
+                    unpack_bootimg,
+                    "--boot_img",
+                    image,
+                    "--out",
+                    unpacked,
+                    "--format",
+                    "info",
+                ],
+                cwd=Path(directory),
+            )
+        except VerificationError as error:
+            raise VerificationError("cannot unpack boot image") from error
+        expected_components = {"kernel", "ramdisk", "dtb"}
+        actual_components = {path.name for path in unpacked.iterdir()}
+        if actual_components != expected_components:
+            raise VerificationError("unpack_bootimg component inventory is unexpected")
+        for name in expected_components:
+            component = unpacked / name
+            if component.is_symlink() or not component.is_file():
+                raise VerificationError(f"unpacked boot component is invalid: {name}")
+        header = _parse_boot_header_info(header_text)
+        try:
+            header_sizes = {
+                name: int(header[f"{name} size"])
+                for name in expected_components
+            }
+        except ValueError as error:
+            raise VerificationError("unpack_bootimg returned invalid component size") from error
+        if header_sizes["kernel"] != (unpacked / "kernel").stat().st_size:
+            raise VerificationError("unpacked boot kernel size does not match header")
+        if header_sizes["ramdisk"] != (unpacked / "ramdisk").stat().st_size:
+            raise VerificationError("unpacked boot ramdisk size does not match header")
+        if header_sizes["dtb"] != (unpacked / "dtb").stat().st_size:
+            raise VerificationError("unpacked boot dtb size does not match header")
+        cpio_path = Path(directory) / "ramdisk.cpio"
+        try:
+            runner(
+                [lz4, "-d", "-f", unpacked / "ramdisk", cpio_path],
+                cwd=Path(directory),
+            )
+        except VerificationError as error:
+            raise VerificationError("cannot decompress boot ramdisk") from error
+        if cpio_path.is_symlink() or not cpio_path.is_file():
+            raise VerificationError("boot ramdisk decompression produced no archive")
+        ramdisk_entries = _parse_newc_ramdisk(cpio_path.read_bytes())
+        kernel_hash = sha256_file(unpacked / "kernel")
+        dtb_hash = sha256_file(unpacked / "dtb")
     return {
         "raw_sha256": hashlib.sha256(boot).hexdigest(),
         "content_sha256": content_hash,
+        "kernel_sha256": kernel_hash,
+        "dtb_sha256": dtb_hash,
+        "boot_header": header,
+        "ramdisk_entries": ramdisk_entries,
     }
 
 
@@ -2171,8 +2476,14 @@ def _verify_release_snapshotted(
     source_provenance = verify_kernel_source_provenance(
         kernel_record, kernel_patch_path, kernel_application_path
     )
+    release_certificate = public_keys / "releasekey.x509.pem"
+    if release_certificate.is_symlink() or not release_certificate.is_file():
+        raise VerificationError("releasekey public certificate is unavailable")
     kernel_evidence = verify_kernel_boot_provenance(
-        unsigned_boot, signed_boot, kernel_record
+        unsigned_boot,
+        signed_boot,
+        kernel_record,
+        release_certificate.read_bytes(),
     )
     kernel_evidence["source_application"] = source_provenance
 

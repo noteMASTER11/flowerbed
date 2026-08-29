@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import io
 import importlib.util
@@ -51,6 +52,35 @@ def write_zip_symlink(
     member.create_system = 3
     member.external_attr = (stat.S_IFLNK | mode) << 16
     archive.writestr(member, target)
+
+
+def build_newc(entries: dict[str, tuple[int, bytes]]) -> bytes:
+    output = bytearray()
+    inode = 1
+    for name, (mode, data) in [*entries.items(), ("TRAILER!!!", (0, b""))]:
+        encoded = name.encode("utf-8") + b"\0"
+        fields = (
+            inode,
+            mode,
+            0,
+            0,
+            1,
+            0,
+            len(data),
+            0,
+            0,
+            0,
+            0,
+            len(encoded),
+            0,
+        )
+        output.extend(b"070701" + b"".join(f"{value:08x}".encode() for value in fields))
+        output.extend(encoded)
+        output.extend(b"\0" * (-len(output) % 4))
+        output.extend(data)
+        output.extend(b"\0" * (-len(output) % 4))
+        inode += 1
+    return bytes(output)
 
 
 class SignedReleasePolicyTest(unittest.TestCase):
@@ -289,8 +319,94 @@ class SignedReleasePolicyTest(unittest.TestCase):
                     ),
                 )
 
-    def test_kernel_provenance_rejects_pre_fix_and_requires_content_match(self):
+    def test_kernel_provenance_allows_only_expected_boot_signing_transform(self):
         module = load_verifier()
+        release_certificate = b"release-certificate"
+        unsigned_otacerts = io.BytesIO()
+        with zipfile.ZipFile(unsigned_otacerts, "w") as archive:
+            archive.writestr("lineage.x509.pem", b"lineage-certificate")
+            archive.writestr("testkey.x509.pem", b"test-certificate")
+        signed_otacerts = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(signed_otacerts, "w") as archive:
+                archive.writestr(
+                    "proc/fixture/fd/7/releasekey.x509.pem", release_certificate
+                )
+                archive.writestr(
+                    "proc/fixture/fd/7/releasekey.x509.pem", release_certificate
+                )
+
+        metadata = (1, stat.S_IFREG | 0o644, 0, 0, 1, 0, 0, 0, 0, 0, 0)
+
+        def entry(data: bytes):
+            return {"metadata": metadata, "data": data}
+
+        unsigned = {
+            "raw_sha256": "e" * 64,
+            "content_sha256": "c" * 64,
+            "kernel_sha256": "2" * 64,
+            "dtb_sha256": "3" * 64,
+            "boot_header": {
+                "boot image header version": "2",
+                "command line args": "console=tty0",
+                "kernel size": "6",
+                "ramdisk size": "100",
+                "dtb size": "3",
+            },
+            "ramdisk_entries": {
+                "init": entry(b"init"),
+                "default.prop": {
+                    "metadata": (
+                        2,
+                        stat.S_IFLNK | 0o777,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ),
+                    "data": b"prop.default",
+                },
+                "prop.default": entry(
+                    b"ro.build.tags=test-keys\n"
+                    b"ro.build.display.id=BUILD test-keys\n"
+                    b"ro.build.description=fleur userdebug test-keys\n"
+                ),
+                "first_stage_ramdisk/system/etc/ramdisk/build.prop": entry(
+                    b"ro.bootimage.build.tags=test-keys\n"
+                ),
+                "system/etc/ramdisk/build.prop": entry(
+                    b"ro.bootimage.build.tags=test-keys\n"
+                ),
+                "system/etc/security/otacerts.zip": entry(
+                    unsigned_otacerts.getvalue()
+                ),
+            },
+        }
+        signed = copy.deepcopy(unsigned)
+        signed["raw_sha256"] = "d" * 64
+        signed["content_sha256"] = "f" * 64
+        signed["boot_header"]["ramdisk size"] = "104"
+        signed["ramdisk_entries"]["prop.default"]["data"] = (
+            b"ro.build.tags=release-keys\n"
+            b"ro.build.display.id=BUILD\n"
+            b"ro.build.description=fleur userdebug release-keys\n\n"
+        )
+        for name in (
+            "first_stage_ramdisk/system/etc/ramdisk/build.prop",
+            "system/etc/ramdisk/build.prop",
+        ):
+            signed["ramdisk_entries"][name]["data"] = (
+                b"ro.bootimage.build.tags=release-keys\n\n"
+            )
+        signed["ramdisk_entries"]["system/etc/security/otacerts.zip"][
+            "data"
+        ] = signed_otacerts.getvalue()
         record = {
             "project": "kernel/xiaomi/mt6781",
             "file": "drivers/example.h",
@@ -303,30 +419,80 @@ class SignedReleasePolicyTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(module.VerificationError, "pre-fix"):
             module.verify_kernel_boot_provenance(
-                {"raw_sha256": PRE_FIX_BOOT_SHA256, "content_sha256": "c" * 64},
-                {"raw_sha256": "d" * 64, "content_sha256": "c" * 64},
+                {**unsigned, "raw_sha256": PRE_FIX_BOOT_SHA256},
+                signed,
                 record,
-            )
-        with self.assertRaisesRegex(module.VerificationError, "content"):
-            module.verify_kernel_boot_provenance(
-                {"raw_sha256": "e" * 64, "content_sha256": "f" * 64},
-                {"raw_sha256": "d" * 64, "content_sha256": "c" * 64},
-                record,
+                release_certificate,
             )
         result = module.verify_kernel_boot_provenance(
-            {"raw_sha256": "e" * 64, "content_sha256": "c" * 64},
-            {"raw_sha256": "d" * 64, "content_sha256": "c" * 64},
+            unsigned,
+            signed,
             record,
+            release_certificate,
         )
         self.assertEqual("kernel/xiaomi/mt6781", result["project"])
-        self.assertEqual("c" * 64, result["boot_content_sha256"])
+        self.assertEqual("2" * 64, result["kernel_sha256"])
+        self.assertEqual("f" * 64, result["boot_content_sha256"])
         self.assertEqual("b" * 64, result["hardware_tested_reference_sha256"])
+
+        mutations = {
+            "kernel": ("kernel_sha256", "4" * 64),
+            "dtb": ("dtb_sha256", "5" * 64),
+        }
+        for label, (field, value) in mutations.items():
+            changed = copy.deepcopy(signed)
+            changed[field] = value
+            with self.subTest(label=label), self.assertRaisesRegex(
+                module.VerificationError, label
+            ):
+                module.verify_kernel_boot_provenance(
+                    unsigned, changed, record, release_certificate
+                )
+        changed = copy.deepcopy(signed)
+        changed["boot_header"]["command line args"] = "console=evil"
+        with self.assertRaisesRegex(module.VerificationError, "header"):
+            module.verify_kernel_boot_provenance(
+                unsigned, changed, record, release_certificate
+            )
+        changed = copy.deepcopy(signed)
+        changed["ramdisk_entries"]["unexpected"] = entry(b"injected")
+        with self.assertRaisesRegex(module.VerificationError, "ramdisk"):
+            module.verify_kernel_boot_provenance(
+                unsigned, changed, record, release_certificate
+            )
+        changed = copy.deepcopy(signed)
+        changed["ramdisk_entries"]["init"]["data"] = b"mutated-init"
+        with self.assertRaisesRegex(module.VerificationError, "ramdisk"):
+            module.verify_kernel_boot_provenance(
+                unsigned, changed, record, release_certificate
+            )
+        changed = copy.deepcopy(signed)
+        changed["ramdisk_entries"]["prop.default"]["data"] += b"evil=1\n"
+        with self.assertRaisesRegex(module.VerificationError, "property"):
+            module.verify_kernel_boot_provenance(
+                unsigned, changed, record, release_certificate
+            )
+        wrong_otacerts = io.BytesIO()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(wrong_otacerts, "w") as archive:
+                archive.writestr("releasekey.x509.pem", b"wrong")
+                archive.writestr("releasekey.x509.pem", b"wrong")
+        changed = copy.deepcopy(signed)
+        changed["ramdisk_entries"]["system/etc/security/otacerts.zip"][
+            "data"
+        ] = wrong_otacerts.getvalue()
+        with self.assertRaisesRegex(module.VerificationError, "OTA certificate"):
+            module.verify_kernel_boot_provenance(
+                unsigned, changed, record, release_certificate
+            )
         invalid_record = dict(record, patch_sha256="invalid")
         with self.assertRaisesRegex(module.VerificationError, "patch"):
             module.verify_kernel_boot_provenance(
-                {"raw_sha256": "e" * 64, "content_sha256": "c" * 64},
-                {"raw_sha256": "d" * 64, "content_sha256": "c" * 64},
+                unsigned,
+                signed,
                 invalid_record,
+                release_certificate,
             )
 
     def test_target_files_relationship_requires_same_partitions_and_firmware(self):
@@ -431,6 +597,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 {"raw_sha256": "e" * 64, "content_sha256": rejected_content},
                 {"raw_sha256": "d" * 64, "content_sha256": rejected_content},
                 record,
+                b"release-certificate",
             )
 
     def test_kernel_source_provenance_binds_patch_and_application_script(self):
@@ -810,9 +977,28 @@ class SignedReleasePolicyTest(unittest.TestCase):
             with zipfile.ZipFile(archive_path, "w") as archive:
                 archive.writestr("IMAGES/boot.img", b"kernel-and-ramdisk")
             calls = []
+            ramdisk = build_newc(
+                {
+                    "init": (stat.S_IFREG | 0o755, b"init"),
+                    "default.prop": (stat.S_IFLNK | 0o777, b"prop.default"),
+                }
+            )
 
             def runner(command, **_kwargs):
                 calls.append(tuple(str(item) for item in command))
+                tool = Path(command[0]).name
+                if tool == "unpack_bootimg":
+                    output = Path(command[command.index("--out") + 1])
+                    (output / "kernel").write_bytes(b"kernel")
+                    (output / "ramdisk").write_bytes(b"compressed-ramdisk")
+                    (output / "dtb").write_bytes(b"dtb")
+                    return (
+                        "kernel size: 6\nramdisk size: 18\n"
+                        "boot image header version: 2\n"
+                        "command line args: console=tty0\ndtb size: 3\n"
+                    )
+                if tool == "lz4":
+                    Path(command[-1]).write_bytes(ramdisk)
                 return ""
 
             evidence = module.extract_boot_evidence(
@@ -821,7 +1007,21 @@ class SignedReleasePolicyTest(unittest.TestCase):
             digest = hashlib.sha256(b"kernel-and-ramdisk").hexdigest()
             self.assertEqual(digest, evidence["raw_sha256"])
             self.assertEqual(digest, evidence["content_sha256"])
-            self.assertIn("erase_footer", calls[0])
+            self.assertEqual(hashlib.sha256(b"kernel").hexdigest(), evidence["kernel_sha256"])
+            self.assertEqual(hashlib.sha256(b"dtb").hexdigest(), evidence["dtb_sha256"])
+            self.assertEqual(b"init", evidence["ramdisk_entries"]["init"]["data"])
+            self.assertEqual(
+                b"prop.default",
+                evidence["ramdisk_entries"]["default.prop"]["data"],
+            )
+            tools = [Path(command[0]).name for command in calls]
+            self.assertEqual(["avbtool", "unpack_bootimg", "lz4"], tools)
+            with self.assertRaisesRegex(module.VerificationError, "unsafe"):
+                module._parse_newc_ramdisk(
+                    build_newc({"../escape": (stat.S_IFREG | 0o644, b"bad")})
+                )
+            with self.assertRaisesRegex(module.VerificationError, "trailer|truncated"):
+                module._parse_newc_ramdisk(ramdisk[:-20])
 
             empty = root / "empty.zip"
             with zipfile.ZipFile(empty, "w"):
@@ -1423,9 +1623,11 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 "apksigner",
                 "deapexer",
                 "avbtool",
+                "lz4",
                 "ota_extractor",
                 "debugfs_static",
                 "fsck.erofs",
+                "unpack_bootimg",
             ):
                 (host_tools / tool).write_text("fixture\n", encoding="utf-8")
                 (host_tools / tool).chmod(0o755)
@@ -1618,8 +1820,72 @@ class SignedReleasePolicyTest(unittest.TestCase):
             )
             commands = []
             apksigner_environments = []
+            release_certificate_bytes = (public / "releasekey.x509.pem").read_bytes()
+            unsigned_otacerts = io.BytesIO()
+            with zipfile.ZipFile(unsigned_otacerts, "w") as archive:
+                archive.writestr("lineage.x509.pem", b"lineage")
+                archive.writestr("testkey.x509.pem", b"testkey")
+            signed_otacerts = io.BytesIO()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                with zipfile.ZipFile(signed_otacerts, "w") as archive:
+                    archive.writestr(
+                        "proc/fixture/fd/7/releasekey.x509.pem",
+                        release_certificate_bytes,
+                    )
+                    archive.writestr(
+                        "proc/fixture/fd/7/releasekey.x509.pem",
+                        release_certificate_bytes,
+                    )
+            unsigned_ramdisk = build_newc(
+                {
+                    "init": (stat.S_IFREG | 0o755, b"init"),
+                    "default.prop": (stat.S_IFLNK | 0o777, b"prop.default"),
+                    "prop.default": (
+                        stat.S_IFREG | 0o644,
+                        b"ro.build.tags=test-keys\n",
+                    ),
+                    "first_stage_ramdisk/system/etc/ramdisk/build.prop": (
+                        stat.S_IFREG | 0o644,
+                        b"ro.bootimage.build.tags=test-keys\n",
+                    ),
+                    "system/etc/ramdisk/build.prop": (
+                        stat.S_IFREG | 0o644,
+                        b"ro.bootimage.build.tags=test-keys\n",
+                    ),
+                    "system/etc/security/otacerts.zip": (
+                        stat.S_IFREG | 0o644,
+                        unsigned_otacerts.getvalue(),
+                    ),
+                }
+            )
+            signed_ramdisk = build_newc(
+                {
+                    "init": (stat.S_IFREG | 0o755, b"init"),
+                    "default.prop": (stat.S_IFLNK | 0o777, b"prop.default"),
+                    "prop.default": (
+                        stat.S_IFREG | 0o644,
+                        b"ro.build.tags=release-keys\n\n",
+                    ),
+                    "first_stage_ramdisk/system/etc/ramdisk/build.prop": (
+                        stat.S_IFREG | 0o644,
+                        b"ro.bootimage.build.tags=release-keys\n\n",
+                    ),
+                    "system/etc/ramdisk/build.prop": (
+                        stat.S_IFREG | 0o644,
+                        b"ro.bootimage.build.tags=release-keys\n\n",
+                    ),
+                    "system/etc/security/otacerts.zip": (
+                        stat.S_IFREG | 0o644,
+                        signed_otacerts.getvalue(),
+                    ),
+                }
+            )
+            boot_unpack_count = 0
+            decompressed_ramdisks = {}
 
             def runner(command, **kwargs):
+                nonlocal boot_unpack_count
                 command = tuple(str(item) for item in command)
                 commands.append(command)
                 tool = Path(command[0]).name
@@ -1657,6 +1923,29 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         else:
                             value = f"image-{partition}".encode()
                         (output / f"{partition}.img").write_bytes(value)
+                    return ""
+                if tool == "unpack_bootimg":
+                    output = Path(command[command.index("--out") + 1])
+                    ramdisk = (
+                        unsigned_ramdisk if boot_unpack_count == 0 else signed_ramdisk
+                    )
+                    boot_unpack_count += 1
+                    (output / "kernel").write_bytes(b"kernel")
+                    (output / "dtb").write_bytes(b"dtb")
+                    compressed = b"compressed-ramdisk"
+                    (output / "ramdisk").write_bytes(compressed)
+                    decompressed_ramdisks[str(output / "ramdisk")] = ramdisk
+                    return (
+                        "kernel size: 6\n"
+                        f"ramdisk size: {len(compressed)}\n"
+                        "boot image header version: 2\n"
+                        "command line args: console=tty0\n"
+                        "dtb size: 3\n"
+                    )
+                if tool == "lz4":
+                    Path(command[-1]).write_bytes(
+                        decompressed_ramdisks[command[-2]]
+                    )
                     return ""
                 if tool == "deapexer":
                     Path(command[-1]).mkdir()
