@@ -77,7 +77,9 @@ command.
 Apply the repository patches, then rebuild only the target-files package. This
 keeps the existing `out` tree and ccache intact and rejects an unchanged stale
 target-files archive. It also creates two-phase MDPM CFI kernel provenance so a
-pre-fix boot image cannot be signed by mistake.
+pre-fix boot image cannot be signed by mistake, including a re-footered or
+re-signed image whose normalized boot content is still the rejected pre-fix
+kernel.
 
 ```bash
 cd ~/src/flowerbed
@@ -89,6 +91,10 @@ The runner writes a timestamped log, JSON metadata, resolved manifest, and final
 build-provenance JSON under the repository's ignored `logs/` and
 `manifests/snapshots/` paths. Its output identifies the refreshed unsigned
 target-files archive and provenance file; use those exact two paths below.
+If the expected target-files archive existed when the runner began, it is
+atomically preserved beside the new archive with a `.pre-run-<run-id>` suffix.
+That preserved archive is evidence only: never pass it to key generation or
+signing.
 
 Generate the keyset once. It is private WSL-ext4 material outside both the Android
 tree and this repository. The passphrase is entered directly in Ubuntu and must

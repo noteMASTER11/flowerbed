@@ -61,7 +61,12 @@ def write_build_provenance(path: Path, target_files: Path) -> None:
     policy = json.loads((ROOT / "sources/kernel-fix.json").read_text(encoding="utf-8"))
     fields = {
         name: policy[name]
-        for name in ("project", "file", "base_commit", "patch_sha256", "application_script", "application_script_sha256")
+        for name in (
+            "project", "file", "base_commit", "patch_sha256",
+            "application_script", "application_script_sha256",
+            "rejected_pre_fix_boot_sha256",
+            "rejected_pre_fix_boot_content_sha256",
+        )
     }
     evidence = {**fields, "post_fix_source_sha256": "1" * 64, "forward_applicable": False, "reverse_applicable": True}
     with zipfile.ZipFile(target_files) as archive:

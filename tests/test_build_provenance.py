@@ -6,6 +6,7 @@ import json
 from contextlib import redirect_stdout
 from pathlib import Path
 import subprocess
+import struct
 import tempfile
 import unittest
 import zipfile
@@ -34,6 +35,8 @@ class BuildProvenanceTest(unittest.TestCase):
             "patch_sha256": build_provenance.sha256_file(patch),
             "application_script": "scripts/ubuntu/apply_patches.sh",
             "application_script_sha256": build_provenance.sha256_file(script),
+            "rejected_pre_fix_boot_sha256": "0" * 64,
+            "rejected_pre_fix_boot_content_sha256": "1" * 64,
         }
         return kernel, patch, script, policy
 
@@ -176,3 +179,41 @@ class BuildProvenanceTest(unittest.TestCase):
                     kernel_root=kernel, policy=policy, patch=patch,
                     application_script=script,
                 )
+
+    def test_finalize_rejects_pre_fix_raw_and_normalized_boot_identities(self):
+        cases = {
+            "raw": b"known-pre-fix-raw",
+            "normalized": b"known-pre-fix-content" + struct.pack(
+                ">4sIIQQQ28s",
+                b"AVBf", 1, 0, len(b"known-pre-fix-content"), 0, 0, b"\0" * 28,
+            ),
+        }
+        for name, boot in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                kernel, patch, script, policy = self._fixture(root)
+                subprocess.run(("git", "apply", patch), cwd=kernel, check=True)
+                if name == "raw":
+                    policy["rejected_pre_fix_boot_sha256"] = hashlib.sha256(boot).hexdigest()
+                    policy["rejected_pre_fix_boot_content_sha256"] = "0" * 64
+                else:
+                    policy["rejected_pre_fix_boot_sha256"] = "0" * 64
+                    policy["rejected_pre_fix_boot_content_sha256"] = hashlib.sha256(
+                        b"known-pre-fix-content"
+                    ).hexdigest()
+                prebuild = root / "prebuild.json"
+                build_provenance.create_pre_build_provenance(
+                    kernel, policy, patch, script, prebuild,
+                    timestamp="2026-08-29T00:00:00Z", nonce="e" * 64,
+                )
+                target = root / "lineage_fleur-target_files.zip"
+                with zipfile.ZipFile(target, "w") as archive:
+                    archive.writestr("IMAGES/boot.img", boot)
+                with self.assertRaisesRegex(
+                    build_provenance.BuildProvenanceError, "pre-fix boot",
+                ):
+                    build_provenance.finalize_build_provenance(
+                        prebuild, target, root / "final.json",
+                        kernel_root=kernel, policy=policy, patch=patch,
+                        application_script=script,
+                    )

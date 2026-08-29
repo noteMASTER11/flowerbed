@@ -73,6 +73,8 @@ memory_snapshot="$runtime_dir/memory-and-swap.txt"
 disk_snapshot="$runtime_dir/disk.txt"
 ccache_snapshot="$runtime_dir/ccache.txt"
 target_files="$workspace/out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip"
+target_files_relative="out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip"
+backup_target_files="$target_files.pre-run-$run_id"
 kernel_root="$workspace/kernel/xiaomi/mt6781"
 kernel_policy="$repo_root/sources/kernel-fix.json"
 kernel_patch="$repo_root/patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch"
@@ -96,28 +98,39 @@ require_command df
 [[ ! -e "$final_provenance" ]] || die "final build provenance output already exists"
 mkdir -p "$repo_root/logs" "$repo_root/manifests/snapshots" "$runtime_dir"
 
-snapshot_target_files() {
-  local target="$1" output="$2"
-  python3 - "$target" "$output" <<'PY'
+preserve_existing_target_files() {
+  local target="$1" backup="$2" output="$3"
+  python3 - "$target" "$backup" "$output" <<'PY'
+import hashlib
 import json
 from pathlib import Path
 import stat
 import sys
 
 target = Path(sys.argv[1])
-output = Path(sys.argv[2])
+backup = Path(sys.argv[2])
+output = Path(sys.argv[3])
 if target.exists() or target.is_symlink():
     metadata = target.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         raise SystemExit("target-files output is not a regular non-symlink file")
+    if backup.exists() or backup.is_symlink():
+        raise SystemExit("target-files pre-run backup already exists")
+    digest = hashlib.sha256()
+    with target.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
     record = {
         "exists": True,
+        "sha256": digest.hexdigest(),
         "device": metadata.st_dev,
         "inode": metadata.st_ino,
         "size": metadata.st_size,
         "mtimeNs": metadata.st_mtime_ns,
         "ctimeNs": metadata.st_ctime_ns,
+        "backup": str(backup),
     }
+    target.replace(backup)
 else:
     record = {"exists": False}
 output.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
@@ -125,17 +138,21 @@ PY
 }
 
 require_refreshed_target_files() {
-  local before="$1" target="$2" output="$3"
-  python3 - "$before" "$target" "$output" <<'PY'
+  local before="$1" target="$2" output="$3" start_ns="$4" log="$5" expected_path="$6"
+  python3 - "$before" "$target" "$output" "$start_ns" "$log" "$expected_path" <<'PY'
 import hashlib
 import json
 from pathlib import Path
 import stat
 import sys
+import zipfile
 
 before = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 target = Path(sys.argv[2])
 output = Path(sys.argv[3])
+start_ns = int(sys.argv[4])
+log = Path(sys.argv[5])
+expected_path = sys.argv[6]
 try:
     metadata = target.lstat()
 except OSError as error:
@@ -150,8 +167,18 @@ after = {
     "mtimeNs": metadata.st_mtime_ns,
     "ctimeNs": metadata.st_ctime_ns,
 }
-if before == after:
-    raise SystemExit("target-files output was not refreshed by this build")
+if after["mtimeNs"] < start_ns or after["ctimeNs"] < start_ns:
+    raise SystemExit("target-files output predates this build")
+try:
+    with zipfile.ZipFile(target) as archive:
+        if archive.testzip() is not None:
+            raise SystemExit("target-files output is not a valid ZIP")
+        if archive.namelist().count("IMAGES/boot.img") != 1:
+            raise SystemExit("target-files output must contain exactly one boot image")
+except zipfile.BadZipFile as error:
+    raise SystemExit("target-files output is not a valid ZIP") from error
+if f"Packaging target files: {expected_path}" not in log.read_text(encoding="utf-8"):
+    raise SystemExit("target-files packaging proof is missing from build log")
 digest = hashlib.sha256()
 with target.open("rb") as source:
     for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -196,7 +223,7 @@ payload = {
     "log": log,
     "metadata": str(path),
     "preBuildProvenance": pre,
-    "buildProvenance": final if Path(final).is_file() else None,
+    "buildProvenance": final,
 }
 with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
     json.dump(payload, handle, indent=2, sort_keys=True)
@@ -206,9 +233,10 @@ temporary.replace(path)
 PY
 }
 
-snapshot_target_files "$target_files" "$before_snapshot"
+preserve_existing_target_files "$target_files" "$backup_target_files" "$before_snapshot"
 start_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 start_epoch="$(date +%s)"
+start_ns="$(date +%s%N)"
 
 run_build() {
   cd "$workspace"
@@ -240,41 +268,49 @@ run_build() {
 }
 
 set +e
-run_build 2>&1 | tee "$log_file"
-status=${PIPESTATUS[0]}
+(
+  set -Eeuo pipefail
+  run_build
+) > >(tee "$log_file") 2>&1
+status=$?
 set -e
 
 if [[ "$status" -eq 0 ]]; then
-  if ! require_refreshed_target_files "$before_snapshot" "$target_files" "$after_snapshot"; then
-    status=1
-  elif ! python3 "$script_dir/build_provenance.py" finalize \
-    --pre-build "$pre_provenance" \
-    --unsigned-target-files "$target_files" \
-    --kernel-root "$kernel_root" \
-    --kernel-policy "$kernel_policy" \
-    --patch "$kernel_patch" \
-    --application-script "$application_script" \
-    --output "$final_provenance" 2>&1 | tee -a "$log_file"; then
+  if ! require_refreshed_target_files "$before_snapshot" "$target_files" "$after_snapshot" "$start_ns" "$log_file" "$target_files_relative"; then
     status=1
   fi
 fi
 
-if ! (
+if [[ "$status" -eq 0 ]] && ! (
   cd "$workspace"
   repo manifest -r
 ) >"$manifest_snapshot"; then
   log "Unable to create resolved manifest snapshot" | tee -a "$log_file"
   status=1
 fi
-free -h >"$memory_snapshot" 2>&1 || true
-df -h "$workspace" >"$disk_snapshot" 2>&1 || true
-ccache -s >"$ccache_snapshot" 2>&1 || true
-cat "$memory_snapshot" "$disk_snapshot" "$ccache_snapshot" >>"$log_file"
+if [[ "$status" -eq 0 ]]; then
+  free -h >"$memory_snapshot"
+  df -h "$workspace" >"$disk_snapshot"
+  ccache -s >"$ccache_snapshot"
+  cat "$memory_snapshot" "$disk_snapshot" "$ccache_snapshot" >>"$log_file"
+fi
 
 end_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 end_epoch="$(date +%s)"
 elapsed_seconds=$((end_epoch - start_epoch))
 write_metadata "$status" "$start_utc" "$end_utc" "$elapsed_seconds"
+
+if [[ "$status" -eq 0 ]] && ! python3 "$script_dir/build_provenance.py" finalize \
+  --pre-build "$pre_provenance" \
+  --unsigned-target-files "$target_files" \
+  --kernel-root "$kernel_root" \
+  --kernel-policy "$kernel_policy" \
+  --patch "$kernel_patch" \
+  --application-script "$application_script" \
+  --output "$final_provenance" 2>&1 | tee -a "$log_file"; then
+  status=1
+  write_metadata "$status" "$start_utc" "$end_utc" "$elapsed_seconds"
+fi
 
 log "Target-files build exit code: $status"
 log "Target-files build log: $log_file"

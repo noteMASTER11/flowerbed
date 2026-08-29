@@ -1,9 +1,12 @@
 from pathlib import Path
 import os
+import json
+import shutil
 import subprocess
 import tempfile
 import uuid
 import unittest
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +103,165 @@ def run_script_with_env(
 
 
 class ScriptTest(unittest.TestCase):
+    def _target_files_runner_fixture(self, root: Path, mode: str) -> tuple[Path, Path]:
+        repo = root / "repo"
+        workspace = root / "android"
+        fake_bin = root / "bin"
+        trace = root / "trace.txt"
+        (repo / "scripts/ubuntu/lib").mkdir(parents=True)
+        (repo / "sources").mkdir()
+        (repo / "patches/android_kernel_xiaomi_mt6781").mkdir(parents=True)
+        (workspace / "build").mkdir(parents=True)
+        (workspace / "device/xiaomi/fleur").mkdir(parents=True)
+        (workspace / "vendor/xiaomi/fleur").mkdir(parents=True)
+        (workspace / "kernel/xiaomi/mt6781").mkdir(parents=True)
+        fake_bin.mkdir()
+        shutil.copy2(ROOT / "scripts/ubuntu/build_target_files.sh", repo / "scripts/ubuntu")
+        shutil.copy2(ROOT / "scripts/ubuntu/lib/common.sh", repo / "scripts/ubuntu/lib")
+        (repo / "sources/kernel-fix.json").write_text("{}\n", encoding="utf-8")
+        (repo / "patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch").write_text("patch\n", encoding="utf-8")
+        (repo / "scripts/ubuntu/apply_patches.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        (repo / "scripts/ubuntu/build_provenance.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            "command = sys.argv[1]\n"
+            "with Path(os.environ['TRACE']).open('a', encoding='utf-8') as trace:\n"
+            "    trace.write(command + '\\n')\n"
+            "if os.environ['FIXTURE_MODE'] == 'prebuild' and command == 'pre-build':\n"
+            "    raise SystemExit(71)\n"
+            "if os.environ['FIXTURE_MODE'] == 'finalize' and command == 'finalize':\n"
+            "    raise SystemExit(72)\n"
+            "Path(sys.argv[sys.argv.index('--output') + 1]).write_text(command + '\\n', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        (workspace / "build/envsetup.sh").write_text(
+            "if [[ \"${FIXTURE_MODE:-}\" == envsetup ]]; then return 61; fi\n"
+            "breakfast() {\n"
+            "  printf 'breakfast\\n' >>\"$TRACE\"\n"
+            "  [[ \"${FIXTURE_MODE:-}\" != breakfast ]] || return 62\n"
+            "}\n"
+            "m() {\n"
+            "  printf 'm:%s\\n' \"$*\" >>\"$TRACE\"\n"
+            "  [[ \"${FIXTURE_MODE:-}\" != m ]] || return 63\n"
+            "  case \"${FIXTURE_MODE:-}\" in\n"
+            "    stale) printf 'Packaging target files: out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip\\n' ;;\n"
+            "    touch) touch \"$target_files\"; printf 'Packaging target files: out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip\\n' ;;\n"
+            "    copy) cp \"$(find \"$(dirname \"$target_files\")\" -maxdepth 1 -name \"lineage_fleur-target_files.zip.pre-run-*\" -print -quit)\" \"$target_files\" ;;\n"
+            "    *) make_target \"$target_files\"; printf 'Packaging target files: out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip\\n' ;;\n"
+            "  esac\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "ccache").write_text(
+            "#!/usr/bin/env bash\n"
+            "printf 'ccache:%s\\n' \"$*\" >>\"$TRACE\"\n"
+            "[[ \"${FIXTURE_MODE:-}\" != ccache ]] || exit 60\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "repo").write_text(
+            "#!/usr/bin/env bash\n"
+            "printf 'manifest\\n' >>\"$TRACE\"\n"
+            "[[ \"${FIXTURE_MODE:-}\" != manifest ]] || exit 64\n"
+            "printf '<manifest/>\\n'\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "make_target").write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            "import zipfile\n"
+            "target = Path(sys.argv[1])\n"
+            "target.parent.mkdir(parents=True, exist_ok=True)\n"
+            "with zipfile.ZipFile(target, 'w') as archive:\n"
+            "    archive.writestr('IMAGES/boot.img', b'new-boot')\n",
+            encoding="utf-8",
+        )
+        for executable in (
+            repo / "scripts/ubuntu/build_target_files.sh",
+            repo / "scripts/ubuntu/build_provenance.py",
+            repo / "scripts/ubuntu/apply_patches.sh",
+            fake_bin / "ccache", fake_bin / "repo", fake_bin / "make_target",
+        ):
+            executable.chmod(0o755)
+        target = workspace / "out/target/product/fleur/obj/PACKAGING/target_files_intermediates/lineage_fleur-target_files.zip"
+        target.parent.mkdir(parents=True)
+        with zipfile.ZipFile(target, "w") as archive:
+            archive.writestr("IMAGES/boot.img", b"previous-boot")
+        return repo, workspace
+
+    def test_target_files_runner_fail_fast_freshness_and_finalization_order(self):
+        cache_root = Path.home() / ".cache/flowerbed-tests"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        expected_exit_codes = {
+            "ccache": 60, "envsetup": 61, "breakfast": 62,
+            "prebuild": 71, "m": 63, "finalize": 1,
+        }
+        expected_failures = {
+            "stale": "target-files output is missing",
+            "touch": "target-files output is not a valid ZIP", "copy": "target-files packaging proof is missing",
+            "manifest": "Unable to create resolved manifest snapshot",
+        }
+        no_m = {"ccache", "envsetup", "breakfast", "prebuild"}
+        no_finalize = set(expected_failures)
+        for mode in (*expected_exit_codes, *expected_failures):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(
+                dir=cache_root
+            ) as directory:
+                root = Path(directory)
+                repo, workspace = self._target_files_runner_fixture(root, mode)
+                environment = {
+                    "PATH": f"{shell_path(root / 'bin')}:/usr/bin:/bin",
+                    "TRACE": shell_path(root / "trace.txt"),
+                    "FIXTURE_MODE": mode,
+                }
+                result = run_bash(
+                    "-c",
+                    " ".join(f"{key}='{value}'" for key, value in environment.items())
+                    + f" bash '{shell_path(repo / 'scripts/ubuntu/build_target_files.sh')}' '{shell_path(workspace)}'",
+                )
+                self.assertNotEqual(0, result.returncode, result.stdout)
+                if mode in expected_exit_codes:
+                    self.assertIn(
+                        f"Target-files build exit code: {expected_exit_codes[mode]}",
+                        result.stdout,
+                    )
+                else:
+                    self.assertIn(expected_failures[mode], result.stdout)
+                trace = (root / "trace.txt").read_text(encoding="utf-8")
+                if mode in no_m:
+                    self.assertNotIn("m:", trace)
+                if mode in no_finalize:
+                    self.assertNotIn("finalize", trace)
+                if mode == "finalize":
+                    metadata = next(
+                        path for path in (repo / "logs").glob("target-files-*.json")
+                        if "provenance" not in path.name
+                    )
+                    self.assertEqual(1, json.loads(metadata.read_text(encoding="utf-8"))["exitCode"])
+                    self.assertEqual([], list((repo / "logs").glob("*.build-provenance.json")))
+
+        with tempfile.TemporaryDirectory(dir=cache_root) as directory:
+            root = Path(directory)
+            repo, workspace = self._target_files_runner_fixture(root, "success")
+            result = run_bash(
+                "-c",
+                f"PATH='{shell_path(root / 'bin')}:/usr/bin:/bin' "
+                f"TRACE='{shell_path(root / 'trace.txt')}' FIXTURE_MODE=success "
+                f"bash '{shell_path(repo / 'scripts/ubuntu/build_target_files.sh')}' '{shell_path(workspace)}'",
+            )
+            self.assertEqual(0, result.returncode, result.stdout)
+            trace = (root / "trace.txt").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                ["ccache:-M 100G", "ccache:-z", "breakfast", "pre-build", "m:target-files-package otatools -j8", "manifest", "ccache:-s", "finalize"],
+                trace,
+            )
+            target_dir = workspace / "out/target/product/fleur/obj/PACKAGING/target_files_intermediates"
+            backups = list(target_dir.glob("lineage_fleur-target_files.zip.pre-run-*"))
+            self.assertEqual(1, len(backups))
+            with zipfile.ZipFile(backups[0]) as archive:
+                self.assertEqual(b"previous-boot", archive.read("IMAGES/boot.img"))
     def test_bootstrap_uses_current_ubuntu_package_names(self):
         result = run_script("scripts/ubuntu/bootstrap.sh", "--print-packages")
         self.assertEqual(0, result.returncode, result.stdout)
@@ -317,7 +479,8 @@ class ScriptTest(unittest.TestCase):
             self.assertNotIn(forbidden, runner)
         self.assertIn("pre-build provenance output already exists", runner)
         self.assertIn("final build provenance output already exists", runner)
-        self.assertIn("target-files output was not refreshed", runner)
+        self.assertIn("target-files output predates this build", runner)
+        self.assertIn("target-files packaging proof is missing", runner)
         self.assertIn("--kernel-root", runner)
         self.assertIn("--kernel-policy", runner)
         self.assertIn("--application-script", runner)

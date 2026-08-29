@@ -58,7 +58,12 @@ def _run(command: Sequence[str | Path], cwd: Path, *, check: bool = True) -> sub
 
 
 def _policy_fields(policy: Mapping[str, object]) -> dict[str, str]:
-    required = ("project", "file", "base_commit", "patch_sha256", "application_script", "application_script_sha256")
+    required = (
+        "project", "file", "base_commit", "patch_sha256",
+        "application_script", "application_script_sha256",
+        "rejected_pre_fix_boot_sha256",
+        "rejected_pre_fix_boot_content_sha256",
+    )
     if set(required) - set(policy):
         raise BuildProvenanceError("kernel policy is incomplete")
     result = {name: policy[name] for name in required}
@@ -66,13 +71,29 @@ def _policy_fields(policy: Mapping[str, object]) -> dict[str, str]:
         raise BuildProvenanceError("kernel policy fields are invalid")
     if not HEX40.fullmatch(result["base_commit"]):
         raise BuildProvenanceError("kernel policy base commit is invalid")
-    for name in ("patch_sha256", "application_script_sha256"):
+    for name in (
+        "patch_sha256", "application_script_sha256",
+        "rejected_pre_fix_boot_sha256",
+        "rejected_pre_fix_boot_content_sha256",
+    ):
         if not HEX64.fullmatch(result[name]):
             raise BuildProvenanceError(f"kernel policy {name} is invalid")
     source = Path(result["file"])
     if source.is_absolute() or ".." in source.parts:
         raise BuildProvenanceError("kernel policy source path is invalid")
     return result
+
+
+def _reject_pre_fix_boot(fields: Mapping[str, str], boot: bytes) -> tuple[str, str]:
+    raw = hashlib.sha256(boot).hexdigest()
+    content = normalized_boot_sha256(boot)
+    if raw == fields["rejected_pre_fix_boot_sha256"]:
+        raise BuildProvenanceError("unsigned target-files contains rejected pre-fix boot")
+    if content == fields["rejected_pre_fix_boot_content_sha256"]:
+        raise BuildProvenanceError(
+            "unsigned target-files contains rejected pre-fix boot content"
+        )
+    return raw, content
 
 
 def _write_once(path: Path, value: Mapping[str, object]) -> None:
@@ -242,12 +263,13 @@ def finalize_build_provenance(
     if pre.get("application_evidence_sha256") != _canonical_hash(live):
         raise BuildProvenanceError("pre-build application evidence hash is invalid")
     boot = _boot_bytes(unsigned_target_files)
+    boot_raw, boot_content = _reject_pre_fix_boot(fields, boot)
     target = _regular(unsigned_target_files, "unsigned target-files")
     finalized = dict(record)
     finalized["state"] = "finalized"
     finalized["unsigned_target_files"] = {
         "filename": target.name, "size": target.stat().st_size, "sha256": sha256_file(target),
-        "boot_raw_sha256": hashlib.sha256(boot).hexdigest(), "boot_content_sha256": normalized_boot_sha256(boot),
+        "boot_raw_sha256": boot_raw, "boot_content_sha256": boot_content,
     }
     _write_once(output, finalized)
     return finalized
@@ -284,10 +306,11 @@ def validate_final_build_provenance(provenance: Path | Mapping[str, object], uns
         raise BuildProvenanceError("application script differs from final provenance")
     target = _regular(unsigned_target_files, "unsigned target-files")
     boot = _boot_bytes(target)
+    boot_raw, boot_content = _reject_pre_fix_boot(fields, boot)
     expected = {
         "filename": target.name if target_filename is None else target_filename,
         "size": target.stat().st_size, "sha256": sha256_file(target),
-        "boot_raw_sha256": hashlib.sha256(boot).hexdigest(), "boot_content_sha256": normalized_boot_sha256(boot),
+        "boot_raw_sha256": boot_raw, "boot_content_sha256": boot_content,
     }
     if record.get("unsigned_target_files") != expected:
         raise BuildProvenanceError("build provenance does not bind exact unsigned target-files and boot")

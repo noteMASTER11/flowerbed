@@ -40,6 +40,9 @@ the same incremental run. Keep private keys on WSL ext4 outside source trees and
 check that no `.pk8`, private `.pem`, password file, or private keyset metadata
 has been copied to an export directory. A lost private keyset means the update
 lineage is lost: create a new keyset and perform a verified clean installation.
+The provenance gate also rejects both the known raw pre-fix boot hash and its
+normalized content hash, so changing an AVB footer or re-signing that old kernel
+does not make it eligible for release signing.
 
 ## Missing `ota_extractor`
 
