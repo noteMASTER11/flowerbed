@@ -487,6 +487,39 @@ class ReleaseOrchestrationTest(unittest.TestCase):
             with self.assertRaisesRegex(self.ReleaseSigningError, "unsafe"):
                 _validate_zip(archive_path)
 
+    def test_zip_validators_reject_terminal_dot_but_allow_directory_entries(self):
+        from scripts.ubuntu.sign_release import (
+            _validate_signed_target_files,
+            _validate_zip,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsigned = root / "unsigned.zip"
+            with zipfile.ZipFile(unsigned, "w") as archive:
+                archive.writestr("dir/", b"")
+
+            valid = root / "valid-directory.zip"
+            with zipfile.ZipFile(valid, "w") as archive:
+                archive.writestr("dir/", b"")
+            _validate_zip(valid)
+            _validate_signed_target_files(valid, unsigned)
+
+            for unsafe_name in (".", "dir/."):
+                with self.subTest(validator="generic", member=unsafe_name):
+                    generic = root / f"generic-{unsafe_name.replace('/', '-')}.zip"
+                    with zipfile.ZipFile(generic, "w") as archive:
+                        archive.writestr(unsafe_name, b"unsafe")
+                    with self.assertRaisesRegex(self.ReleaseSigningError, "unsafe"):
+                        _validate_zip(generic)
+
+                with self.subTest(validator="signed-target", member=unsafe_name):
+                    signed = root / f"signed-{unsafe_name.replace('/', '-')}.zip"
+                    with zipfile.ZipFile(signed, "w") as archive:
+                        archive.writestr(unsafe_name, b"unsafe")
+                    with self.assertRaisesRegex(self.ReleaseSigningError, "unsafe"):
+                        _validate_signed_target_files(signed, unsigned)
+
     def test_signed_target_files_symlink_manifest_must_match_unsigned(self):
         from scripts.ubuntu.sign_release import _validate_signed_target_files
 

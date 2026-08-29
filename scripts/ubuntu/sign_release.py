@@ -1201,6 +1201,7 @@ def _inspect_zip(
                     or name.startswith("/")
                     or (len(name) > 1 and name[1] == ":" and name[0].isalpha())
                     or ".." in parts
+                    or parts[-1] == "."
                     or any(part in {"", "."} for part in parts[:-1])
                 ):
                     raise ReleaseSigningError(f"{path.name} has unsafe member {name!r}")
