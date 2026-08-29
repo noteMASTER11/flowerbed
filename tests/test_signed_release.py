@@ -1122,6 +1122,13 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 if "verify_image" in command:
                     image = Path(command[command.index("--image") + 1])
                     if image.stem == "vbmeta":
+                        if (
+                            "--key" in command
+                            and "--follow_chain_partitions" in command
+                        ):
+                            self.fail(
+                                "root key must not be reused for followed child images"
+                            )
                         self.assertTrue(
                             all(
                                 (image.parent / f"{partition}.img").is_file()
@@ -1146,35 +1153,55 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 target, public, root / "avbtool", runner=runner
             )
             self.assertEqual(expected, evidence)
-            self.assertEqual(8, len(commands))
+            self.assertEqual(9, len(commands))
             self.assertTrue(all(Path(command[0]).name == "avbtool" for command in commands))
-            self.assertTrue(
-                all(
-                    Path(command[command.index("--key") + 1]).name.endswith(".public.pem")
-                    for command in commands
-                    if "verify_image" in command
-                )
-            )
-            root_verify = next(
+            root_verifies = [
                 command
                 for command in commands
                 if "verify_image" in command
                 and Path(command[command.index("--image") + 1]).stem == "vbmeta"
+            ]
+            self.assertEqual(2, len(root_verifies))
+            self.assertIn("--key", root_verifies[0])
+            self.assertIn("--follow_chain_partitions", root_verifies[1])
+            keyed_root = next(
+                command for command in root_verifies if "--key" in command
             )
-            self.assertIn("--follow_chain_partitions", root_verify)
+            followed_root = next(
+                command for command in root_verifies if "--follow_chain_partitions" in command
+            )
+            self.assertNotIn("--follow_chain_partitions", keyed_root)
+            self.assertNotIn("--key", followed_root)
             expected_chains = {
                 f"{partition}:{location}:{public / f'avb_{partition}.avbpubkey'}"
                 for partition, location in chain_locations.items()
             }
-            actual_chains = {
-                root_verify[index + 1]
-                for index, value in enumerate(root_verify)
-                if value == "--expected_chain_partition"
-            }
-            self.assertEqual(
-                len(chain_locations), root_verify.count("--expected_chain_partition")
+            for root_verify in root_verifies:
+                actual_chains = {
+                    root_verify[index + 1]
+                    for index, value in enumerate(root_verify)
+                    if value == "--expected_chain_partition"
+                }
+                self.assertEqual(
+                    len(chain_locations),
+                    root_verify.count("--expected_chain_partition"),
+                )
+                self.assertEqual(expected_chains, actual_chains)
+            keyed_children = [
+                command
+                for command in commands
+                if "verify_image" in command
+                and Path(command[command.index("--image") + 1]).stem != "vbmeta"
+            ]
+            self.assertEqual(3, len(keyed_children))
+            self.assertTrue(
+                all(
+                    Path(command[command.index("--key") + 1]).name.endswith(
+                        ".public.pem"
+                    )
+                    for command in keyed_children
+                )
             )
-            self.assertEqual(expected_chains, actual_chains)
 
     def test_root_vbmeta_chain_manifest_must_match_release_keys_exactly(self):
         module = load_verifier()
@@ -1263,6 +1290,73 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         module.verify_avb_images(
                             target, public, root / "avbtool", runner=runner
                         )
+
+            malformed = (
+                "    Chain Partition descriptor:\n"
+                "      Partition Name:          boot\n"
+                "      Public key (sha1):       "
+                + expected["boot"][1]
+                + "\n"
+            )
+            with self.assertRaisesRegex(module.VerificationError, "malformed"):
+                module._parse_avb_chain_descriptors(malformed)
+
+            duplicate = info(expected) + info({"boot": expected["boot"]})
+            with self.assertRaisesRegex(module.VerificationError, "duplicate"):
+                module._parse_avb_chain_descriptors(duplicate)
+
+    def test_root_vbmeta_public_key_must_come_from_top_level_header(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            public = root / "public-keys"
+            public.mkdir()
+            image = root / "vbmeta.img"
+            image.write_bytes(b"vbmeta")
+            for partition in module.REQUIRED_AVB_PARTITIONS:
+                (public / f"avb_{partition}.avbpubkey").write_bytes(
+                    f"public-{partition}".encode()
+                )
+                (public / f"avb_{partition}.public.pem").write_text(
+                    f"pem-{partition}", encoding="utf-8"
+                )
+            loose_root = hashlib.sha1(
+                (public / "avb_vbmeta.avbpubkey").read_bytes()
+            ).hexdigest()
+            lines = [f"Nested Public key (sha1): {loose_root}", "Descriptors:"]
+            for partition, location in (
+                ("boot", 1),
+                ("vbmeta_system", 2),
+                ("vbmeta_vendor", 3),
+            ):
+                lines.extend(
+                    (
+                        "    Chain Partition descriptor:",
+                        f"      Partition Name:          {partition}",
+                        f"      Rollback Index Location: {location}",
+                        "      Public key (sha1):       "
+                        + hashlib.sha1(
+                            (public / f"avb_{partition}.avbpubkey").read_bytes()
+                        ).hexdigest(),
+                        "      Flags:                   0",
+                    )
+                )
+
+            def runner(command, **_kwargs):
+                if "info_image" in command:
+                    return "\n".join(lines) + "\n"
+                if "--key" in command and "--follow_chain_partitions" in command:
+                    self.fail(
+                        "root key must not be reused for followed child images"
+                    )
+                return "verified\n"
+
+            with self.assertRaisesRegex(
+                module.VerificationError, "embedded public key"
+            ):
+                module._verify_root_vbmeta(
+                    image, public, root / "avbtool", runner=runner
+                )
 
     def test_payload_partition_policy_requires_android_and_manifest_firmware(self):
         module = load_verifier()

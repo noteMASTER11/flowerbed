@@ -1464,11 +1464,17 @@ def _verify_root_vbmeta(
         raise VerificationError("missing AVB public PEM for avb_vbmeta")
 
     expected: dict[str, tuple[int, str]] = {}
-    command = [
+    keyed_command = [
         avbtool,
         "verify_image",
         "--key",
         root_pem,
+        "--image",
+        image,
+    ]
+    followed_command = [
+        avbtool,
+        "verify_image",
         "--image",
         image,
         "--follow_chain_partitions",
@@ -1477,20 +1483,24 @@ def _verify_root_vbmeta(
         public_blob = public_keys / f"avb_{partition}.avbpubkey"
         if not public_blob.is_file() or public_blob.is_symlink():
             raise VerificationError(f"missing AVB public key blob for avb_{partition}")
-        command.extend(
-            (
-                "--expected_chain_partition",
-                f"{partition}:{location}:{public_blob}",
-            )
+        chain_arguments = (
+            "--expected_chain_partition",
+            f"{partition}:{location}:{public_blob}",
         )
+        keyed_command.extend(chain_arguments)
+        followed_command.extend(chain_arguments)
         expected[partition] = (
             location,
             hashlib.sha1(public_blob.read_bytes()).hexdigest(),
         )
 
-    runner(command)
+    runner(keyed_command)
+    runner(followed_command)
     info = runner([avbtool, "info_image", "--image", image])
-    root_match = re.search(r"Public key \(sha1\):\s*([0-9A-Fa-f]{40})", info)
+    root_match = re.search(
+        r"(?m)^Public key \(sha1\):[ \t]*([0-9A-Fa-f]{40})[ \t]*\r?$",
+        info,
+    )
     if not root_match:
         raise VerificationError("avbtool did not report embedded public key for avb_vbmeta")
     if root_match.group(1).lower() != hashlib.sha1(root_blob.read_bytes()).hexdigest():
