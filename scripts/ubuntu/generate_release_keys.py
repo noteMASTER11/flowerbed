@@ -64,6 +64,11 @@ _DIRECTORY_FLAGS = (
 _FILE_READ_FLAGS = (
     os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 )
+_PATH_FLAGS = (
+    getattr(os, "O_PATH", os.O_RDONLY)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
 _OPEN_DELIMITER = "[[["
 _CLOSE_DELIMITER = "]]]"
 
@@ -192,7 +197,10 @@ def _workspace_context(destination: Path, plan: KeyPlan):
     except BaseException as error:
         if not workspace.published:
             try:
-                _cleanup_workspace(workspace)
+                if _workspace_is_published(workspace):
+                    workspace.published = True
+                else:
+                    _cleanup_workspace(workspace)
             except BaseException as cleanup_error:
                 try:
                     error.add_note(
@@ -801,11 +809,9 @@ def _reject_existing_destination_at(parent_fd: int, name: str, plan: KeyPlan) ->
 
 
 def _cleanup_workspace(workspace: _Workspace) -> None:
-    _close_fd(workspace.raw_fd)
-    workspace.raw_fd = -1
-    _close_fd(workspace.public_fd)
-    workspace.public_fd = -1
-    _remove_tree_contents(workspace.staging_fd)
+    if _workspace_is_published(workspace):
+        workspace.published = True
+        return
     staging_stat = os.stat(
         workspace.staging_name,
         dir_fd=workspace.parent_fd,
@@ -813,24 +819,87 @@ def _cleanup_workspace(workspace: _Workspace) -> None:
     )
     if _identity(staging_stat) != workspace.staging_identity:
         raise KeyGenerationError("refusing to remove replaced staging directory")
+    _close_fd(workspace.raw_fd)
+    workspace.raw_fd = -1
+    _close_fd(workspace.public_fd)
+    workspace.public_fd = -1
+    _remove_tree_contents(workspace.staging_fd)
+    staging_stat_after = os.stat(
+        workspace.staging_name,
+        dir_fd=workspace.parent_fd,
+        follow_symlinks=False,
+    )
+    if _identity(staging_stat_after) != workspace.staging_identity:
+        raise KeyGenerationError("refusing to remove replaced staging directory")
     os.rmdir(workspace.staging_name, dir_fd=workspace.parent_fd)
     os.fsync(workspace.parent_fd)
 
 
+def _workspace_is_published(workspace: _Workspace) -> bool:
+    try:
+        destination_stat = os.stat(
+            workspace.destination.name,
+            dir_fd=workspace.parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    if _identity(destination_stat) != workspace.staging_identity:
+        return False
+    if (
+        not stat.S_ISDIR(destination_stat.st_mode)
+        or destination_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(destination_stat.st_mode) != 0o700
+    ):
+        raise KeyGenerationError("published destination inode is unsafe")
+    try:
+        os.stat(
+            workspace.staging_name,
+            dir_fd=workspace.parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return True
+    raise KeyGenerationError("workspace inode has two authoritative names")
+
+
 def _remove_tree_contents(directory_fd: int) -> None:
+    parent_stat = os.fstat(directory_fd)
     with os.scandir(directory_fd) as iterator:
         children = list(iterator)
     for child in children:
-        metadata = child.stat(follow_symlinks=False)
-        if stat.S_ISDIR(metadata.st_mode):
-            child_fd = os.open(child.name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+        expected_identity = (parent_stat.st_dev, child.inode())
+        entry_fd = os.open(child.name, _PATH_FLAGS, dir_fd=directory_fd)
+        try:
+            metadata = os.fstat(entry_fd)
+            named_metadata = os.stat(
+                child.name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if (
+                _identity(metadata) != expected_identity
+                or _identity(named_metadata) != expected_identity
+                or stat.S_IFMT(metadata.st_mode) != stat.S_IFMT(named_metadata.st_mode)
+            ):
+                raise KeyGenerationError("cleanup entry changed before removal")
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.unlink(child.name, dir_fd=directory_fd)
+                continue
+
+            child_fd = os.open(".", _DIRECTORY_FLAGS, dir_fd=entry_fd)
             try:
+                if _identity(os.fstat(child_fd)) != expected_identity:
+                    raise KeyGenerationError("cleanup directory descriptor changed")
                 _remove_tree_contents(child_fd)
             finally:
                 os.close(child_fd)
+            named_after = os.stat(
+                child.name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if _identity(named_after) != expected_identity:
+                raise KeyGenerationError("cleanup directory changed during removal")
             os.rmdir(child.name, dir_fd=directory_fd)
-        else:
-            os.unlink(child.name, dir_fd=directory_fd)
+        finally:
+            os.close(entry_fd)
 
 
 def _close_workspace(workspace: _Workspace) -> None:

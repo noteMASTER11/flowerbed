@@ -54,6 +54,17 @@ def digest_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def contains_text_digest(
+    value: str, expected_digest: str, expected_length: int
+) -> bool:
+    if expected_length <= 0 or len(value) < expected_length:
+        return False
+    return any(
+        digest_text(value[offset : offset + expected_length]) == expected_digest
+        for offset in range(len(value) - expected_length + 1)
+    )
+
+
 @dataclass(frozen=True)
 class RecordedCall:
     command: tuple[str, ...]
@@ -78,7 +89,12 @@ class FakeRunner:
         self.calls: list[RecordedCall] = []
         self.failure_tool = failure_tool
         self.create_unexpected_entry = create_unexpected_entry
-        self.forbidden_secret = forbidden_secret
+        self._forbidden_digest = (
+            None if forbidden_secret is None else digest_text(forbidden_secret)
+        )
+        self._forbidden_length = (
+            0 if forbidden_secret is None else len(forbidden_secret)
+        )
         self.raise_error = raise_error
         self.mutate_after_first = mutate_after_first
         self.replace_first_output_with_symlink_to = replace_first_output_with_symlink_to
@@ -87,10 +103,20 @@ class FakeRunner:
     def __call__(self, command, *, stdin=None, env=None, pass_fds=()):
         command = tuple(str(item) for item in command)
         environment = tuple(sorted((env or {}).items()))
-        if self.forbidden_secret:
-            exposed = any(self.forbidden_secret in item for item in command)
+        if self._forbidden_digest is not None:
+            exposed = any(
+                contains_text_digest(
+                    item, self._forbidden_digest, self._forbidden_length
+                )
+                for item in command
+            )
             exposed = exposed or any(
-                self.forbidden_secret in key or self.forbidden_secret in value
+                contains_text_digest(
+                    key, self._forbidden_digest, self._forbidden_length
+                )
+                or contains_text_digest(
+                    value, self._forbidden_digest, self._forbidden_length
+                )
                 for key, value in environment
             )
             if exposed:
@@ -172,6 +198,25 @@ class GenerateReleaseKeysTest(unittest.TestCase):
 
     def private_temp(self):
         return tempfile.TemporaryDirectory(dir="/home/administrator")
+
+    def test_fake_runner_keeps_only_redacted_secret_state(self):
+        secret = uuid.uuid4().hex
+        secret_digest = digest_text(secret)
+        runner = FakeRunner(forbidden_secret=secret)
+
+        self.assertFalse("forbidden_secret" in vars(runner))
+        self.assertTrue(runner._forbidden_length == len(secret))
+        self.assertTrue(runner._forbidden_digest == secret_digest)
+        self.assertFalse(
+            any(
+                isinstance(value, str)
+                and contains_text_digest(value, secret_digest, len(secret))
+                for value in vars(runner).values()
+            )
+        )
+        with self.assertRaisesRegex(AssertionError, "secret exposed outside stdin"):
+            runner(["tool", secret])
+        self.assertEqual(len(runner.calls), 0)
 
     def test_rejects_repository_android_and_windows_mount_destinations(self):
         with self.private_temp() as directory:
@@ -728,6 +773,172 @@ class GenerateReleaseKeysTest(unittest.TestCase):
             self.assertFalse(keys_dir.exists())
             self.assertEqual(list(private_parent.glob(".keys.staging-*")), [])
 
+    def test_post_rename_interrupt_preserves_complete_destination(self):
+        import scripts.ubuntu.generate_release_keys as generator
+
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            repo = root / "repo"
+            android_root = root / "android"
+            private_parent = root / "private"
+            keys_dir = private_parent / "keys"
+            repo.mkdir()
+            android_root.mkdir()
+            private_parent.mkdir(mode=0o700)
+            secret = uuid.uuid4().hex
+            original_rename = generator._rename_no_replace_at
+
+            def rename_then_interrupt(*args, **kwargs):
+                original_rename(*args, **kwargs)
+                raise KeyboardInterrupt()
+
+            with mock.patch.object(
+                generator,
+                "_rename_no_replace_at",
+                side_effect=rename_then_interrupt,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.generate_keyset(
+                        target_files,
+                        android_root,
+                        keys_dir,
+                        "/CN=fleur release/",
+                        repo_root=repo,
+                        runner=FakeRunner(forbidden_secret=secret),
+                        getpass_fn=lambda _prompt: secret,
+                    )
+
+            if keys_dir.exists():
+                plan = self.build_key_plan(target_files)
+                actual_files = {
+                    str(path.relative_to(keys_dir))
+                    for path in keys_dir.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(actual_files, generator._expected_files(plan))
+                self.assertFalse((keys_dir / ".raw").exists())
+            self.assertEqual(list(private_parent.glob(".keys.staging-*")), [])
+
+    def test_base_exception_at_each_publication_boundary_is_atomic(self):
+        import scripts.ubuntu.generate_release_keys as generator
+
+        with self.private_temp() as directory:
+            root = Path(directory)
+            target_files = root / "target-files.zip"
+            write_target_files(target_files)
+            repo = root / "repo"
+            android_root = root / "android"
+            repo.mkdir()
+            android_root.mkdir()
+            secret = uuid.uuid4().hex
+            plan = self.build_key_plan(target_files)
+            boundaries = (
+                "_remove_raw_directory",
+                "_write_password_file_at",
+                "_write_keyset_manifest",
+                "_validate_complete_staging",
+                "_rename_no_replace_at",
+            )
+
+            for boundary in boundaries:
+                with self.subTest(boundary=boundary):
+                    private_parent = root / boundary
+                    private_parent.mkdir(mode=0o700)
+                    keys_dir = private_parent / "keys"
+                    with mock.patch.object(
+                        generator, boundary, side_effect=KeyboardInterrupt()
+                    ):
+                        with self.assertRaises(KeyboardInterrupt):
+                            self.generate_keyset(
+                                target_files,
+                                android_root,
+                                keys_dir,
+                                "/CN=fleur release/",
+                                repo_root=repo,
+                                runner=FakeRunner(forbidden_secret=secret),
+                                getpass_fn=lambda _prompt: secret,
+                            )
+                    self.assertFalse(keys_dir.exists())
+                    self.assertEqual(
+                        list(private_parent.glob(".keys.staging-*")), []
+                    )
+
+            private_parent = root / "post-rename-fsync"
+            private_parent.mkdir(mode=0o700)
+            keys_dir = private_parent / "keys"
+            original_fsync = generator.os.fsync
+
+            def interrupt_published_fsync(descriptor):
+                if keys_dir.exists():
+                    raise KeyboardInterrupt()
+                return original_fsync(descriptor)
+
+            with mock.patch.object(
+                generator.os, "fsync", side_effect=interrupt_published_fsync
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.generate_keyset(
+                        target_files,
+                        android_root,
+                        keys_dir,
+                        "/CN=fleur release/",
+                        repo_root=repo,
+                        runner=FakeRunner(forbidden_secret=secret),
+                        getpass_fn=lambda _prompt: secret,
+                    )
+
+            actual_files = {
+                str(path.relative_to(keys_dir))
+                for path in keys_dir.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(actual_files, generator._expected_files(plan))
+            self.assertFalse((keys_dir / ".raw").exists())
+            self.assertEqual(list(private_parent.glob(".keys.staging-*")), [])
+
+    def test_cleanup_refuses_to_traverse_swapped_child_directory(self):
+        import scripts.ubuntu.generate_release_keys as generator
+
+        with self.private_temp() as directory:
+            root = Path(directory)
+            staging = root / "staging"
+            child = staging / "child"
+            held = staging / "held-original"
+            replacement = root / "replacement"
+            child.mkdir(parents=True)
+            replacement.mkdir()
+            (child / "original-marker").write_bytes(b"original")
+            (replacement / "replacement-marker").write_bytes(b"replacement")
+            staging_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+            original_open = generator.os.open
+            swapped = False
+
+            def swap_before_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                if (
+                    not swapped
+                    and path == "child"
+                    and kwargs.get("dir_fd") == staging_fd
+                ):
+                    swapped = True
+                    child.rename(held)
+                    replacement.rename(child)
+                return original_open(path, flags, *args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    generator.os, "open", side_effect=swap_before_open
+                ):
+                    with self.assertRaises(generator.KeyGenerationError):
+                        generator._remove_tree_contents(staging_fd)
+            finally:
+                os.close(staging_fd)
+
+            self.assertTrue((held / "original-marker").is_file())
+            self.assertTrue((child / "replacement-marker").is_file())
+
     def test_post_generation_error_removes_passwords_and_staging_material(self):
         with self.private_temp() as directory:
             root = Path(directory)
@@ -845,7 +1056,7 @@ class PasswordHelperTest(unittest.TestCase):
 
             result = self.run_helper(password_file, "/secure/key.pem")
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(result.returncode == 0)
             self.assertEqual(len(result.stdout), len(wanted))
             self.assertEqual(digest_text(result.stdout), digest_text(wanted))
             self.assertFalse(unrelated in result.stdout + result.stderr)
@@ -868,7 +1079,7 @@ class PasswordHelperTest(unittest.TestCase):
                     self.write_passwords(password_file, content)
                     result = self.run_helper(password_file, "/secure/key.pem")
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(len(result.stdout), 0)
                     self.assertFalse(secret in result.stderr)
 
     def test_helper_rejects_symlink_and_overly_permissive_file(self):
