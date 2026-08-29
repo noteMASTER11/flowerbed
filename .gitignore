@@ -2,6 +2,7 @@ artifacts/
 logs/
 reports/private/
 .cache/
+.worktrees/
 out/
 __pycache__/
 *.pyc
@@ -13,4 +14,3 @@ __pycache__/
 *.tar.xz
 *.vhd
 *.vhdx
-
