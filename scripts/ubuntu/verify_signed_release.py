@@ -366,8 +366,8 @@ def _parse_properties(text: str, label: str) -> dict[str, str]:
         if "=" not in line:
             raise VerificationError(f"{label} line {line_number} is not key=value")
         key, value = (item.strip() for item in line.split("=", 1))
-        if not key or not value:
-            raise VerificationError(f"{label} line {line_number} has an empty property")
+        if not key:
+            raise VerificationError(f"{label} line {line_number} has an empty property key")
         if key in properties and properties[key] != value:
             raise VerificationError(f"{label} has conflicting property {key}")
         properties[key] = value
@@ -388,6 +388,13 @@ def verify_build_tags(properties: Mapping[str, str]) -> str:
     if len(values) != 1 or "release-keys" not in next(iter(values)).split(","):
         raise VerificationError("build tags do not consistently report release-keys")
     return next(iter(values))
+
+
+def verify_target_build_properties(properties: Mapping[str, str]) -> str:
+    """Require the signed target-files device and release build tags."""
+    if properties.get("ro.product.system.device") != "fleur":
+        raise VerificationError("signed target-files device is not fleur")
+    return verify_build_tags(properties)
 
 
 def verify_ota_metadata(text: str) -> dict[str, str]:
@@ -1869,9 +1876,7 @@ def _verify_release_snapshotted(
             _read_unique_text(signed_target, "SYSTEM/build.prop"),
             "SYSTEM/build.prop",
         )
-        if build_prop.get("ro.product.system.device") != "fleur":
-            raise VerificationError("signed target-files device is not fleur")
-        build_tags = verify_build_tags(build_prop)
+        build_tags = verify_target_build_properties(build_prop)
         sku_mapping = verify_sku_properties(_read_sku_files(signed_target))
         presigned = verify_signing_metadata_paths(apkcerts, apexkeys, misc_info)
 

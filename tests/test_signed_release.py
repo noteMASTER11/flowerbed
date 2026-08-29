@@ -62,6 +62,50 @@ class SignedReleasePolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(module.VerificationError, "test-keys"):
             module.verify_build_tags({"ro.product.build.tags": "test-keys"})
 
+    def test_property_parser_allows_optional_empty_values_but_rejects_bad_syntax(self):
+        module = load_verifier()
+        properties = module._parse_properties(
+            "ro.build.version.base_os=\n"
+            "ro.product.system.device=fleur\n"
+            "ro.build.tags=release-keys\n",
+            "SYSTEM/build.prop",
+        )
+        self.assertEqual("", properties["ro.build.version.base_os"])
+        for malformed in (
+            "ro.build.version.base_os\n",
+            "=value\n",
+            "   =value\n",
+        ):
+            with self.assertRaises(module.VerificationError):
+                module._parse_properties(malformed, "SYSTEM/build.prop")
+
+    def test_required_target_build_properties_reject_missing_or_empty_values(self):
+        module = load_verifier()
+        self.assertEqual(
+            "release-keys",
+            module.verify_target_build_properties(
+                {
+                    "ro.build.version.base_os": "",
+                    "ro.product.system.device": "fleur",
+                    "ro.build.tags": "release-keys",
+                }
+            ),
+        )
+        for properties in (
+            {"ro.build.tags": "release-keys"},
+            {
+                "ro.product.system.device": "",
+                "ro.build.tags": "release-keys",
+            },
+            {"ro.product.system.device": "fleur"},
+            {
+                "ro.product.system.device": "fleur",
+                "ro.build.tags": "",
+            },
+        ):
+            with self.assertRaises(module.VerificationError):
+                module.verify_target_build_properties(properties)
+
     def test_rejects_wrong_ota_device(self):
         module = load_verifier()
         with self.assertRaisesRegex(module.VerificationError, "pre-device"):
@@ -1106,6 +1150,7 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         archive.writestr(name, value)
                     archive.writestr(
                         "SYSTEM/build.prop",
+                        "ro.build.version.base_os=\n"
                         f"ro.product.system.device=fleur\nro.build.tags={tags}\nro.system.build.tags={tags}\n",
                     )
                     write_zip_symlink(
