@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -26,6 +27,7 @@ class AvbSigningError(RuntimeError):
 OpenSslRunner = Callable[..., bytes]
 _SUPPORTED_ALGORITHM = "SHA256_RSA4096"
 _CONFIG_ENV = "FLEUR_AVB_SIGNING_CONFIG"
+_PROC_FD_REFERENCE = re.compile(r"/proc/[1-9][0-9]*/fd/(?:0|[1-9][0-9]*)\Z")
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _WRITE_FLAGS = (
     os.O_RDWR
@@ -217,7 +219,7 @@ def export_public_key(
 
 
 def _load_config(config_path: Path) -> tuple[Path, dict[str, dict[str, object]]]:
-    descriptor = _open_owned_private_file(config_path, "AVB helper config")
+    descriptor = _open_helper_config(config_path)
     try:
         with os.fdopen(descriptor, "r", encoding="utf-8") as source:
             descriptor = -1
@@ -260,10 +262,25 @@ def _open_private_key(private_key: Path) -> int:
     return _open_owned_private_file(private_key, "encrypted private key")
 
 
-def _open_owned_private_file(path: Path, label: str) -> int:
+def _open_helper_config(path: Path) -> int:
+    rendered = os.fspath(path)
+    flags = _READ_FLAGS
+    if rendered.startswith("/proc/"):
+        if not _PROC_FD_REFERENCE.fullmatch(rendered):
+            raise AvbSigningError("AVB helper config has an invalid proc-fd reference")
+        flags &= ~getattr(os, "O_NOFOLLOW", 0)
+    return _open_owned_private_file(path, "AVB helper config", flags=flags)
+
+
+def _open_owned_private_file(
+    path: Path,
+    label: str,
+    *,
+    flags: int = _READ_FLAGS,
+) -> int:
     descriptor = -1
     try:
-        descriptor = os.open(path, _READ_FLAGS)
+        descriptor = os.open(path, flags)
         metadata = os.fstat(descriptor)
     except OSError as error:
         if descriptor >= 0:

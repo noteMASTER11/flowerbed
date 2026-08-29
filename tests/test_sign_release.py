@@ -873,6 +873,63 @@ class AvbSigningHelperTest(unittest.TestCase):
         self.export_public_key = export_public_key
         self.sign_payload = sign_payload
 
+    def test_proc_fd_config_uses_real_loader_and_rejects_post_use_replacement(self):
+        from scripts.ubuntu.sign_release import (
+            ReleaseSigningError,
+            _pin_private_runtime_file,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_key = root / "avb_boot.pem"
+            public_key = root / "avb_boot.public.pem"
+            password_file = root / "passwords"
+            config = root / "helper.json"
+            private_key.write_bytes(b"original-private")
+            public_key.write_bytes(b"original-public")
+            password_file.write_text(
+                f"[[[ secret ]]] {private_key}\n", encoding="utf-8"
+            )
+            config.write_text(
+                json.dumps(helper_config(private_key, public_key, password_file)),
+                encoding="utf-8",
+            )
+            for path in (private_key, password_file, config):
+                path.chmod(0o600)
+            original_config = config.read_bytes()
+
+            with _pin_private_runtime_file(
+                config, "AVB helper config"
+            ) as pinned_config:
+
+                def replacing_runner(command, *, input_data, pass_fds):
+                    replacement = root / "replacement-helper.json"
+                    replacement.write_text(
+                        '{"schema_version": 2}\n', encoding="utf-8"
+                    )
+                    replacement.chmod(0o600)
+                    os.replace(replacement, config)
+                    self.assertEqual(
+                        pinned_config.proc_path.read_bytes(), original_config
+                    )
+                    return b"S" * 512
+
+                signature = self.sign_payload(
+                    pinned_config.proc_path,
+                    "SHA256_RSA4096",
+                    public_key,
+                    b"padded-hash",
+                    runner=replacing_runner,
+                )
+
+                self.assertEqual(signature, b"S" * 512)
+                with self.assertRaisesRegex(
+                    ReleaseSigningError, "config.*changed"
+                ):
+                    pinned_config.verify_named(
+                        "AVB helper config", verify_hash=True
+                    )
+
     def test_signs_avb_stdin_with_password_only_on_inherited_fd(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
