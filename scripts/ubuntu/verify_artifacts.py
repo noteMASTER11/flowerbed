@@ -137,6 +137,33 @@ def _run_checked(command: list[str], *, cwd: Path, timeout: int = 600) -> str:
     return result.stdout
 
 
+def verify_zip_with_unzip(path: Path) -> dict:
+    """Verify a ZIP through both Python's reader and the platform unzip tool."""
+    path = Path(path)
+    if not path.is_file() or path.is_symlink():
+        raise ValueError(f"ZIP does not exist as a regular file: {path}")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            if archive.testzip() is not None:
+                raise ValueError(f"ZIP member CRC failed: {path.name}")
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"unzip -t rejected {path.name}: {error}") from error
+    result = subprocess.run(
+        ["unzip", "-t", str(path)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"unzip -t rejected {path.name}: {result.stdout.strip()}")
+    return {
+        "status": "verified",
+        "name": path.name,
+        "size": path.stat().st_size,
+        "sha256": sha256_file(path),
+    }
+
+
 def verify_payload_firmware(
     archive: zipfile.ZipFile,
     android_top: Path,
@@ -222,6 +249,7 @@ def verify(args: argparse.Namespace) -> dict:
     ota = args.ota.resolve()
     if not ota.is_file():
         raise ValueError(f"OTA ZIP does not exist: {ota}")
+    verify_zip_with_unzip(ota)
     try:
         with zipfile.ZipFile(ota) as archive:
             corrupt = archive.testzip()

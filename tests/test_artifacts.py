@@ -150,6 +150,22 @@ class ArtifactTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "vendor revision mismatch"):
                 module.verify_git_revision(repository, "0" * 40)
 
+    def test_zip_integrity_uses_unzip_and_rejects_corruption(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            good = root / "good.zip"
+            with zipfile.ZipFile(good, "w") as archive:
+                archive.writestr("member", b"contents")
+            result = module.verify_zip_with_unzip(good)
+            self.assertEqual("verified", result["status"])
+            self.assertEqual(good.name, result["name"])
+
+            corrupt = root / "corrupt.zip"
+            corrupt.write_bytes(good.read_bytes()[:-5])
+            with self.assertRaisesRegex(ValueError, "unzip -t"):
+                module.verify_zip_with_unzip(corrupt)
+
 
 if __name__ == "__main__":
     unittest.main()
