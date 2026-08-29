@@ -6,6 +6,7 @@ import io
 import importlib.util
 import json
 import os
+import stat
 import struct
 import tarfile
 from contextlib import redirect_stdout
@@ -36,6 +37,19 @@ def load_verifier():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def write_zip_symlink(
+    archive: zipfile.ZipFile,
+    name: str,
+    target: bytes,
+    *,
+    mode: int = 0o777,
+) -> None:
+    member = zipfile.ZipInfo(name)
+    member.create_system = 3
+    member.external_attr = (stat.S_IFLNK | mode) << 16
+    archive.writestr(member, target)
 
 
 class SignedReleasePolicyTest(unittest.TestCase):
@@ -897,6 +911,11 @@ class SignedReleasePolicyTest(unittest.TestCase):
                         "SYSTEM/build.prop",
                         f"ro.product.system.device=fleur\nro.build.tags={tags}\nro.system.build.tags={tags}\n",
                     )
+                    write_zip_symlink(
+                        archive,
+                        "BOOT/RAMDISK/adb_keys",
+                        b"/product/etc/security/adb_keys",
+                    )
 
             ota = root / "lineage-SIGNED-fleur.zip"
             with zipfile.ZipFile(ota, "w") as archive:
@@ -1267,6 +1286,111 @@ class SignedReleasePolicyTest(unittest.TestCase):
                 archive.writestr(info, "target")
             with self.assertRaisesRegex(module.VerificationError, "symlink"):
                 module.validate_zip_members(symlink_zip)
+            with self.assertRaisesRegex(module.VerificationError, "symlink"):
+                module._zip_evidence(symlink_zip)
+
+    def test_target_files_symlink_manifest_must_match_exactly(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsigned = root / "unsigned.zip"
+            expected = {
+                "BOOT/RAMDISK/adb_keys": b"/product/etc/security/adb_keys",
+                "SYSTEM/bin/tool": b"../lib64/tool",
+            }
+            with zipfile.ZipFile(unsigned, "w") as archive:
+                archive.writestr("META/member", b"unsigned")
+                for name, target in expected.items():
+                    write_zip_symlink(archive, name, target)
+
+            matching = root / "matching.zip"
+            with zipfile.ZipFile(matching, "w") as archive:
+                archive.writestr("META/member", b"signed")
+                for name, target in expected.items():
+                    write_zip_symlink(archive, name, target)
+            module.validate_target_files_symlink_manifest(unsigned, matching)
+
+            variants = {
+                "added": {
+                    **expected,
+                    "SYSTEM/bin/added": b"/system/lib64/added",
+                },
+                "removed": {
+                    "BOOT/RAMDISK/adb_keys": expected["BOOT/RAMDISK/adb_keys"],
+                },
+                "retargeted": {
+                    **expected,
+                    "SYSTEM/bin/tool": b"../lib64/other",
+                },
+            }
+            for label, links in variants.items():
+                with self.subTest(change=label):
+                    candidate = root / f"{label}.zip"
+                    with zipfile.ZipFile(candidate, "w") as archive:
+                        archive.writestr("META/member", b"signed")
+                        for name, target in links.items():
+                            write_zip_symlink(archive, name, target)
+                    with self.assertRaisesRegex(
+                        module.VerificationError, "symlink manifest"
+                    ):
+                        module.validate_target_files_symlink_manifest(
+                            unsigned, candidate
+                        )
+
+            mode_changed = root / "mode-changed.zip"
+            with zipfile.ZipFile(mode_changed, "w") as archive:
+                archive.writestr("META/member", b"signed")
+                for name, target in expected.items():
+                    write_zip_symlink(
+                        archive,
+                        name,
+                        target,
+                        mode=0o755 if name == "SYSTEM/bin/tool" else 0o777,
+                    )
+            with self.assertRaisesRegex(module.VerificationError, "symlink manifest"):
+                module.validate_target_files_symlink_manifest(unsigned, mode_changed)
+
+    def test_target_files_and_generic_zip_policies_reject_terminal_dot(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsigned = root / "unsigned.zip"
+            with zipfile.ZipFile(unsigned, "w") as archive:
+                archive.writestr("dir/", b"")
+
+            valid = root / "valid.zip"
+            with zipfile.ZipFile(valid, "w") as archive:
+                archive.writestr("dir/", b"")
+            module.validate_zip_members(valid)
+            module.validate_target_files_symlink_manifest(unsigned, valid)
+
+            for unsafe_name in (".", "dir/."):
+                candidate = root / f"unsafe-{unsafe_name.replace('/', '-')}.zip"
+                with zipfile.ZipFile(candidate, "w") as archive:
+                    archive.writestr(unsafe_name, b"unsafe")
+                with self.subTest(policy="generic", member=unsafe_name):
+                    with self.assertRaisesRegex(module.VerificationError, "unsafe"):
+                        module.validate_zip_members(candidate)
+                with self.subTest(policy="target-files", member=unsafe_name):
+                    with self.assertRaisesRegex(module.VerificationError, "unsafe"):
+                        module.validate_target_files_symlink_manifest(
+                            unsigned, candidate
+                        )
+
+    def test_target_files_symlink_policy_rejects_other_special_files(self):
+        module = load_verifier()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsigned = root / "unsigned.zip"
+            signed = root / "signed.zip"
+            for path in (unsigned, signed):
+                with zipfile.ZipFile(path, "w") as archive:
+                    special = zipfile.ZipInfo("SYSTEM/bin/fifo")
+                    special.create_system = 3
+                    special.external_attr = (stat.S_IFIFO | 0o600) << 16
+                    archive.writestr(special, b"")
+            with self.assertRaisesRegex(module.VerificationError, "special"):
+                module.validate_target_files_symlink_manifest(unsigned, signed)
 
     def test_cli_passes_all_required_release_paths_to_verifier(self):
         module = load_verifier()

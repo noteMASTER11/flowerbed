@@ -640,36 +640,88 @@ def verify_kernel_source_provenance(
     }
 
 
-def _archive_members(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
+def _archive_members(
+    archive: zipfile.ZipFile,
+    *,
+    allow_symlinks: bool = False,
+    symlink_manifest: dict[str, tuple[int, int, bytes]] | None = None,
+) -> dict[str, zipfile.ZipInfo]:
     members: dict[str, zipfile.ZipInfo] = {}
     for member in archive.infolist():
         name = member.filename
         parts = name.split("/")
-        mode = (member.external_attr >> 16) & 0o170000
+        file_type = (member.external_attr >> 16) & 0o170000
         if (
             not name
             or "\x00" in name
             or "\\" in name
             or name.startswith("/")
             or re.match(r"^[A-Za-z]:", name)
-            or any(part in {"", ".", ".."} for part in parts[:-1])
             or ".." in parts
+            or parts[-1] == "."
+            or any(part in {"", "."} for part in parts[:-1])
         ):
             raise VerificationError(f"archive has unsafe member {name!r}")
-        if mode == stat.S_IFLNK:
-            raise VerificationError(f"archive has symlink member {name}")
         if member.filename in members:
             raise VerificationError(f"archive has duplicate member {member.filename}")
         members[member.filename] = member
+        if file_type == stat.S_IFLNK:
+            if not allow_symlinks:
+                raise VerificationError(f"archive has symlink member {name}")
+            if symlink_manifest is not None:
+                symlink_manifest[name] = (
+                    member.create_system,
+                    member.external_attr,
+                    archive.read(member),
+                )
+        elif file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+            raise VerificationError(f"archive has special-file member {name}")
     return members
 
 
-def validate_zip_members(path: Path) -> list[str]:
+def validate_zip_members(path: Path, *, allow_symlinks: bool = False) -> list[str]:
+    path = Path(path)
+    if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+        raise VerificationError(f"invalid ZIP: {path.name}")
     try:
         with zipfile.ZipFile(path) as archive:
-            return sorted(_archive_members(archive))
+            members = _archive_members(archive, allow_symlinks=allow_symlinks)
+            if archive.testzip() is not None:
+                raise VerificationError(f"archive is corrupt: {path.name}")
+            return sorted(members)
     except zipfile.BadZipFile as error:
         raise VerificationError(f"invalid ZIP: {Path(path).name}") from error
+
+
+def _target_files_symlink_manifest(path: Path) -> dict[str, tuple[int, int, bytes]]:
+    path = Path(path)
+    if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+        raise VerificationError(f"invalid target-files ZIP: {path.name}")
+    manifest: dict[str, tuple[int, int, bytes]] = {}
+    try:
+        with zipfile.ZipFile(path) as archive:
+            _archive_members(
+                archive,
+                allow_symlinks=True,
+                symlink_manifest=manifest,
+            )
+            if archive.testzip() is not None:
+                raise VerificationError(f"target-files archive is corrupt: {path.name}")
+    except zipfile.BadZipFile as error:
+        raise VerificationError(f"invalid target-files ZIP: {path.name}") from error
+    return manifest
+
+
+def validate_target_files_symlink_manifest(
+    unsigned_target_files: Path,
+    signed_target_files: Path,
+) -> None:
+    expected = _target_files_symlink_manifest(unsigned_target_files)
+    actual = _target_files_symlink_manifest(signed_target_files)
+    if actual != expected:
+        raise VerificationError(
+            "signed target-files symlink manifest differs from unsigned target-files"
+        )
 
 
 def _partition_members(members: Mapping[str, zipfile.ZipInfo], prefix: str) -> dict[str, str]:
@@ -694,8 +746,8 @@ def compare_target_files(
     expected_firmware_hashes: Mapping[str, str],
 ) -> dict[str, object]:
     with zipfile.ZipFile(unsigned_path) as unsigned, zipfile.ZipFile(signed_path) as signed:
-        unsigned_members = _archive_members(unsigned)
-        signed_members = _archive_members(signed)
+        unsigned_members = _archive_members(unsigned, allow_symlinks=True)
+        signed_members = _archive_members(signed, allow_symlinks=True)
         unsigned_android = _partition_members(unsigned_members, "IMAGES/")
         signed_android = _partition_members(signed_members, "IMAGES/")
         unsigned_firmware = _partition_members(unsigned_members, "RADIO/")
@@ -730,7 +782,7 @@ def target_metadata_hashes(target_files: Path) -> dict[str, str]:
         "SYSTEM/build.prop",
     )
     with zipfile.ZipFile(target_files) as archive:
-        _archive_members(archive)
+        _archive_members(archive, allow_symlinks=True)
         return {
             name: hashlib.sha256(_read_unique_bytes(archive, name)).hexdigest()
             for name in required
@@ -1080,7 +1132,7 @@ def verify_fastboot_against_target_files(
     signed_target_files: Path, fastboot: Path
 ) -> dict[str, object]:
     with zipfile.ZipFile(signed_target_files) as target, zipfile.ZipFile(fastboot) as images:
-        target_members = _archive_members(target)
+        target_members = _archive_members(target, allow_symlinks=True)
         fastboot_members = _archive_members(images)
         files = set(fastboot_members)
         if files != FASTBOOT_ALLOWED_MEMBERS:
@@ -1365,7 +1417,7 @@ def verify_avb_images(
         prefix="flowerbed-avb-proof-"
     ) as directory:
         root = Path(directory)
-        members = _archive_members(archive)
+        members = _archive_members(archive, allow_symlinks=True)
         images = _partition_members(members, "IMAGES/")
         for partition, member in images.items():
             (root / f"{partition}.img").write_bytes(archive.read(member))
@@ -1432,7 +1484,7 @@ def verify_ota_partition_binding(
     with zipfile.ZipFile(signed_target_files) as target, tempfile.TemporaryDirectory(
         prefix="flowerbed-ota-partitions-"
     ) as directory:
-        _archive_members(target)
+        _archive_members(target, allow_symlinks=True)
         expected = _target_ota_partitions(target)
         verify_payload_partition_set(actual_partitions, expected)
         extracted_files = {
@@ -1608,9 +1660,26 @@ def _ota_public_key(
     return destination
 
 
-def _zip_evidence(path: Path) -> dict[str, object]:
-    validate_zip_members(path)
+def _zip_evidence(path: Path, *, allow_symlinks: bool = False) -> dict[str, object]:
+    validate_zip_members(path, allow_symlinks=allow_symlinks)
     try:
+        if allow_symlinks:
+            result = subprocess.run(
+                ["unzip", "-t", str(path)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            if result.returncode != 0:
+                raise ValueError(
+                    f"unzip -t rejected {Path(path).name}: {result.stdout.strip()}"
+                )
+            return {
+                "status": "verified",
+                "name": Path(path).name,
+                "size": Path(path).stat().st_size,
+                "sha256": sha256_file(path),
+            }
         return verify_zip_with_unzip(path)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise VerificationError(f"ZIP integrity check failed for {Path(path).name}: {error}") from error
@@ -1671,7 +1740,17 @@ def _verify_release_snapshotted(
     if not public_keys.is_dir() or public_keys.is_symlink():
         raise VerificationError("public key bundle is unavailable")
 
-    zip_evidence = {label: _zip_evidence(path) for label, path in paths.items()}
+    validate_target_files_symlink_manifest(
+        paths["unsigned_target_files"],
+        paths["signed_target_files"],
+    )
+    zip_evidence = {
+        label: _zip_evidence(
+            path,
+            allow_symlinks=label in {"unsigned_target_files", "signed_target_files"},
+        )
+        for label, path in paths.items()
+    }
     try:
         manifest = load_firmware_manifest(manifest_path)
     except (OSError, ValueError, json.JSONDecodeError) as error:
