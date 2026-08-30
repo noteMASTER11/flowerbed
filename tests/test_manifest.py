@@ -27,6 +27,10 @@ EXPECTED = {
         "mt6781-devs/android_device_mediatek_sepolicy_vndr",
         "dc6d099b7a1b85a38151b80e675684888ef22683",
     ),
+    "hardware/xiaomi": (
+        "LineageOS/android_hardware_xiaomi",
+        "1ad18efb60bc5c3cf794213fb29822837e38c1f8",
+    ),
 }
 
 

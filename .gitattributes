@@ -4,4 +4,5 @@
 *.json text eol=lf
 *.yml text eol=lf
 *.md text eol=lf
+patches/**/*.patch text eol=lf whitespace=-blank-at-eol
 patches/android_kernel_xiaomi_mt6781/0001-mdpm-cfi-function-pointer-signature.patch whitespace=-trailing-space,-space-before-tab

@@ -11,11 +11,13 @@
         {"path": "vendor/xiaomi/fleur", "repository": "z3rh0/proprietary_vendor_xiaomi_fleur", "revision": "9430b0e8c9e7915fcac5257c21d1c539acaf94c6"},
         {"path": "kernel/xiaomi/mt6781", "repository": "mt6781-devs/android_kernel_xiaomi_mt6781", "revision": "9996b68a1808b38f2f9e7798b26479e721bc2a84"},
         {"path": "hardware/mediatek", "repository": "mt6781-devs/android_hardware_mediatek", "revision": "8d18fc6d5b3a63fe2abf9e935947f71c484db291"},
-        {"path": "device/mediatek/sepolicy_vndr", "repository": "mt6781-devs/android_device_mediatek_sepolicy_vndr", "revision": "dc6d099b7a1b85a38151b80e675684888ef22683"}
+        {"path": "device/mediatek/sepolicy_vndr", "repository": "mt6781-devs/android_device_mediatek_sepolicy_vndr", "revision": "dc6d099b7a1b85a38151b80e675684888ef22683"},
+        {"path": "hardware/xiaomi", "repository": "LineageOS/android_hardware_xiaomi", "revision": "1ad18efb60bc5c3cf794213fb29822837e38c1f8"}
       ],
       "evidence": [
         "https://github.com/mt6781-devs/android_device_xiaomi_fleur/tree/lineage-23.2",
-        "https://github.com/z3rh0/proprietary_vendor_xiaomi_fleur/tree/lineage-23.2"
+        "https://github.com/z3rh0/proprietary_vendor_xiaomi_fleur/tree/lineage-23.2",
+        "https://github.com/LineageOS/android_hardware_xiaomi/tree/lineage-23.2"
       ],
       "notes": "Clean candidate baseline. The exact branch heads were reachable on 2026-08-27; build and device validation are separate gates."
     },
@@ -87,4 +89,3 @@
     }
   ]
 }
-

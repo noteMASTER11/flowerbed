@@ -353,6 +353,7 @@ class ScriptTest(unittest.TestCase):
         self.assertIn("fleur-lineage-23.2.xml", result.stdout)
         self.assertIn("script --quiet --return --flush --command", result.stdout)
         self.assertIn("repo sync", result.stdout)
+        self.assertIn("apply_patches.sh", result.stdout)
         self.assertIn("repo manifest -r", result.stdout)
         existence = run_bash("-c", f"test ! -e '{workspace}'")
         self.assertEqual(0, existence.returncode, existence.stdout)
@@ -426,6 +427,136 @@ class ScriptTest(unittest.TestCase):
                 cleanup = run_bash("-c", f"rm -rf -- '{workspace}'")
                 self.assertEqual(0, cleanup.returncode, cleanup.stdout)
 
+    def test_apply_patches_selects_memtrack_module_defined_by_pinned_hardware(self):
+        home = run_bash("-lc", "printf '%s' \"$HOME\"").stdout
+        sandbox = f"{home}/.cache/flowerbed-tests/apply-patches-{uuid.uuid4().hex}"
+        device_tree = f"{sandbox}/device/xiaomi/fleur"
+        kernel_tree = f"{sandbox}/kernel/xiaomi/mt6781"
+        try:
+            setup = run_bash(
+                "-c",
+                f"mkdir -p '{device_tree}/sepolicy/vendor' '{device_tree}/sku' "
+                f"'{kernel_tree}/drivers/misc/mediatek/base/power/include/mdpm_v2/mt6781' && "
+                f"printf '%s\\n' '# Graphics' 'PRODUCT_PACKAGES += \\' "
+                f"'    android.hardware.graphics.composer@2.3-service \\' "
+                f"'    android.hardware.memtrack-service.mediatek-mali' '' "
+                f"'# Health' 'PRODUCT_PACKAGES += \\' "
+                f">'{device_tree}/device.mk' && "
+                f"printf '%s\\n' 'vendor_public_prop(vendor_thermal_engine_prop)' "
+                f"'vendor_restricted_prop(vendor_camera_prop)' "
+                f"'vendor_internal_prop(vendor_camera_persist_prop)' "
+                f"'vendor_internal_prop(vendor_dynamic_sensor_prop)' "
+                f">'{device_tree}/sepolicy/vendor/property.te' && "
+                f"printf '%s\\n' '# Graphics' "
+                f"'genfscon sysfs /devices/platform/14000000.dispsys_config/drm/card0/card0-DSI-1/panel_event u:object_r:vendor_sysfs_panel:s0' "
+                f"'genfscon sysfs /devices/platform/14000000.dispsys_config/drm/card0/card0-DSI-1/panel_info u:object_r:vendor_sysfs_panel:s0' "
+                f"'genfscon sysfs /devices/platform/14000000.dispsys_config/idle_state u:object_r:vendor_sysfs_panel:s0' "
+                f"'genfscon sysfs /devices/platform/13000000.mali/dvfs_period u:object_r:sysfs_gpu:s0' "
+                f"'genfscon sysfs /devices/platform/13000000.mali/js_ctx_scheduling_mode u:object_r:sysfs_gpu:s0' "
+                f"'genfscon sysfs /devices/platform/13000000.mali/js_scheduling_period u:object_r:sysfs_gpu:s0' "
+                f"'' '# Health' "
+                f">'{device_tree}/sepolicy/vendor/genfs_contexts' && "
+                f"printf '%s\\n' '# Camera' "
+                f"'persist.vendor.camera. u:object_r:vendor_camera_persist_prop:s0' "
+                f"'vendor.camera. u:object_r:vendor_camera_prop:s0' "
+                f"'vendor.debug. u:object_r:vendor_camera_prop:s0' "
+                f"'' '# Dynamic sensor' "
+                f"'vendor.dynamic_sensor. u:object_r:vendor_dynamic_sensor_prop:s0' "
+                f"'' '# Fingerprint' "
+                f"'persist.vendor.sys.fp. u:object_r:vendor_fp_prop:s0' "
+                f"'' '# RIL' "
+                f"'ro.vendor.oem. u:object_r:vendor_mtk_radio_prop:s0' "
+                f"'ro.vendor.vt. u:object_r:vendor_mtk_radio_prop:s0' "
+                f"'' '# Thermal' "
+                f">'{device_tree}/sepolicy/vendor/property_contexts' && "
+                f"printf '%s\\n' 'bluetooth.device.default_name=Redmi Note 11S' "
+                f"'vendor.usb.product_string=Redmi Note 11S' 'ro.product.odm.brand=Redmi' "
+                f"'ro.product.odm.device=fleur' 'ro.product.odm.model=fleur' "
+                f"'ro.product.odm.name=fleur_global' >'{device_tree}/sku/build_fleur.prop' && "
+                f"printf '%s\\n' 'bluetooth.device.default_name=Redmi Note 11S' "
+                f"'vendor.usb.product_string=Redmi Note 11S' 'ro.product.odm.brand=Redmi' "
+                f"'ro.product.odm.device=miel' 'ro.product.odm.model=miel' "
+                f"'ro.product.odm.name=miel_global' >'{device_tree}/sku/build_miel.prop' && "
+                f"printf '%s\\n' 'bluetooth.device.default_name=POCO M4 Pro' "
+                f"'vendor.usb.product_string=POCO M4 Pro' 'ro.product.odm.brand=POCO' "
+                f"'ro.product.odm.device=fleur' 'ro.product.odm.model=fleur' "
+                f"'ro.product.odm.name=fleur_p_global' >'{device_tree}/sku/build_fleurp.prop' && "
+                f"printf '%s\\n' 'bluetooth.device.default_name=POCO M4 Pro' "
+                f"'vendor.usb.product_string=POCO M4 Pro' 'ro.product.odm.brand=POCO' "
+                f"'ro.product.odm.device=miel' 'ro.product.odm.model=miel' "
+                f"'ro.product.odm.name=miel_p_global' >'{device_tree}/sku/build_mielp.prop' && "
+                f"printf '%b\\n' 'struct mdpm_scenario {{' "
+                f"'\\tchar scenario_name[MAX_MDPM_NAME_LEN];' "
+                f"'\\tstruct scenario_power_type_t *scenario_power;' "
+                f"'\\tenum tx_rat_type tx_power_rat[MAX_DBM_FUNC_NUM];' "
+                f"'\\tint (*tx_power_func)(u32 *dbm_mem, u32 *old_dbm_mem, unsigned int rat,' "
+                f"'\\t\\tunsigned int power_type, struct md_power_status *md_power_s);' "
+                f"'}};' '' '#ifdef MD_POWER_UT' "
+                f">'{kernel_tree}/drivers/misc/mediatek/base/power/include/mdpm_v2/mt6781/mtk_mdpm_platform.h' && "
+                f"git -C '{device_tree}' init -q && "
+                f"git -C '{device_tree}' add device.mk sepolicy sku && "
+                f"git -C '{device_tree}' -c user.name=Test "
+                f"-c user.email=test@example.invalid commit -qm fixture && "
+                f"git -C '{kernel_tree}' init -q && "
+                f"git -C '{kernel_tree}' add drivers && "
+                f"git -C '{kernel_tree}' -c user.name=Test "
+                f"-c user.email=test@example.invalid commit -qm fixture",
+            )
+            self.assertEqual(0, setup.returncode, setup.stdout)
+
+            result = run_script("scripts/ubuntu/apply_patches.sh", sandbox)
+            self.assertEqual(0, result.returncode, result.stdout)
+            device_mk = run_bash("-c", f"cat '{device_tree}/device.mk'")
+            self.assertEqual(0, device_mk.returncode, device_mk.stdout)
+            self.assertIn(
+                "android.hardware.memtrack-service.mediatek\n",
+                device_mk.stdout,
+            )
+            self.assertNotIn(
+                "android.hardware.memtrack-service.mediatek-mali",
+                device_mk.stdout,
+            )
+            property_te = run_bash(
+                "-c", f"cat '{device_tree}/sepolicy/vendor/property.te'"
+            )
+            self.assertEqual(0, property_te.returncode, property_te.stdout)
+            self.assertNotIn(
+                "vendor_internal_prop(vendor_dynamic_sensor_prop)",
+                property_te.stdout,
+            )
+            self.assertIn(
+                "vendor_public_prop(vendor_thermal_engine_prop)",
+                property_te.stdout,
+            )
+            genfs_contexts = run_bash(
+                "-c", f"cat '{device_tree}/sepolicy/vendor/genfs_contexts'"
+            )
+            self.assertEqual(0, genfs_contexts.returncode, genfs_contexts.stdout)
+            self.assertNotIn(
+                "/devices/platform/13000000.mali/",
+                genfs_contexts.stdout,
+            )
+            self.assertIn(
+                "/devices/platform/14000000.dispsys_config/idle_state",
+                genfs_contexts.stdout,
+            )
+            property_contexts = run_bash(
+                "-c", f"cat '{device_tree}/sepolicy/vendor/property_contexts'"
+            )
+            self.assertEqual(0, property_contexts.returncode, property_contexts.stdout)
+            self.assertNotIn("vendor.dynamic_sensor.", property_contexts.stdout)
+            self.assertIn("persist.vendor.camera.", property_contexts.stdout)
+            self.assertNotIn("ro.vendor.vt.", property_contexts.stdout)
+            self.assertIn("ro.vendor.oem.", property_contexts.stdout)
+
+            second = run_script("scripts/ubuntu/apply_patches.sh", sandbox)
+            self.assertEqual(0, second.returncode, second.stdout)
+            self.assertIn("already applied", second.stdout.lower())
+        finally:
+            self.assertTrue(sandbox.startswith(f"{home}/.cache/flowerbed-tests/"))
+            cleanup = run_bash("-c", f"rm -rf -- '{sandbox}'")
+            self.assertEqual(0, cleanup.returncode, cleanup.stdout)
+
     def test_build_dry_run_is_side_effect_free_and_selects_fleur(self):
         workspace = f"/tmp/flowerbed-build-{uuid.uuid4().hex}"
         result = run_script("scripts/ubuntu/build.sh", "--dry-run", workspace)
@@ -436,6 +567,18 @@ class ScriptTest(unittest.TestCase):
         self.assertIn("USE_CCACHE=1", result.stdout)
         existence = run_bash("-c", f"test ! -e '{workspace}'")
         self.assertEqual(0, existence.returncode, existence.stdout)
+
+    def test_build_verbose_passes_verbose_flag_to_ninja(self):
+        result = run_script(
+            "scripts/ubuntu/build.sh",
+            "--dry-run",
+            "--verbose",
+            "/tmp/unused-build-workspace",
+        )
+        self.assertEqual(0, result.returncode, result.stdout)
+        self.assertIn("export SOONG_UI_NINJA_ARGS=-v", result.stdout)
+        self.assertIn("m bacon -j8", result.stdout)
+        self.assertNotIn("showcommands", result.stdout)
 
     def test_build_sources_android_envsetup_without_nounset(self):
         with tempfile.TemporaryDirectory() as directory:
